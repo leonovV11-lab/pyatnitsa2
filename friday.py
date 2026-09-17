@@ -3,7 +3,7 @@ from __future__ import annotations
 from html import escape
 import ccxt
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
 from dataclasses import dataclass
 from typing import Literal
 from enum import Enum
@@ -26,6 +26,42 @@ SENIOR_TF = {
     Mode.INTRADAY: Mode.SWING,
     Mode.SWING:    None,
 }
+
+
+# ─────────── ИНДИКАТОРЫ (чистый pandas, без pandas-ta) ───────────
+
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
+
+
+def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1 / length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50)
+
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / length, adjust=False).mean()
+
+
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
 
 
 @dataclass
@@ -73,16 +109,14 @@ class Friday:
 
     def enrich(self, df: pd.DataFrame, mode: Mode) -> pd.DataFrame:
         cfg = MODE_CONFIG[mode]
-        df["ema_fast"] = ta.ema(df["close"], length=cfg["ema_fast"])
-        df["ema_slow"] = ta.ema(df["close"], length=cfg["ema_slow"])
-        df["rsi"]      = ta.rsi(df["close"], length=cfg["rsi_len"])
-        df["atr"]      = ta.atr(df["high"], df["low"], df["close"], length=14)
-        macd = ta.macd(df["close"])
-        if macd is None or macd.empty:
-            raise RuntimeError("MACD не посчитался")
-        df["macd"]      = macd["MACD_12_26_9"]
-        df["macd_hist"] = macd["MACDh_12_26_9"]
-        df["macd_sig"]  = macd["MACDs_12_26_9"]
+        df["ema_fast"] = ema(df["close"], cfg["ema_fast"])
+        df["ema_slow"] = ema(df["close"], cfg["ema_slow"])
+        df["rsi"]      = rsi(df["close"], cfg["rsi_len"])
+        df["atr"]      = atr(df["high"], df["low"], df["close"], 14)
+        macd_line, signal_line, hist = macd(df["close"])
+        df["macd"]      = macd_line
+        df["macd_sig"]  = signal_line
+        df["macd_hist"] = hist
         df["vol_ma"]    = df["volume"].rolling(20).mean()
         return df
 
@@ -120,17 +154,17 @@ class Friday:
         votes, reasons = self.score(df)
         last = df.iloc[-1]
         price = float(last["close"])
-        atr   = float(last["atr"])
-        cfg   = MODE_CONFIG[mode]
-        conf  = min(abs(votes) / 6.0, 1.0)
+        atr_val = float(last["atr"])
+        cfg = MODE_CONFIG[mode]
+        conf = min(abs(votes) / 6.0, 1.0)
         if votes >= cfg["min_votes"]:
             action = "BUY"
-            sl = price - atr * cfg["atr_mult"]
-            tp = price + atr * cfg["atr_mult"] * 2
+            sl = price - atr_val * cfg["atr_mult"]
+            tp = price + atr_val * cfg["atr_mult"] * 2
         elif votes <= -cfg["min_votes"]:
             action = "SELL"
-            sl = price + atr * cfg["atr_mult"]
-            tp = price - atr * cfg["atr_mult"] * 2
+            sl = price + atr_val * cfg["atr_mult"]
+            tp = price - atr_val * cfg["atr_mult"] * 2
         else:
             action = "HOLD"
             sl = tp = price
