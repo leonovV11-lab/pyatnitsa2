@@ -9,7 +9,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from friday import Friday, Mode
 from chart import build_chart
 from exchanges import EXCHANGES, DEFAULT_QUOTES, load_all_pairs
-from config import TELEGRAM_TOKEN, DEFAULT_SYMBOL
+from config import TELEGRAM_TOKEN, DEFAULT_SYMBOL, MIN_CONFIDENCE_LIVE, SIGNAL_COOLDOWN_SEC
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("friday")
@@ -17,7 +17,6 @@ log = logging.getLogger("friday")
 STATE = {}
 PAGE_SIZE = 20
 CACHE = {}
-MIN_CONFIDENCE_LIVE = 0.33
 
 INTERVAL_OPTIONS = {
     "1m":  60,
@@ -37,7 +36,7 @@ def get_state(chat_id: int) -> dict:
         "interval": 60,
         "live": False,
         "task": None,
-        "last_sent": None,
+        "last_sent": {},
         "page": 0,
         "search_mode": False,
     })
@@ -191,20 +190,23 @@ async def _live_loop(chat_id: int, ctx, st: dict):
 
     await ctx.bot.send_message(
         chat_id,
-        "запущена. следим за " + sym + " на " + EXCHANGES[ex] + "\nпроверка каждые " + str(interval) + " сек.",
+        "запущена. следим за " + sym + " на " + EXCHANGES[ex] + "\n"
+        + "порог уверенности " + str(int(MIN_CONFIDENCE_LIVE * 100)) + "%\n"
+        + "проверка каждые " + str(interval) + " сек.",
         reply_markup=kb_running(ex, sym, mode),
     )
 
-    st["last_sent"] = None
+    st["last_sent"] = {}
     while st["live"]:
         try:
             friday = await asyncio.to_thread(Friday, sym, ex)
             sig = await asyncio.to_thread(friday.analyze_filtered, Mode(mode))
 
             if sig.action in ("BUY", "SELL") and sig.confidence >= MIN_CONFIDENCE_LIVE:
-                signature = (sig.action, round(sig.price, 4))
-                if signature != st["last_sent"]:
-                    st["last_sent"] = signature
+                now = time.time()
+                last_time = st["last_sent"].get(sig.action, 0)
+                if now - last_time >= SIGNAL_COOLDOWN_SEC:
+                    st["last_sent"][sig.action] = now
                     await ctx.bot.send_message(chat_id, "СИГНАЛ\n" + sig.pretty(), parse_mode=ParseMode.HTML)
                     try:
                         path = await asyncio.to_thread(build_chart, sym, Mode(mode), sig, "chart_" + mode + ".png")
@@ -252,7 +254,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu:current":
         await q.message.reply_text(
-            "биржа " + st["exchange"] + "\nпара " + st["symbol"] + "\nрежим " + str(st["mode"]),
+            "биржа " + st["exchange"] + "\nпара " + st["symbol"] + "\nрежим " + str(st["mode"])
+            + "\nпорог " + str(int(MIN_CONFIDENCE_LIVE * 100)) + "%",
             reply_markup=kb_start(),
         )
         return
