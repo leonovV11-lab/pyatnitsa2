@@ -4,8 +4,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 import pandas as pd
-import pandas_ta as ta
-from friday import Friday, Mode, MODE_CONFIG
+from friday import Friday, Mode, MODE_CONFIG, ema
 
 
 def build_chart(symbol: str, mode: Mode, signal, out_path: str = "signal.png", bars: int = 100) -> str:
@@ -13,8 +12,8 @@ def build_chart(symbol: str, mode: Mode, signal, out_path: str = "signal.png", b
     cfg = MODE_CONFIG[mode]
     need = bars + cfg["ema_slow"] + 10
     df = friday.fetch(mode).tail(need).copy()
-    df["ema_fast"] = ta.ema(df["close"], length=cfg["ema_fast"])
-    df["ema_slow"] = ta.ema(df["close"], length=cfg["ema_slow"])
+    df["ema_fast"] = ema(df["close"], cfg["ema_fast"])
+    df["ema_slow"] = ema(df["close"], cfg["ema_slow"])
     df = df.dropna().tail(bars).reset_index(drop=True)
     df = df.set_index("ts")
     ohlc = df.rename(columns={"open": "Open", "high": "High", "low": "Low",
