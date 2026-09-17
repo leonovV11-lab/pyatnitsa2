@@ -6,7 +6,7 @@ EXCHANGES = {
     "binance":  "Binance",
     "okx":      "OKX",
     "kucoin":   "KuCoin",
-    "gateio":   "Gate.io",
+    "gate":     "Gate.io",
     "mexc":     "MEXC",
 }
 
