@@ -28,8 +28,6 @@ SENIOR_TF = {
 }
 
 
-# ─────────── ИНДИКАТОРЫ (чистый pandas, без pandas-ta) ───────────
-
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
@@ -160,11 +158,11 @@ class Friday:
         if votes >= cfg["min_votes"]:
             action = "BUY"
             sl = price - atr_val * cfg["atr_mult"]
-            tp = price + atr_val * cfg["atr_mult"] * 2
+            tp = price + atr_val * cfg["atr_mult"] * 3
         elif votes <= -cfg["min_votes"]:
             action = "SELL"
             sl = price + atr_val * cfg["atr_mult"]
-            tp = price - atr_val * cfg["atr_mult"] * 2
+            tp = price - atr_val * cfg["atr_mult"] * 3
         else:
             action = "HOLD"
             sl = tp = price
