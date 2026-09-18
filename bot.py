@@ -10,6 +10,7 @@ from friday import Friday, Mode
 from chart import build_chart
 from exchanges import EXCHANGES, DEFAULT_QUOTES, load_all_pairs
 from config import TELEGRAM_TOKEN, DEFAULT_SYMBOL, MIN_CONFIDENCE_LIVE, SIGNAL_COOLDOWN_SEC
+import portfolio
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("friday")
@@ -39,12 +40,14 @@ def get_state(chat_id: int) -> dict:
         "last_sent": {},
         "page": 0,
         "search_mode": False,
+        "pending_price": None,
     })
 
 
 def kb_start() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Начать", callback_data="menu:exchanges")],
+        [InlineKeyboardButton("Статистика", callback_data="menu:stats")],
         [InlineKeyboardButton("Текущая настройка", callback_data="menu:current")],
     ])
 
@@ -131,6 +134,20 @@ def kb_running(exchange_key: str, symbol: str, mode: str) -> InlineKeyboardMarku
     ])
 
 
+def kb_signal_buttons(symbol: str, action: str, price: float) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ купил", callback_data=f"bought:{symbol}:{action}:{price}")],
+        [InlineKeyboardButton("❌ пропустил", callback_data=f"skip:{symbol}")],
+    ])
+
+
+def kb_in_position(symbol: str, price: float) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ продал", callback_data=f"sold:{symbol}:{price}")],
+        [InlineKeyboardButton("❌ не продал", callback_data=f"hold:{symbol}")],
+    ])
+
+
 def kb_after_stop(exchange_key: str, symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("1 минута", callback_data=f"go:{exchange_key}:{symbol}:60")],
@@ -182,6 +199,32 @@ def kb_pairs_sorted(exchange_key: str, quote: str, sorted_rows: list, order: str
     return InlineKeyboardMarkup(rows)
 
 
+def stats_text() -> str:
+    s = portfolio.stats()
+    if s["total"] == 0 and not s["open"]:
+        return "сделок пока нет.\n\nкогда бот пришлёт сигнал — жми «купил». когда продашь — «продал». тут появится статистика."
+    lines = []
+    lines.append("статистика сделок")
+    lines.append("")
+    if s["open"]:
+        o = s["open"]
+        lines.append("открыта: " + o["symbol"] + " " + o["side"] + " @ " + str(o["entry"]))
+        lines.append("")
+    lines.append("всего: " + str(s["total"]))
+    lines.append("прибыльных: " + str(s["wins"]))
+    lines.append("убыточных: " + str(s["losses"]))
+    if s["total"] > 0:
+        lines.append("winrate: " + str(round(s["winrate"], 1)) + "%")
+    lines.append("суммарный PnL: " + str(round(s["total_pnl"], 2)) + "%")
+    if s["wins"]:
+        lines.append("средний выигрыш: +" + str(round(s["avg_win"], 2)) + "%")
+    if s["losses"]:
+        lines.append("средний проигрыш: " + str(round(s["avg_loss"], 2)) + "%")
+    if s["pf"]:
+        lines.append("профит-фактор: " + str(round(s["pf"], 2)))
+    return "\n".join(lines)
+
+
 async def _live_loop(chat_id: int, ctx, st: dict):
     interval = st["interval"]
     ex = st["exchange"]
@@ -190,8 +233,8 @@ async def _live_loop(chat_id: int, ctx, st: dict):
 
     await ctx.bot.send_message(
         chat_id,
-        "запущена. следим за " + sym + " на " + EXCHANGES[ex] + "\n"
-        + "порог уверенности " + str(int(MIN_CONFIDENCE_LIVE * 100)) + "%\n"
+        "запущена. " + sym + " на " + EXCHANGES[ex] + "\n"
+        + "порог " + str(int(MIN_CONFIDENCE_LIVE * 100)) + "%\n"
         + "проверка каждые " + str(interval) + " сек.",
         reply_markup=kb_running(ex, sym, mode),
     )
@@ -207,7 +250,22 @@ async def _live_loop(chat_id: int, ctx, st: dict):
                 last_time = st["last_sent"].get(sig.action, 0)
                 if now - last_time >= SIGNAL_COOLDOWN_SEC:
                     st["last_sent"][sig.action] = now
-                    await ctx.bot.send_message(chat_id, "СИГНАЛ\n" + sig.pretty(), parse_mode=ParseMode.HTML)
+
+                    pos = portfolio.load().get("open")
+                    header = "СИГНАЛ"
+                    if pos:
+                        cp = portfolio.current_pnl(sig.price)
+                        if cp:
+                            pnl_str = str(round(cp["pnl_pct"], 2))
+                            header = ("твой PnL: " + pnl_str + "%  ·  вход " + str(cp["entry"])
+                                      + "\n\nСИГНАЛ")
+
+                    await ctx.bot.send_message(
+                        chat_id,
+                        header + "\n" + sig.pretty(),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=kb_signal_buttons(sym, sig.action, sig.price),
+                    )
                     try:
                         path = await asyncio.to_thread(build_chart, sym, Mode(mode), sig, "chart_" + mode + ".png")
                         with open(path, "rb") as f:
@@ -227,6 +285,10 @@ async def _live_loop(chat_id: int, ctx, st: dict):
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Пятница на связи.", reply_markup=kb_start())
+
+
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(stats_text(), reply_markup=kb_start())
 
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -252,10 +314,18 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("меню:", reply_markup=kb_start())
         return
 
+    if data == "menu:stats":
+        await q.message.reply_text(stats_text(), reply_markup=kb_start())
+        return
+
     if data == "menu:current":
+        pos = portfolio.load().get("open")
+        pos_str = ""
+        if pos:
+            pos_str = "\nоткрыта: " + pos["symbol"] + " " + pos["side"] + " @ " + str(pos["entry"])
         await q.message.reply_text(
             "биржа " + st["exchange"] + "\nпара " + st["symbol"] + "\nрежим " + str(st["mode"])
-            + "\nпорог " + str(int(MIN_CONFIDENCE_LIVE * 100)) + "%",
+            + "\nпорог " + str(int(MIN_CONFIDENCE_LIVE * 100)) + "%" + pos_str,
             reply_markup=kb_start(),
         )
         return
@@ -376,6 +446,44 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("остановлено. что дальше?", reply_markup=kb_after_stop(st["exchange"], st["symbol"]))
         return
 
+    # ── купил ──
+    if data.startswith("bought:"):
+        _, symbol, action, price_str = data.split(":")
+        price = float(price_str)
+        portfolio.open_position(symbol, action, price)
+        await q.message.reply_text(
+            "✅ позиция открыта\n" + action + " " + symbol + " @ " + str(price)
+            + "\n\nпри следующем сигнале увидишь свой PnL.",
+        )
+        return
+
+    if data.startswith("skip:"):
+        await q.message.reply_text("пропущено. ждём следующий сигнал.")
+        return
+
+    # ── продал ──
+    if data.startswith("sold:"):
+        _, symbol, price_str = data.split(":")
+        price = float(price_str)
+        trade = portfolio.close_position(price)
+        if "error" in trade:
+            await q.message.reply_text("нет открытой позиции")
+            return
+        s = portfolio.stats()
+        await q.message.reply_text(
+            "✅ сделка закрыта\n"
+            + trade["side"] + " " + trade["symbol"] + "\n"
+            + "вход " + str(trade["entry"]) + " · выход " + str(trade["exit"]) + "\n"
+            + "PnL: " + str(trade["pnl_pct"]) + "%\n"
+            + "держишь " + str(trade["held_min"]) + " мин\n\n"
+            + "всего сделок: " + str(s["total"]) + " · winrate " + str(round(s["winrate"], 1)) + "%"
+        )
+        return
+
+    if data.startswith("hold:"):
+        await q.message.reply_text("держим позицию дальше.")
+        return
+
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     st = get_state(update.effective_chat.id)
@@ -406,6 +514,7 @@ def main():
         raise SystemExit("нет TELEGRAM_TOKEN")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
