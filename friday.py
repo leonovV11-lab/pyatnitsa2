@@ -7,26 +7,25 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Literal
 from enum import Enum
-
 import analysis
 
 
 class Mode(Enum):
-    SCALP    = "scalp"
+    SCALP = "scalp"
     INTRADAY = "intraday"
-    SWING    = "swing"
+    SWING = "swing"
 
 
 MODE_CONFIG = {
-    Mode.SCALP:    {"tf": "1m",  "lookback": 300, "ema_fast": 9,  "ema_slow": 21,  "rsi_len": 7,  "atr_mult": 1.2, "min_votes": 3},
-    Mode.INTRADAY: {"tf": "15m", "lookback": 300, "ema_fast": 20, "ema_slow": 50,  "rsi_len": 14, "atr_mult": 1.5, "min_votes": 3},
-    Mode.SWING:    {"tf": "4h",  "lookback": 500, "ema_fast": 50, "ema_slow": 200, "rsi_len": 14, "atr_mult": 2.0, "min_votes": 3},
+    Mode.SCALP: {"tf": "1m", "lookback": 300, "ema_fast": 9, "ema_slow": 21, "rsi_len": 7, "atr_mult": 1.2, "min_votes": 3},
+    Mode.INTRADAY: {"tf": "15m", "lookback": 300, "ema_fast": 20, "ema_slow": 50, "rsi_len": 14, "atr_mult": 1.5, "min_votes": 3},
+    Mode.SWING: {"tf": "4h", "lookback": 500, "ema_fast": 50, "ema_slow": 200, "rsi_len": 14, "atr_mult": 2.0, "min_votes": 3},
 }
 
 SENIOR_TF = {
-    Mode.SCALP:    Mode.INTRADAY,
+    Mode.SCALP: Mode.INTRADAY,
     Mode.INTRADAY: Mode.SWING,
-    Mode.SWING:    None,
+    Mode.SWING: None,
 }
 
 MAX_VOTES = 8.0
@@ -41,18 +40,17 @@ def rsi(series, length=14):
     gain = d.where(d > 0, 0.0)
     loss = -d.where(d < 0, 0.0)
     ag = gain.ewm(alpha=1.0 / length, adjust=False).mean()
-    al = loss. -ewm(alpha pc=1.0 / length, adjust).=False).mean()
-    rsabs = ag / al.replace(0,(),
- np.nan)
-    return (100 - (100        / (1 + rs))).fillna(50)
+    al = loss.ewm(alpha=1.0 / length, adjust=False).mean()
+    rs = ag / al.replace(0, np.nan)
+    return (100 - (100 / (1 + rs))).fillna(50)
 
 
 def atr(high, low, close, length=14):
     pc = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high (low - pc).abs(),
-    ], axis=1).max(axis=1)
+    tr1 = high - low
+    tr2 = (high - pc).abs()
+    tr3 = (low - pc).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.ewm(alpha=1.0 / length, adjust=False).mean()
 
 
@@ -77,20 +75,19 @@ class Signal:
     symbol: str = ""
 
     def pretty(self) -> str:
-        arrow = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}[self.action]
-        lines = [
-            f"{arrow} <b>{self.action}</b>  ·  {self.mode.value.upper()}",
-            f"пара: <code>{escape(self.symbol)}</code>",
-            f"цена: <code>{self.price:.4f}</code>",
-            f"уверенность: <b>{self.confidence:.0%}</b>",
-        ]
+        arrow = {"BUY": "BUY", "SELL": "SELL", "HOLD": "HOLD"}[self.action]
+        lines = []
+        lines.append(arrow + " <b>" + self.action + "</b> · " + self.mode.value.upper())
+        lines.append("пара: <code>" + escape(self.symbol) + "</code>")
+        lines.append("цена: <code>" + str(round(self.price, 4)) + "</code>")
+        lines.append("уверенность: <b>" + str(int(self.confidence * 100)) + "%</b>")
         if self.action != "HOLD":
-            lines.append(f"стоп: <code>{self.stop_loss:.4f}</code>")
-            lines.append(f"тейк: <code>{self.take_profit:.4f}</code>")
+            lines.append("стоп: <code>" + str(round(self.stop_loss, 4)) + "</code>")
+            lines.append("тейк: <code>" + str(round(self.take_profit, 4)) + "</code>")
         lines.append("")
         lines.append("причины:")
         for r in self.reasons:
-            lines.append(f"  • {escape(str(r))}")
+            lines.append("  • " + escape(str(r)))
         return "\n".join(lines)
 
 
@@ -101,12 +98,10 @@ class Friday:
 
     def fetch(self, mode):
         cfg = MODE_CONFIG[mode]
-        raw = self.exchange.fetch_ohlcv(
-            self.symbol, timeframe=cfg["tf"], limit=cfg["lookback"])
+        raw = self.exchange.fetch_ohlcv(self.symbol, timeframe=cfg["tf"], limit=cfg["lookback"])
         if not raw or len(raw) < 60:
-            raise RuntimeError(f"мало данных для {mode.value}")
-        df = pd.DataFrame(
-            raw, columns=["ts", "open", "high", "low", "close", "volume"])
+            raise RuntimeError("мало данных для " + mode.value)
+        df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
         df["ts"] = pd.to_datetime(df["ts"], unit="ms")
         return df
 
@@ -178,10 +173,10 @@ class Friday:
 
         if last["rsi"] < 30:
             votes += 1
-            reasons.append(f"RSI перепродан ({last['rsi']:.0f})")
+            reasons.append("RSI перепродан " + str(int(last["rsi"])))
         elif last["rsi"] > 70:
             votes -= 1
-            reasons.append(f"RSI перекуплен ({last['rsi']:.0f})")
+            reasons.append("RSI перекуплен " + str(int(last["rsi"])))
 
         if prev["macd"] < prev["macd_sig"] and last["macd"] > last["macd_sig"]:
             votes += 2
@@ -199,7 +194,7 @@ class Friday:
 
         if last["vol_ma"] and last["volume"] > last["vol_ma"] * 1.5:
             mult = last["volume"] / last["vol_ma"]
-            reasons.append(f"всплеск объёма ({mult:.1f}x)")
+            reasons.append("всплеск объёма " + str(round(mult, 1)) + "x")
             votes += 1 if votes > 0 else -1
 
         if last["close"] < last["bb_lower"]:
@@ -227,10 +222,10 @@ class Friday:
             av = last["adx"]
             if last["plus_di"] > last["minus_di"]:
                 votes += 1
-                reasons.append(f"ADX {av:.0f} тренд вверх")
+                reasons.append("ADX " + str(int(av)) + " тренд вверх")
             else:
                 votes -= 1
-                reasons.append(f"ADX {av:.0f} тренд вниз")
+                reasons.append("ADX " + str(int(av)) + " тренд вниз")
 
         if last["rsi_div"] == "bull":
             votes += 2
@@ -246,10 +241,10 @@ class Friday:
         for name, direction in patterns:
             if direction == "bull":
                 votes += 1
-                reasons.append(f"свеча: {name}")
+                reasons.append("свеча: " + name)
             elif direction == "bear":
                 votes -= 1
-                reasons.append(f"свеча: {name}")
+                reasons.append("свеча: " + name)
 
         if last["near_support"]:
             votes += 1
@@ -258,12 +253,10 @@ class Friday:
             votes -= 1
             reasons.append("цена у сопротивления")
 
-        if (last["obv_ma"] and last["obv"] > last["obv_ma"]
-                and last["obv"] > prev["obv"]):
+        if last["obv_ma"] and last["obv"] > last["obv_ma"] and last["obv"] > prev["obv"]:
             votes += 1
             reasons.append("OBV растёт")
-        elif (last["obv_ma"] and last["obv"] < last["obv_ma"]
-                and last["obv"] < prev["obv"]):
+        elif last["obv_ma"] and last["obv"] < last["obv_ma"] and last["obv"] < prev["obv"]:
             votes -= 1
             reasons.append("OBV падает")
 
@@ -323,5 +316,5 @@ class Friday:
             sig.reasons.append("[фильтр] старший ТФ вверх — SELL отменён")
             sig.action = "HOLD"
         else:
-            sig.reasons.append(f"[фильтр] старший ТФ {trend} — согласовано")
+            sig.reasons.append("[фильтр] старший ТФ " + trend + " — согласовано")
         return sig
