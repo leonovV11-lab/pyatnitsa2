@@ -9,7 +9,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from friday import Friday, Mode
 from chart import build_chart
 from exchanges import EXCHANGES, DEFAULT_QUOTES, load_all_pairs
-from config import TELEGRAM_TOKEN, DEFAULT_SYMBOL, MIN_CONFIDENCE_LIVE, SIGNAL_COOLDOWN_SEC
+from config import TELEGRAM_TOKEN, DEFAULT_SYMBOL, PROFILES
 import portfolio
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -34,13 +34,13 @@ def get_state(chat_id: int) -> dict:
         "symbol": DEFAULT_SYMBOL,
         "quote": "USDT",
         "mode": "scalp",
+        "profile": "high",
         "interval": 60,
         "live": False,
         "task": None,
         "last_sent": {},
         "page": 0,
         "search_mode": False,
-        "pending_price": None,
     })
 
 
@@ -113,12 +113,20 @@ def kb_pairs(exchange_key: str, quote: str, pairs: list, page: int = 0) -> Inlin
     return InlineKeyboardMarkup(rows)
 
 
+def kb_profile_select(exchange_key: str, symbol: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("большая прибыль (редко, 4R)", callback_data="profile:high")],
+        [InlineKeyboardButton("малая прибыль (часто, 1.5R)", callback_data="profile:low")],
+        [InlineKeyboardButton("назад", callback_data=f"back:pairs:{exchange_key}")],
+    ])
+
+
 def kb_mode_select(exchange_key: str, symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("скальп 1m", callback_data=f"lmode:scalp:{exchange_key}:{symbol}")],
         [InlineKeyboardButton("интрадей 15m", callback_data=f"lmode:intraday:{exchange_key}:{symbol}")],
         [InlineKeyboardButton("свинг 4h", callback_data=f"lmode:swing:{exchange_key}:{symbol}")],
-        [InlineKeyboardButton("назад", callback_data=f"back:pairs:{exchange_key}")],
+        [InlineKeyboardButton("назад", callback_data=f"pair:{exchange_key}:USDT:{symbol.split('/')[0]}")],
     ])
 
 
@@ -136,15 +144,8 @@ def kb_running(exchange_key: str, symbol: str, mode: str) -> InlineKeyboardMarku
 
 def kb_signal_buttons(symbol: str, action: str, price: float) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ купил", callback_data=f"bought:{symbol}:{action}:{price}")],
-        [InlineKeyboardButton("❌ пропустил", callback_data=f"skip:{symbol}")],
-    ])
-
-
-def kb_in_position(symbol: str, price: float) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ продал", callback_data=f"sold:{symbol}:{price}")],
-        [InlineKeyboardButton("❌ не продал", callback_data=f"hold:{symbol}")],
+        [InlineKeyboardButton("купил", callback_data=f"bought:{symbol}:{action}:{price}")],
+        [InlineKeyboardButton("пропустил", callback_data=f"skip:{symbol}")],
     ])
 
 
@@ -155,6 +156,7 @@ def kb_after_stop(exchange_key: str, symbol: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("15 минут", callback_data=f"go:{exchange_key}:{symbol}:900")],
         [InlineKeyboardButton("1 час",    callback_data=f"go:{exchange_key}:{symbol}:3600")],
         [InlineKeyboardButton("4 часа",   callback_data=f"go:{exchange_key}:{symbol}:14400")],
+        [InlineKeyboardButton("сменить профиль", callback_data=f"pair:{exchange_key}:USDT:{symbol.split('/')[0]}")],
         [InlineKeyboardButton("сменить пару", callback_data=f"back:pairs:{exchange_key}")],
         [InlineKeyboardButton("сменить биржу", callback_data="menu:exchanges")],
         [InlineKeyboardButton("в меню", callback_data="menu:start")],
@@ -202,10 +204,8 @@ def kb_pairs_sorted(exchange_key: str, quote: str, sorted_rows: list, order: str
 def stats_text() -> str:
     s = portfolio.stats()
     if s["total"] == 0 and not s["open"]:
-        return "сделок пока нет.\n\nкогда бот пришлёт сигнал — жми «купил». когда продашь — «продал». тут появится статистика."
-    lines = []
-    lines.append("статистика сделок")
-    lines.append("")
+        return "сделок пока нет.\nкогда бот пришлёт сигнал — жми «купил». когда продашь — «продал»."
+    lines = ["статистика сделок", ""]
     if s["open"]:
         o = s["open"]
         lines.append("открыта: " + o["symbol"] + " " + o["side"] + " @ " + str(o["entry"]))
@@ -230,11 +230,17 @@ async def _live_loop(chat_id: int, ctx, st: dict):
     ex = st["exchange"]
     sym = st["symbol"]
     mode = st["mode"]
+    profile_key = st.get("profile", "high")
+    profile = PROFILES[profile_key]
+    min_conf = profile["min_confidence"]
+    cooldown = profile["cooldown"]
+    tp_mult = profile["tp_mult"]
 
     await ctx.bot.send_message(
         chat_id,
         "запущена. " + sym + " на " + EXCHANGES[ex] + "\n"
-        + "порог " + str(int(MIN_CONFIDENCE_LIVE * 100)) + "%\n"
+        + "профиль: " + profile["label"] + "\n"
+        + "порог " + str(int(min_conf * 100)) + "% · тейк " + str(tp_mult) + "R\n"
         + "проверка каждые " + str(interval) + " сек.",
         reply_markup=kb_running(ex, sym, mode),
     )
@@ -243,12 +249,12 @@ async def _live_loop(chat_id: int, ctx, st: dict):
     while st["live"]:
         try:
             friday = await asyncio.to_thread(Friday, sym, ex)
-            sig = await asyncio.to_thread(friday.analyze_filtered, Mode(mode))
+            sig = await asyncio.to_thread(friday.analyze_filtered, Mode(mode), tp_mult)
 
-            if sig.action in ("BUY", "SELL") and sig.confidence >= MIN_CONFIDENCE_LIVE:
+            if sig.action in ("BUY", "SELL") and sig.confidence >= min_conf:
                 now = time.time()
                 last_time = st["last_sent"].get(sig.action, 0)
-                if now - last_time >= SIGNAL_COOLDOWN_SEC:
+                if now - last_time >= cooldown:
                     st["last_sent"][sig.action] = now
 
                     pos = portfolio.load().get("open")
@@ -257,7 +263,7 @@ async def _live_loop(chat_id: int, ctx, st: dict):
                         cp = portfolio.current_pnl(sig.price)
                         if cp:
                             pnl_str = str(round(cp["pnl_pct"], 2))
-                            header = ("твой PnL: " + pnl_str + "%  ·  вход " + str(cp["entry"])
+                            header = ("твой PnL: " + pnl_str + "% · вход " + str(cp["entry"])
                                       + "\n\nСИГНАЛ")
 
                     await ctx.bot.send_message(
@@ -319,13 +325,14 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "menu:current":
+        profile = PROFILES.get(st.get("profile", "high"), {})
         pos = portfolio.load().get("open")
         pos_str = ""
         if pos:
             pos_str = "\nоткрыта: " + pos["symbol"] + " " + pos["side"] + " @ " + str(pos["entry"])
         await q.message.reply_text(
             "биржа " + st["exchange"] + "\nпара " + st["symbol"] + "\nрежим " + str(st["mode"])
-            + "\nпорог " + str(int(MIN_CONFIDENCE_LIVE * 100)) + "%" + pos_str,
+            + "\nпрофиль " + profile.get("label", "—") + pos_str,
             reply_markup=kb_start(),
         )
         return
@@ -371,7 +378,24 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         symbol = base + "/" + quote
         st["symbol"] = symbol
         st["quote"] = quote
-        await q.message.reply_text("пара " + symbol + "\nшаг 4: режим", reply_markup=kb_mode_select(ex, symbol))
+        await q.message.reply_text(
+            "пара " + symbol + "\n\nшаг 4: выбери профиль прибыли",
+            reply_markup=kb_profile_select(ex, symbol),
+        )
+        return
+
+    if data.startswith("profile:"):
+        profile_key = data.split(":")[1]
+        st["profile"] = profile_key
+        profile = PROFILES[profile_key]
+        await q.message.reply_text(
+            "профиль: " + profile["label"] + "\n"
+            + "порог " + str(int(profile["min_confidence"] * 100)) + "%\n"
+            + "тейк " + str(profile["tp_mult"]) + "R\n"
+            + "кулдаун " + str(profile["cooldown"]) + " сек\n\n"
+            + "шаг 5: выбери режим",
+            reply_markup=kb_mode_select(st["exchange"], st["symbol"]),
+        )
         return
 
     if data.startswith("back:pairs:"):
@@ -403,8 +427,13 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         st["exchange"] = ex
         st["symbol"] = symbol
         st["mode"] = mode_name
+        profile = PROFILES.get(st.get("profile", "high"), {})
         await q.message.reply_text(
-            "режим " + mode_name + "\nбиржа " + EXCHANGES[ex] + "\nпара " + symbol + "\nжми ЗАПУСТИТЬ",
+            "режим " + mode_name + "\n"
+            + "профиль " + profile.get("label", "—") + "\n"
+            + "биржа " + EXCHANGES[ex] + "\n"
+            + "пара " + symbol + "\n\n"
+            + "жми ЗАПУСТИТЬ",
             reply_markup=kb_confirm_start(ex, symbol, mode_name),
         )
         return
@@ -446,13 +475,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("остановлено. что дальше?", reply_markup=kb_after_stop(st["exchange"], st["symbol"]))
         return
 
-    # ── купил ──
     if data.startswith("bought:"):
         _, symbol, action, price_str = data.split(":")
         price = float(price_str)
         portfolio.open_position(symbol, action, price)
         await q.message.reply_text(
-            "✅ позиция открыта\n" + action + " " + symbol + " @ " + str(price)
+            "позиция открыта\n" + action + " " + symbol + " @ " + str(price)
             + "\n\nпри следующем сигнале увидишь свой PnL.",
         )
         return
@@ -461,7 +489,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("пропущено. ждём следующий сигнал.")
         return
 
-    # ── продал ──
     if data.startswith("sold:"):
         _, symbol, price_str = data.split(":")
         price = float(price_str)
@@ -471,7 +498,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         s = portfolio.stats()
         await q.message.reply_text(
-            "✅ сделка закрыта\n"
+            "сделка закрыта\n"
             + trade["side"] + " " + trade["symbol"] + "\n"
             + "вход " + str(trade["entry"]) + " · выход " + str(trade["exit"]) + "\n"
             + "PnL: " + str(trade["pnl_pct"]) + "%\n"
