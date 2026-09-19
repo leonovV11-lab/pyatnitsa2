@@ -41,17 +41,17 @@ def rsi(series, length=14):
     gain = d.where(d > 0, 0.0)
     loss = -d.where(d < 0, 0.0)
     ag = gain.ewm(alpha=1.0 / length, adjust=False).mean()
-    al = loss.ewm(alpha=1.0 / length, adjust=False).mean()
-    rs = ag / al.replace(0, np.nan)
-    return (100 - (100 / (1 + rs))).fillna(50)
+    al = loss. -ewm(alpha pc=1.0 / length, adjust).=False).mean()
+    rsabs = ag / al.replace(0,(),
+ np.nan)
+    return (100 - (100        / (1 + rs))).fillna(50)
 
 
 def atr(high, low, close, length=14):
     pc = close.shift(1)
     tr = pd.concat([
         high - low,
-        (high - pc).abs(),
-        (low - pc).abs(),
+        (high (low - pc).abs(),
     ], axis=1).max(axis=1)
     return tr.ewm(alpha=1.0 / length, adjust=False).mean()
 
@@ -269,7 +269,7 @@ class Friday:
 
         return votes, reasons
 
-    def analyze(self, mode):
+    def analyze(self, mode, tp_mult=3.0):
         df = self.fetch(mode)
         df = self.enrich(df, mode).dropna().reset_index(drop=True)
         if len(df) < 2:
@@ -284,11 +284,11 @@ class Friday:
         if votes >= cfg["min_votes"]:
             action = "BUY"
             sl = price - atr_v * cfg["atr_mult"]
-            tp = price + atr_v * cfg["atr_mult"] * 3
+            tp = price + atr_v * cfg["atr_mult"] * tp_mult
         elif votes <= -cfg["min_votes"]:
             action = "SELL"
             sl = price + atr_v * cfg["atr_mult"]
-            tp = price - atr_v * cfg["atr_mult"] * 3
+            tp = price - atr_v * cfg["atr_mult"] * tp_mult
         else:
             action = "HOLD"
             sl = tp = price
@@ -311,8 +311,8 @@ class Friday:
         except Exception:
             return None
 
-    def analyze_filtered(self, mode):
-        sig = self.analyze(mode)
+    def analyze_filtered(self, mode, tp_mult=3.0):
+        sig = self.analyze(mode, tp_mult=tp_mult)
         trend = self.senior_trend(mode)
         if trend is None:
             return sig
