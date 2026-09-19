@@ -9,8 +9,20 @@ DEFAULT_SYMBOL = "BTC/USDT"
 EXCHANGE = "bybit"
 WATCH_INTERVAL = 300
 ALERT_COOLDOWN = 900
-
-MIN_CONFIDENCE_LIVE = 0.75
-SIGNAL_COOLDOWN_SEC = 600
 FEE_ROUND = 0.001
 PORTFOLIO_FILE = "portfolio.json"
+
+PROFILES = {
+    "high": {
+        "label": "большая прибыль",
+        "min_confidence": 0.75,
+        "tp_mult": 4.0,
+        "cooldown": 900,
+    },
+    "low": {
+        "label": "малая прибыль",
+        "min_confidence": 0.55,
+        "tp_mult": 1.5,
+        "cooldown": 180,
+    },
+}
