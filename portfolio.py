@@ -2,11 +2,10 @@
 import json
 import os
 from datetime import datetime
-
 from config import PORTFOLIO_FILE, FEE_ROUND
 
 
-def load() -> dict:
+def load():
     if not os.path.exists(PORTFOLIO_FILE):
         return {"open": None, "history": []}
     try:
@@ -16,34 +15,40 @@ def load() -> dict:
         return {"open": None, "history": []}
 
 
-def save(data: dict):
+def save(data):
     with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def open_position(symbol: str, side: str, price: float):
+def open_position(symbol, side, price, qty):
     data = load()
     data["open"] = {
         "symbol": symbol,
         "side": side,
         "entry": price,
+        "qty": qty,
         "opened_at": datetime.utcnow().isoformat(),
     }
     save(data)
 
 
-def close_position(price: float) -> dict:
+def close_position(price):
     data = load()
     pos = data.get("open")
     if not pos:
         return {"error": "нет открытой позиции"}
     entry = pos["entry"]
+    qty = pos.get("qty", 1.0)
     side = pos["side"]
     if side == "BUY":
         raw = (price - entry) / entry
+        abs_pnl = (price - entry) * qty
     else:
         raw = (entry - price) / entry
-    pnl = (raw - FEE_ROUND) * 100
+        abs_pnl = (entry - price) * qty
+    fee = entry * qty * FEE_ROUND
+    pnl_pct = (raw - FEE_ROUND) * 100
+    abs_pnl = abs_pnl - fee
 
     opened_at = datetime.fromisoformat(pos["opened_at"])
     held_min = int((datetime.utcnow() - opened_at).total_seconds() / 60)
@@ -53,7 +58,9 @@ def close_position(price: float) -> dict:
         "side": side,
         "entry": entry,
         "exit": price,
-        "pnl_pct": round(pnl, 3),
+        "qty": qty,
+        "pnl_pct": round(pnl_pct, 3),
+        "pnl_abs": round(abs_pnl, 4),
         "held_min": held_min,
         "closed_at": datetime.utcnow().isoformat(),
     }
@@ -63,16 +70,17 @@ def close_position(price: float) -> dict:
     return trade
 
 
-def stats() -> dict:
+def stats():
     data = load()
     history = data.get("history", [])
     if not history:
         return {"total": 0, "wins": 0, "losses": 0, "winrate": 0,
-                "total_pnl": 0, "avg_win": 0, "avg_loss": 0, "pf": 0,
-                "open": data.get("open")}
+                "total_pnl": 0, "total_abs": 0, "avg_win": 0, "avg_loss": 0,
+                "pf": 0, "open": data.get("open")}
     wins = [t for t in history if t["pnl_pct"] > 0]
     losses = [t for t in history if t["pnl_pct"] <= 0]
     total_pnl = sum(t["pnl_pct"] for t in history)
+    total_abs = sum(t.get("pnl_abs", 0) for t in history)
     avg_win = sum(t["pnl_pct"] for t in wins) / len(wins) if wins else 0
     avg_loss = sum(t["pnl_pct"] for t in losses) / len(losses) if losses else 0
     gross_win = sum(t["pnl_pct"] for t in wins)
@@ -84,6 +92,7 @@ def stats() -> dict:
         "losses": len(losses),
         "winrate": len(wins) / len(history) * 100,
         "total_pnl": total_pnl,
+        "total_abs": total_abs,
         "avg_win": avg_win,
         "avg_loss": avg_loss,
         "pf": pf,
@@ -91,19 +100,24 @@ def stats() -> dict:
     }
 
 
-def current_pnl(price: float):
+def current_pnl(price):
     data = load()
     pos = data.get("open")
     if not pos:
         return None
     entry = pos["entry"]
+    qty = pos.get("qty", 1.0)
     side = pos["side"]
     if side == "BUY":
         raw = (price - entry) / entry
+        abs_pnl = (price - entry) * qty
     else:
         raw = (entry - price) / entry
+        abs_pnl = (entry - price) * qty
     return {
         "pnl_pct": raw * 100,
+        "pnl_abs": abs_pnl,
         "entry": entry,
+        "qty": qty,
         "side": side,
     }
