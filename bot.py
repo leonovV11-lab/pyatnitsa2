@@ -43,6 +43,7 @@ def get_state(chat_id):
         "page": 0,
         "search_mode": False,
         "pending_buy": None,
+        "demo_pos": None,
     })
 
 
@@ -50,6 +51,7 @@ def kb_start():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Начать", callback_data="menu:exchanges")],
         [InlineKeyboardButton("Статистика", callback_data="menu:stats")],
+        [InlineKeyboardButton("Демо-тест кнопок", callback_data="demo:start")],
         [InlineKeyboardButton("Текущая настройка", callback_data="menu:current")],
     ])
 
@@ -88,7 +90,6 @@ def kb_pairs(ex, quote, pairs, page=0):
     start = page * PAGE_SIZE
     chunk = pairs[start:start + PAGE_SIZE]
     rows = []
-    row = []
     for sym in chunk:
         base = sym.split("/")[0]
         rows.append([InlineKeyboardButton(base, callback_data="pair:" + ex + ":" + quote + ":" + base)])
@@ -144,7 +145,17 @@ def kb_running(ex, symbol):
     ])
 
 
-def kb_signal_buttons(symbol, action, price):
+def kb_signal_buttons(symbol, action, price, has_position):
+    if has_position:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("закрыл", callback_data="sold:" + symbol + ":" + str(price))],
+            [InlineKeyboardButton("не закрыл", callback_data="hold:" + symbol)],
+        ])
+    if action == "SELL":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("продал", callback_data="bought:" + symbol + ":" + action + ":" + str(price))],
+            [InlineKeyboardButton("пропустил", callback_data="skip:" + symbol)],
+        ])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("купил", callback_data="bought:" + symbol + ":" + action + ":" + str(price))],
         [InlineKeyboardButton("пропустил", callback_data="skip:" + symbol)],
@@ -206,7 +217,7 @@ def kb_pairs_sorted(ex, quote, sorted_rows, order):
 def stats_text():
     s = portfolio.stats()
     if s["total"] == 0 and not s["open"]:
-        return "сделок пока нет.\nкогда бот пришлёт сигнал — жми «купил», введи количество."
+        return "сделок пока нет.\nкогда бот пришлёт сигнал — жми «купил»/«продал», введи количество."
     lines = ["статистика сделок", ""]
     if s["open"]:
         o = s["open"]
@@ -266,13 +277,15 @@ async def _live_loop(chat_id, ctx, st):
                         if cp:
                             header = ("твой PnL: " + str(round(cp["pnl_pct"], 2)) + "% ("
                                       + str(round(cp["pnl_abs"], 4)) + ")\n"
-                                      + "вход " + str(cp["entry"]) + " · кол-во " + str(cp["qty"])
+                                      + "вход " + str(cp["entry"]) + " · " + cp["side"]
+                                      + " · кол-во " + str(cp["qty"])
                                       + "\n\nСИГНАЛ")
+                    has_pos = pos is not None
                     await ctx.bot.send_message(
                         chat_id,
                         header + "\n" + sig.pretty(),
                         parse_mode=ParseMode.HTML,
-                        reply_markup=kb_signal_buttons(sym, sig.action, sig.price),
+                        reply_markup=kb_signal_buttons(sym, sig.action, sig.price, has_pos),
                     )
                     try:
                         path = await asyncio.to_thread(build_chart, sym, Mode(mode), sig, "chart_" + mode + ".png")
@@ -389,6 +402,53 @@ async def on_button(update, ctx):
 
     if data == "menu:stats":
         await q.message.reply_text(stats_text(), reply_markup=kb_start())
+        return
+
+    if data == "demo:start":
+        st["demo_pos"] = None
+        text = (
+            "СИГНАЛ (ДЕМО)\n"
+            "BUY · SCALP\n"
+            "пара: DEMO/USDT\n"
+            "цена: 100.00\n"
+            "уверенность: 85%\n"
+            "стоп: 95.00\n"
+            "тейк: 115.00\n\n"
+            "причины:\n"
+            "  • демо тренд\n"
+            "  • демо MACD"
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("купил", callback_data="demo:bought")],
+            [InlineKeyboardButton("пропустил", callback_data="demo:skip")]
+        ])
+        await q.message.reply_text(text, reply_markup=markup)
+        return
+
+    if data == "demo:bought":
+        st["pending_buy"] = {"symbol": "DEMO/USDT", "action": "BUY", "price": 100.0, "is_demo": True}
+        await q.message.reply_text("сколько купил?\nнапиши число, например 10")
+        return
+
+    if data == "demo:skip":
+        await q.message.reply_text("демо пропущено.")
+        return
+
+    if data == "demo:sold":
+        pos = st.get("demo_pos")
+        if not pos:
+            await q.message.reply_text("нет демо-позиции")
+            return
+        pnl = (110.0 - pos["entry"]) * pos["qty"]
+        pnl_pct = (110.0 - pos["entry"]) / pos["entry"] * 100
+        st["demo_pos"] = None
+        await q.message.reply_text(
+            "Сделка закрыта (ДЕМО)\n"
+            "вход " + str(pos['entry']) + " · выход 110.00\n"
+            "кол-во " + str(pos['qty']) + "\n"
+            "PnL: +" + str(round(pnl_pct,2)) + "% (+" + str(round(pnl,2)) + " USDT)\n\n"
+            "Это был тест. В реальном режиме бот так же считает ваши сделки."
+        )
         return
 
     if data == "menu:current":
@@ -570,9 +630,10 @@ async def on_button(update, ctx):
     if data.startswith("bought:"):
         _, symbol, action, price_str = data.split(":")
         price = float(price_str)
-        st["pending_buy"] = {"symbol": symbol, "action": action, "price": price}
+        st["pending_buy"] = {"symbol": symbol, "action": action, "price": price, "is_demo": False}
+        word = "купил" if action == "BUY" else "продал"
         await q.message.reply_text(
-            "сколько купил?\nнапиши число, например 100 или 0.5\nцена входа: " + str(price))
+            word + "\nсколько?\nнапиши число, например 100 или 0.5\nцена входа: " + str(price))
         return
 
     if data.startswith("skip:"):
@@ -620,10 +681,33 @@ async def on_text(update, ctx):
             return
         pb = st["pending_buy"]
         st["pending_buy"] = None
+
+        if pb.get("is_demo"):
+            st["demo_pos"] = {"entry": pb["price"], "qty": qty, "side": pb["action"]}
+            msg = (
+                "СИГНАЛ (ДЕМО)\n"
+                "SELL · SCALP\n"
+                "пара: DEMO/USDT\n"
+                "цена: 110.00\n"
+                "уверенность: 80%\n"
+                "стоп: 115.00\n"
+                "тейк: 95.00\n\n"
+                "причины:\n"
+                "  • демо тренд вниз\n"
+                "  • демо MACD"
+            )
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("продал", callback_data="demo:sold")],
+                [InlineKeyboardButton("пропустил", callback_data="demo:skip")]
+            ])
+            await update.message.reply_text(msg, reply_markup=markup)
+            return
+
         portfolio.open_position(pb["symbol"], pb["action"], pb["price"], qty)
+        side_word = "лонг" if pb["action"] == "BUY" else "шорт"
         await update.message.reply_text(
             "позиция открыта\n"
-            + pb["action"] + " " + pb["symbol"] + "\n"
+            + side_word + " " + pb["symbol"] + "\n"
             + "вход " + str(pb["price"]) + " · кол-во " + str(qty) + "\n\n"
             + "при следующем сигнале увидишь PnL."
         )
@@ -667,3 +751,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
