@@ -1,4 +1,4 @@
-# language: Python 3.10+, file: bot.py
+ # language: Python 3.10+, file: bot.py
 import asyncio
 import logging
 import time
@@ -432,13 +432,13 @@ async def on_button(update, ctx):
         return
 
     if data == "demo:skip":
-        await q.message.reply_text("демо пропущено.")
+        await q.message.reply_text("демо пропущено.", reply_markup=kb_start())
         return
 
     if data == "demo:sold":
         pos = st.get("demo_pos")
         if not pos:
-            await q.message.reply_text("нет демо-позиции")
+            await q.message.reply_text("нет демо-позиции", reply_markup=kb_start())
             return
         st["pending_sell"] = {"price": 110.0, "is_demo": True, "available": pos["qty"]}
         await q.message.reply_text("сколько продал?\nв позиции: " + str(pos["qty"]))
@@ -632,7 +632,7 @@ async def on_button(update, ctx):
     if data.startswith("skip:"):
         st["pending_buy"] = None
         st["pending_sell"] = None
-        await q.message.reply_text("пропущено.")
+        await q.message.reply_text("пропущено.", reply_markup=kb_start())
         return
 
     if data.startswith("sold:"):
@@ -640,14 +640,14 @@ async def on_button(update, ctx):
         price = float(price_str)
         pos = portfolio.load().get("open")
         if not pos:
-            await q.message.reply_text("нет открытой позиции")
+            await q.message.reply_text("нет открытой позиции", reply_markup=kb_start())
             return
         st["pending_sell"] = {"symbol": symbol, "price": price, "is_demo": False, "available": pos["qty"]}
         await q.message.reply_text("сколько продал?\nв позиции: " + str(pos["qty"]))
         return
 
     if data.startswith("hold:"):
-        await q.message.reply_text("держим позицию дальше.")
+        await q.message.reply_text("держим позицию дальше.", reply_markup=kb_start())
         return
 
 
@@ -693,7 +693,8 @@ async def on_text(update, ctx):
             "позиция открыта\n"
             + side_word + " " + pb["symbol"] + "\n"
             + "вход " + str(pb["price"]) + " · кол-во " + str(qty) + "\n\n"
-            + "при следующем сигнале увидишь PnL."
+            + "при следующем сигнале увидишь PnL.",
+            reply_markup=kb_start()
         )
         return
 
@@ -712,7 +713,7 @@ async def on_text(update, ctx):
         if ps.get("is_demo"):
             pos = st.get("demo_pos")
             if not pos:
-                await update.message.reply_text("нет демо позиции")
+                await update.message.reply_text("нет демо позиции", reply_markup=kb_start())
                 return
             if qty > pos["qty"] + 1e-8:
                 await update.message.reply_text("у тебя только " + str(pos["qty"]))
@@ -728,13 +729,14 @@ async def on_text(update, ctx):
                 "Сделка закрыта (ДЕМО)\n"
                 "вход " + str(pos['entry']) + " · выход " + str(ps['price']) + "\n"
                 "кол-во " + str(qty) + "\n"
-                "PnL: " + str(round(pnl_pct,2)) + "% (" + str(round(pnl,2)) + " USDT)" + rem_str
+                "PnL: " + str(round(pnl_pct,2)) + "% (" + str(round(pnl,2)) + " USDT)" + rem_str,
+                reply_markup=kb_start()
             )
             return
 
         trade = portfolio.close_position(ps["price"], qty)
         if "error" in trade:
-            await update.message.reply_text(trade["error"])
+            await update.message.reply_text(trade["error"], reply_markup=kb_start())
             return
         s = portfolio.stats()
         sign = "+" if trade["pnl_pct"] > 0 else ""
@@ -749,7 +751,8 @@ async def on_text(update, ctx):
             + "вход " + str(trade["entry"]) + " · выход " + str(trade["exit"]) + "\n"
             + "продано " + str(trade["qty"]) + "\n"
             + "PnL: " + sign + str(trade["pnl_pct"]) + "%  (" + abs_sign + str(trade["pnl_abs"]) + ")" + rem_str + "\n\n"
-            + "всего сделок: " + str(s["total"]) + " · winrate " + str(round(s["winrate"], 1)) + "%"
+            + "всего сделок: " + str(s["total"]) + " · winrate " + str(round(s["winrate"], 1)) + "%",
+            reply_markup=kb_start()
         )
         return
 
@@ -765,7 +768,7 @@ async def on_text(update, ctx):
         pairs = await asyncio.to_thread(get_cached_pairs, ex, quote)
         matches = [p for p in pairs if query in p.split("/")[0]]
         if not matches:
-            await update.message.reply_text("пара с " + query + " не найдена")
+            await update.message.reply_text("пара с " + query + " не найдена", reply_markup=kb_start())
             return
         rows = []
         for m in matches[:15]:
@@ -773,7 +776,7 @@ async def on_text(update, ctx):
         await update.message.reply_text("нашёл " + str(len(matches)) + ":",
                                         reply_markup=InlineKeyboardMarkup(rows))
     except Exception as e:
-        await update.message.reply_text("ошибка: " + str(e))
+        await update.message.reply_text("ошибка: " + str(e), reply_markup=kb_start())
 
 
 def main():
