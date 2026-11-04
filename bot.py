@@ -51,6 +51,7 @@ def get_state(chat_id):
 def kb_start():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Начать", callback_data="menu:exchanges")],
+        [InlineKeyboardButton("📁 История сделок", callback_data="hist:menu")],
         [InlineKeyboardButton("Статистика", callback_data="menu:stats")],
         [InlineKeyboardButton("Демо-тест кнопок", callback_data="demo:start")],
         [InlineKeyboardButton("Текущая настройка", callback_data="menu:current")],
@@ -150,17 +151,17 @@ def kb_running(ex, symbol):
 def kb_signal_buttons(symbol, action, price, has_position):
     if has_position:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("закрыл", callback_data="sold:" + symbol + ":" + str(price))],
-            [InlineKeyboardButton("не закрыл", callback_data="hold:" + symbol)],
+            [InlineKeyboardButton("Закрыл", callback_data="sold:" + symbol + ":" + str(price))],
+            [InlineKeyboardButton("Не закрыл", callback_data="hold:" + symbol)],
         ])
     if action == "SELL":
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("продал", callback_data="bought:" + symbol + ":" + action + ":" + str(price))],
-            [InlineKeyboardButton("пропустил", callback_data="skip:" + symbol)],
+            [InlineKeyboardButton("Открыл шорт (SELL)", callback_data="bought:" + symbol + ":" + action + ":" + str(price))],
+            [InlineKeyboardButton("Пропустил", callback_data="skip:" + symbol)],
         ])
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("купил", callback_data="bought:" + symbol + ":" + action + ":" + str(price))],
-        [InlineKeyboardButton("пропустил", callback_data="skip:" + symbol)],
+        [InlineKeyboardButton("Купил (BUY)", callback_data="bought:" + symbol + ":" + action + ":" + str(price))],
+        [InlineKeyboardButton("Пропустил", callback_data="skip:" + symbol)],
     ])
 
 
@@ -171,9 +172,19 @@ def kb_after_stop(ex, symbol):
         [InlineKeyboardButton("15 минут", callback_data="go:" + ex + ":" + symbol + ":900")],
         [InlineKeyboardButton("1 час", callback_data="go:" + ex + ":" + symbol + ":3600")],
         [InlineKeyboardButton("4 часа", callback_data="go:" + ex + ":" + symbol + ":14400")],
+        [InlineKeyboardButton("📁 История сделок", callback_data="hist:menu")],
         [InlineKeyboardButton("сменить тип", callback_data="stype:back")],
         [InlineKeyboardButton("сменить пару", callback_data="back:pairs:" + ex)],
         [InlineKeyboardButton("сменить биржу", callback_data="menu:exchanges")],
+        [InlineKeyboardButton("в меню", callback_data="menu:start")],
+    ])
+
+
+def kb_history_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Все сделки", callback_data="hist:view:all")],
+        [InlineKeyboardButton("Только лонги (BUY)", callback_data="hist:view:BUY")],
+        [InlineKeyboardButton("Только шорты (SELL)", callback_data="hist:view:SELL")],
         [InlineKeyboardButton("в меню", callback_data="menu:start")],
     ])
 
@@ -240,6 +251,31 @@ def stats_text():
         lines.append("средний проигрыш: " + str(round(s["avg_loss"], 2)) + "%")
     if s["pf"]:
         lines.append("профит-фактор: " + str(round(s["pf"], 2)))
+    return "\n".join(lines)
+
+
+def history_text(filter_type):
+    data = portfolio.load()
+    history = data.get("history", [])
+    
+    if filter_type != "all":
+        history = [t for t in history if t["side"] == filter_type]
+        
+    if not history:
+        return "В этой категории сделок пока нет."
+    
+    lines = [f"<b>История ({filter_type}):</b>", ""]
+    # Показываем последние 15 сделок
+    for t in history[-15:][::-1]:
+        sign = "+" if t["pnl_pct"] > 0 else ""
+        abs_sign = "+" if t["pnl_abs"] > 0 else ""
+        icon = "🟢" if t["side"] == "BUY" else "🔴"
+        
+        lines.append(f"{icon} <b>{t['symbol']}</b> · {t['qty']} шт.")
+        lines.append(f"Вход: {t['entry']} → Выход: {t['exit']}")
+        lines.append(f"PnL: {sign}{t['pnl_pct']}% ({abs_sign}{t['pnl_abs']} USDT)")
+        lines.append("──────────────")
+        
     return "\n".join(lines)
 
 
@@ -416,10 +452,12 @@ async def cmd_stats(update, ctx):
 async def cmd_stop(update, ctx):
     st = get_state(update.effective_chat.id)
     st["live"] = False
+    st["pending_buy"] = None
+    st["pending_sell"] = None
     if st.get("task"):
         st["task"].cancel()
         st["task"] = None
-    await update.message.reply_text("остановлено. что дальше?",
+    await update.message.reply_text("остановлено. состояние сброшено. что дальше?",
                                     reply_markup=kb_after_stop(st["exchange"], st["symbol"]))
 
 
@@ -440,6 +478,19 @@ async def on_button(update, ctx):
     if data == "menu:stats":
         await q.message.reply_text(stats_text(), reply_markup=kb_start())
         return
+
+    # --- ИСТОРИЯ СДЕЛОК ---
+    if data == "hist:menu":
+        await q.message.reply_text("📁 <b>Папка с историей.</b>\nВыбери категорию:", 
+                                   parse_mode=ParseMode.HTML, reply_markup=kb_history_menu())
+        return
+
+    if data.startswith("hist:view:"):
+        filter_type = data.split(":")[2]
+        text = history_text(filter_type)
+        await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_history_menu())
+        return
+    # ----------------------
 
     if data == "demo:start":
         st["demo_pos"] = None
@@ -663,10 +714,12 @@ async def on_button(update, ctx):
 
     if data.startswith("stop:"):
         st["live"] = False
+        st["pending_buy"] = None
+        st["pending_sell"] = None
         if st.get("task"):
             st["task"].cancel()
             st["task"] = None
-        await q.message.reply_text("остановлено. что дальше?",
+        await q.message.reply_text("остановлено. состояние сброшено. что дальше?",
                                    reply_markup=kb_after_stop(st["exchange"], st["symbol"]))
         return
 
@@ -674,7 +727,7 @@ async def on_button(update, ctx):
         _, symbol, action, price_str = data.split(":")
         price = float(price_str)
         st["pending_buy"] = {"symbol": symbol, "action": action, "price": price, "is_demo": False}
-        word = "купил" if action == "BUY" else "продал"
+        word = "купил" if action == "BUY" else "открыл шорт"
         await q.message.reply_text(
             word + "\nсколько?\nнапиши число, например 100 или 0.5\nцена входа: " + str(price))
         return
@@ -740,7 +793,7 @@ async def on_text(update, ctx):
         portfolio.open_position(pb["symbol"], pb["action"], pb["price"], qty)
         side_word = "лонг" if pb["action"] == "BUY" else "шорт"
         await update.message.reply_text(
-            "позиция открыта и занесена в память\n"
+            "позиция открыта\n"
             + side_word + " " + pb["symbol"] + "\n"
             + "вход " + str(pb["price"]) + " · кол-во " + str(qty) + "\n\n"
             + "при следующем сигнале увидишь PnL."
@@ -775,7 +828,7 @@ async def on_text(update, ctx):
             
             rem_str = "\nосталось в позиции: " + str(rem) if rem > 0 else "\nпозиция полностью закрыта"
             await update.message.reply_text(
-                "Сделка закрыта (ДЕМО)\n"
+                "Сделка закрыта (ДЕМО) и занесена в историю\n"
                 "вход " + str(pos['entry']) + " · выход " + str(ps['price']) + "\n"
                 "кол-во " + str(qty) + "\n"
                 "PnL: " + str(round(pnl_pct,2)) + "% (" + str(round(pnl,2)) + " USDT)" + rem_str,
@@ -795,7 +848,7 @@ async def on_text(update, ctx):
         rem_str = "\nосталось в позиции: " + str(rem) if rem > 0 else "\nпозиция полностью закрыта"
 
         await update.message.reply_text(
-            "сделка закрыта и занесена в память\n"
+            "сделка закрыта и занесена в историю\n"
             + trade["side"] + " " + trade["symbol"] + "\n"
             + "вход " + str(trade["entry"]) + " · выход " + str(trade["exit"]) + "\n"
             + "продано " + str(trade["qty"]) + "\n"
