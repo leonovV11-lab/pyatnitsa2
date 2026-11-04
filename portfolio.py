@@ -32,21 +32,27 @@ def open_position(symbol, side, price, qty):
     save(data)
 
 
-def close_position(price):
+def close_position(price, qty_to_sell):
     data = load()
     pos = data.get("open")
     if not pos:
         return {"error": "нет открытой позиции"}
+
+    available = pos.get("qty", 1.0)
+    if qty_to_sell > available + 1e-8:
+        return {"error": "у тебя только " + str(available) + " монет"}
+
     entry = pos["entry"]
-    qty = pos.get("qty", 1.0)
     side = pos["side"]
+
     if side == "BUY":
         raw = (price - entry) / entry
-        abs_pnl = (price - entry) * qty
+        abs_pnl = (price - entry) * qty_to_sell
     else:
         raw = (entry - price) / entry
-        abs_pnl = (entry - price) * qty
-    fee = entry * qty * FEE_ROUND
+        abs_pnl = (entry - price) * qty_to_sell
+
+    fee = entry * qty_to_sell * FEE_ROUND
     pnl_pct = (raw - FEE_ROUND) * 100
     abs_pnl = abs_pnl - fee
 
@@ -58,13 +64,21 @@ def close_position(price):
         "side": side,
         "entry": entry,
         "exit": price,
-        "qty": qty,
+        "qty": qty_to_sell,
         "pnl_pct": round(pnl_pct, 3),
         "pnl_abs": round(abs_pnl, 4),
         "held_min": held_min,
         "closed_at": datetime.utcnow().isoformat(),
     }
-    data["open"] = None
+
+    pos["qty"] -= qty_to_sell
+    if pos["qty"] <= 1e-8:
+        data["open"] = None
+        trade["remaining"] = 0
+    else:
+        data["open"] = pos
+        trade["remaining"] = pos["qty"]
+
     data["history"].append(trade)
     save(data)
     return trade
