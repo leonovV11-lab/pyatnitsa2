@@ -1,4 +1,4 @@
- # language: Python 3.10+, file: bot.py
+# language: Python 3.10+, file: bot.py
 import asyncio
 import logging
 import time
@@ -121,6 +121,7 @@ def kb_type_select(ex, symbol):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("сигналы (BUY/SELL + кнопки)", callback_data="stype:signals")],
         [InlineKeyboardButton("прогноз (вверх / вниз)", callback_data="stype:forecast")],
+        [InlineKeyboardButton("микро-шаг (1 мин)", callback_data="stype:micro")],
         [InlineKeyboardButton("назад", callback_data="pair:" + ex + ":USDT:" + symbol.split("/")[0])],
     ])
 
@@ -369,6 +370,42 @@ async def _forecast_loop(chat_id, ctx, st):
             await asyncio.sleep(1)
 
 
+async def _micro_loop(chat_id, ctx, st):
+    ex = st["exchange"]
+    sym = st["symbol"]
+
+    await ctx.bot.send_message(
+        chat_id,
+        "МИКРО-ШАГ запущен. " + sym + " на " + EXCHANGES[ex] + "\n"
+        + "предсказываю шаг каждую минуту. жми кнопки для входа/выхода.",
+        reply_markup=kb_running(ex, sym),
+    )
+
+    while st["live"]:
+        try:
+            friday = await asyncio.to_thread(Friday, sym, ex)
+            sig = await asyncio.to_thread(friday.micro_predict)
+            
+            if sig.action != "HOLD":
+                arrow = "↑ ВВЕРХ" if sig.action == "BUY" else "↓ ВНИЗ"
+                msg = ("ПРОГНОЗ НА СЛЕДУЮЩУЮ МИНУТУ\n"
+                       + arrow + " (" + sig.action + ")\n"
+                       + "цена: " + str(round(sig.price, 4)) + "\n\n"
+                       + "жми кнопку чтобы зафиксировать сделку.")
+                
+                pos = portfolio.load().get("open")
+                has_pos = pos is not None
+                await ctx.bot.send_message(chat_id, msg, reply_markup=kb_signal_buttons(sym, sig.action, sig.price, has_pos))
+        except Exception as e:
+            log.warning("micro error: " + str(e))
+            
+        # Ждём 60 секунд
+        for _ in range(60):
+            if not st["live"]:
+                return
+            await asyncio.sleep(1)
+
+
 async def cmd_start(update, ctx):
     await update.message.reply_text("Пятница на связи.", reply_markup=kb_start())
 
@@ -527,7 +564,10 @@ async def on_button(update, ctx):
                                        reply_markup=kb_type_select(st["exchange"], st["symbol"]))
             return
         st["signal_type"] = arg
-        label = "сигналы (BUY/SELL)" if arg == "signals" else "прогноз (вверх/вниз)"
+        if arg == "signals": label = "сигналы (BUY/SELL)"
+        elif arg == "forecast": label = "прогноз (вверх/вниз)"
+        else: label = "микро-шаг (1 мин)"
+        
         await q.message.reply_text(
             "тип: " + label + "\n\nшаг 6: режим",
             reply_markup=kb_mode_select(st["exchange"], st["symbol"]),
@@ -566,7 +606,11 @@ async def on_button(update, ctx):
         st["symbol"] = symbol
         st["mode"] = mode_name
         profile = PROFILES.get(st.get("profile", "high"), {})
-        label = "сигналы" if st.get("signal_type") == "signals" else "прогноз"
+        
+        if st.get("signal_type") == "signals": label = "сигналы"
+        elif st.get("signal_type") == "forecast": label = "прогноз"
+        else: label = "микро-шаг"
+        
         await q.message.reply_text(
             "тип " + label + "\n"
             + "режим " + mode_name + "\n"
@@ -588,11 +632,15 @@ async def on_button(update, ctx):
             st["interval"] = 300
         else:
             st["interval"] = 900
+            
         st["live"] = True
         if st.get("task"):
             st["task"].cancel()
+            
         if st.get("signal_type") == "forecast":
             st["task"] = asyncio.create_task(_forecast_loop(chat_id, ctx, st))
+        elif st.get("signal_type") == "micro":
+            st["task"] = asyncio.create_task(_micro_loop(chat_id, ctx, st))
         else:
             st["task"] = asyncio.create_task(_live_loop(chat_id, ctx, st))
         return
@@ -605,8 +653,11 @@ async def on_button(update, ctx):
         st["live"] = True
         if st.get("task"):
             st["task"].cancel()
+            
         if st.get("signal_type") == "forecast":
             st["task"] = asyncio.create_task(_forecast_loop(chat_id, ctx, st))
+        elif st.get("signal_type") == "micro":
+            st["task"] = asyncio.create_task(_micro_loop(chat_id, ctx, st))
         else:
             st["task"] = asyncio.create_task(_live_loop(chat_id, ctx, st))
         return
