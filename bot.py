@@ -43,6 +43,7 @@ def get_state(chat_id):
         "page": 0,
         "search_mode": False,
         "pending_buy": None,
+        "pending_sell": None,
         "demo_pos": None,
     })
 
@@ -427,7 +428,7 @@ async def on_button(update, ctx):
 
     if data == "demo:bought":
         st["pending_buy"] = {"symbol": "DEMO/USDT", "action": "BUY", "price": 100.0, "is_demo": True}
-        await q.message.reply_text("сколько купил?\nнапиши число, например 10")
+        await q.message.reply_text("сколько купил?\nнапиши число, например 5")
         return
 
     if data == "demo:skip":
@@ -439,16 +440,8 @@ async def on_button(update, ctx):
         if not pos:
             await q.message.reply_text("нет демо-позиции")
             return
-        pnl = (110.0 - pos["entry"]) * pos["qty"]
-        pnl_pct = (110.0 - pos["entry"]) / pos["entry"] * 100
-        st["demo_pos"] = None
-        await q.message.reply_text(
-            "Сделка закрыта (ДЕМО)\n"
-            "вход " + str(pos['entry']) + " · выход 110.00\n"
-            "кол-во " + str(pos['qty']) + "\n"
-            "PnL: +" + str(round(pnl_pct,2)) + "% (+" + str(round(pnl,2)) + " USDT)\n\n"
-            "Это был тест. В реальном режиме бот так же считает ваши сделки."
-        )
+        st["pending_sell"] = {"price": 110.0, "is_demo": True, "available": pos["qty"]}
+        await q.message.reply_text("сколько продал?\nв позиции: " + str(pos["qty"]))
         return
 
     if data == "menu:current":
@@ -638,28 +631,19 @@ async def on_button(update, ctx):
 
     if data.startswith("skip:"):
         st["pending_buy"] = None
+        st["pending_sell"] = None
         await q.message.reply_text("пропущено.")
         return
 
     if data.startswith("sold:"):
         _, symbol, price_str = data.split(":")
         price = float(price_str)
-        trade = portfolio.close_position(price)
-        if "error" in trade:
+        pos = portfolio.load().get("open")
+        if not pos:
             await q.message.reply_text("нет открытой позиции")
             return
-        s = portfolio.stats()
-        sign = "+" if trade["pnl_pct"] > 0 else ""
-        abs_sign = "+" if trade["pnl_abs"] > 0 else ""
-        await q.message.reply_text(
-            "сделка закрыта\n"
-            + trade["side"] + " " + trade["symbol"] + "\n"
-            + "вход " + str(trade["entry"]) + " · выход " + str(trade["exit"]) + "\n"
-            + "кол-во " + str(trade["qty"]) + "\n"
-            + "PnL: " + sign + str(trade["pnl_pct"]) + "%  (" + abs_sign + str(trade["pnl_abs"]) + ")\n"
-            + "держишь " + str(trade["held_min"]) + " мин\n\n"
-            + "всего сделок: " + str(s["total"]) + " · winrate " + str(round(s["winrate"], 1)) + "%"
-        )
+        st["pending_sell"] = {"symbol": symbol, "price": price, "is_demo": False, "available": pos["qty"]}
+        await q.message.reply_text("сколько продал?\nв позиции: " + str(pos["qty"]))
         return
 
     if data.startswith("hold:"):
@@ -713,6 +697,62 @@ async def on_text(update, ctx):
         )
         return
 
+    if st.get("pending_sell"):
+        text = update.message.text.strip().replace(",", ".")
+        try:
+            qty = float(text)
+            if qty <= 0:
+                raise ValueError
+        except Exception:
+            await update.message.reply_text("нужно положительное число, например 3 или 0.5")
+            return
+        ps = st["pending_sell"]
+        st["pending_sell"] = None
+
+        if ps.get("is_demo"):
+            pos = st.get("demo_pos")
+            if not pos:
+                await update.message.reply_text("нет демо позиции")
+                return
+            if qty > pos["qty"] + 1e-8:
+                await update.message.reply_text("у тебя только " + str(pos["qty"]))
+                return
+            pnl = (ps["price"] - pos["entry"]) * qty
+            pnl_pct = (ps["price"] - pos["entry"]) / pos["entry"] * 100
+            pos["qty"] -= qty
+            rem = pos["qty"] if pos["qty"] > 1e-8 else 0
+            st["demo_pos"] = pos if rem > 0 else None
+            
+            rem_str = "\nосталось в позиции: " + str(rem) if rem > 0 else "\nпозиция полностью закрыта"
+            await update.message.reply_text(
+                "Сделка закрыта (ДЕМО)\n"
+                "вход " + str(pos['entry']) + " · выход " + str(ps['price']) + "\n"
+                "кол-во " + str(qty) + "\n"
+                "PnL: " + str(round(pnl_pct,2)) + "% (" + str(round(pnl,2)) + " USDT)" + rem_str
+            )
+            return
+
+        trade = portfolio.close_position(ps["price"], qty)
+        if "error" in trade:
+            await update.message.reply_text(trade["error"])
+            return
+        s = portfolio.stats()
+        sign = "+" if trade["pnl_pct"] > 0 else ""
+        abs_sign = "+" if trade["pnl_abs"] > 0 else ""
+        
+        rem = trade["remaining"]
+        rem_str = "\nосталось в позиции: " + str(rem) if rem > 0 else "\nпозиция полностью закрыта"
+
+        await update.message.reply_text(
+            "сделка закрыта\n"
+            + trade["side"] + " " + trade["symbol"] + "\n"
+            + "вход " + str(trade["entry"]) + " · выход " + str(trade["exit"]) + "\n"
+            + "продано " + str(trade["qty"]) + "\n"
+            + "PnL: " + sign + str(trade["pnl_pct"]) + "%  (" + abs_sign + str(trade["pnl_abs"]) + ")" + rem_str + "\n\n"
+            + "всего сделок: " + str(s["total"]) + " · winrate " + str(round(s["winrate"], 1)) + "%"
+        )
+        return
+
     if not st.get("search_mode"):
         return
     st["search_mode"] = False
@@ -751,4 +791,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
