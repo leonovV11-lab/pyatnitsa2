@@ -75,9 +75,8 @@ class Signal:
     symbol: str = ""
 
     def pretty(self) -> str:
-        arrow = {"BUY": "BUY", "SELL": "SELL", "HOLD": "HOLD"}[self.action]
         lines = []
-        lines.append(arrow + " <b>" + self.action + "</b> · " + self.mode.value.upper())
+        lines.append("<b>" + self.action + "</b> · " + self.mode.value.upper())
         lines.append("пара: <code>" + escape(self.symbol) + "</code>")
         lines.append("цена: <code>" + str(round(self.price, 4)) + "</code>")
         lines.append("уверенность: <b>" + str(int(self.confidence * 100)) + "%</b>")
@@ -318,3 +317,38 @@ class Friday:
         else:
             sig.reasons.append("[фильтр] старший ТФ " + trend + " — согласовано")
         return sig
+
+    # НОВЫЙ МЕТОД ДЛЯ МИКРО-ШАГА
+    def micro_predict(self):
+        raw = self.exchange.fetch_ohlcv(self.symbol, timeframe="1m", limit=15)
+        if not raw or len(raw) < 10:
+            raise RuntimeError("мало данных")
+        df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        votes = 0
+        if last["close"] > last["open"]: votes += 1
+        else: votes -= 1
+
+        if last["close"] > prev["close"]: votes += 1
+        else: votes -= 1
+
+        if last["volume"] > prev["volume"] * 1.2:
+            votes += 1 if votes > 0 else -1
+
+        if votes >= 2:
+            action = "BUY"
+        elif votes <= -2:
+            action = "SELL"
+        else:
+            action = "HOLD"
+
+        price = float(last["close"])
+        tp = price * 1.001
+        sl = price * 0.999
+        if action == "SELL":
+            tp = price * 0.999
+            sl = price * 1.001
+
+        return Signal(Mode.SCALP, action, 0.5, price, ["микро-импульс 1m"], sl, tp, self.symbol)
