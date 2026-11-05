@@ -1,5 +1,5 @@
 # language: Python, file: exchanges.py
-# *список бирж + функция загрузки всех пар с биржи*
+# *бирж + функция загрузки всех пар*
 
 import ccxt
 
@@ -25,7 +25,6 @@ DEFAULT_QUOTES = ["USDT", "USDC", "BTC", "ETH"]
 
 
 def load_all_pairs(exchange_key: str, quote: str = "USDT", max_pairs: int = 500) -> list:
-    """тянет с биржи все активные спотовые пары с заданной котировкой."""
     try:
         ex = getattr(ccxt, exchange_key)({"enableRateLimit": True})
         ex.load_markets()
