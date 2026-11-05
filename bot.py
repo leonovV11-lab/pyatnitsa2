@@ -6,7 +6,7 @@ import ccxt
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
-from friday import Friday, Mode
+from friday import Friday, Mode, MODE_CONFIG
 from chart import build_chart
 from exchanges import EXCHANGES, DEFAULT_QUOTES, load_all_pairs
 from config import TELEGRAM_TOKEN, DEFAULT_SYMBOL, PROFILES
@@ -122,7 +122,7 @@ def kb_type_select(ex, symbol):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("сигналы (BUY/SELL + кнопки)", callback_data="stype:signals")],
         [InlineKeyboardButton("прогноз (вверх / вниз)", callback_data="stype:forecast")],
-        [InlineKeyboardButton("микро-шаг (1 мин)", callback_data="stype:micro")],
+        [InlineKeyboardButton("микро-шаг (свечи)", callback_data="stype:micro")],
         [InlineKeyboardButton("назад", callback_data="pair:" + ex + ":USDT:" + symbol.split("/")[0])],
     ])
 
@@ -265,7 +265,6 @@ def history_text(filter_type):
         return "В этой категории сделок пока нет."
     
     lines = [f"<b>История ({filter_type}):</b>", ""]
-    # Показываем последние 15 сделок
     for t in history[-15:][::-1]:
         sign = "+" if t["pnl_pct"] > 0 else ""
         abs_sign = "+" if t["pnl_abs"] > 0 else ""
@@ -409,22 +408,26 @@ async def _forecast_loop(chat_id, ctx, st):
 async def _micro_loop(chat_id, ctx, st):
     ex = st["exchange"]
     sym = st["symbol"]
+    mode = st["mode"]
+    interval = st["interval"]
+    tf = MODE_CONFIG[Mode(mode)]["tf"]
 
     await ctx.bot.send_message(
         chat_id,
         "МИКРО-ШАГ запущен. " + sym + " на " + EXCHANGES[ex] + "\n"
-        + "предсказываю шаг каждую минуту. жми кнопки для входа/выхода.",
+        + "таймфрейм: " + tf + " · проверка каждые " + str(interval) + " сек.\n"
+        + "жми кнопки для входа/выхода.",
         reply_markup=kb_running(ex, sym),
     )
 
     while st["live"]:
         try:
             friday = await asyncio.to_thread(Friday, sym, ex)
-            sig = await asyncio.to_thread(friday.micro_predict)
+            sig = await asyncio.to_thread(friday.micro_predict, Mode(mode))
             
             if sig.action != "HOLD":
                 arrow = "↑ ВВЕРХ" if sig.action == "BUY" else "↓ ВНИЗ"
-                msg = ("ПРОГНОЗ НА СЛЕДУЮЩУЮ МИНУТУ\n"
+                msg = ("ПРОГНОЗ НА СЛЕДУЮЩУЮ СВЕЧУ (" + tf + ")\n"
                        + arrow + " (" + sig.action + ")\n"
                        + "цена: " + str(round(sig.price, 4)) + "\n\n"
                        + "жми кнопку чтобы зафиксировать сделку.")
@@ -435,7 +438,7 @@ async def _micro_loop(chat_id, ctx, st):
         except Exception as e:
             log.warning("micro error: " + str(e))
             
-        for _ in range(60):
+        for _ in range(interval):
             if not st["live"]:
                 return
             await asyncio.sleep(1)
@@ -479,7 +482,6 @@ async def on_button(update, ctx):
         await q.message.reply_text(stats_text(), reply_markup=kb_start())
         return
 
-    # --- ИСТОРИЯ СДЕЛОК ---
     if data == "hist:menu":
         await q.message.reply_text("📁 <b>Папка с историей.</b>\nВыбери категорию:", 
                                    parse_mode=ParseMode.HTML, reply_markup=kb_history_menu())
@@ -490,7 +492,6 @@ async def on_button(update, ctx):
         text = history_text(filter_type)
         await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_history_menu())
         return
-    # ----------------------
 
     if data == "demo:start":
         st["demo_pos"] = None
@@ -616,7 +617,7 @@ async def on_button(update, ctx):
         st["signal_type"] = arg
         if arg == "signals": label = "сигналы (BUY/SELL)"
         elif arg == "forecast": label = "прогноз (вверх/вниз)"
-        else: label = "микро-шаг (1 мин)"
+        else: label = "микро-шаг (свечи)"
         
         await q.message.reply_text(
             "тип: " + label + "\n\nшаг 6: режим",
