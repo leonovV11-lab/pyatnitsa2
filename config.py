@@ -16,13 +16,13 @@ PROFILES = {
     "high": {
         "label": "большая прибыль",
         "min_confidence": 0.85,
-        "tp_mult": 4.0,
+        "tp_mult": 7.0,
         "cooldown": 900,
     },
     "low": {
         "label": "малая прибыль",
         "min_confidence": 0.65,
-        "tp_mult": 1.5,
+        "tp_mult": 4.0,
         "cooldown": 180,
     },
 }
