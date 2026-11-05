@@ -318,9 +318,10 @@ class Friday:
             sig.reasons.append("[фильтр] старший ТФ " + trend + " — согласовано")
         return sig
 
-    # НОВЫЙ МЕТОД ДЛЯ МИКРО-ШАГА
-    def micro_predict(self):
-        raw = self.exchange.fetch_ohlcv(self.symbol, timeframe="1m", limit=15)
+    # ОБНОВЛЕННЫЙ МЕТОД МИКРО-ШАГА (принимает таймфрейм)
+    def micro_predict(self, mode=Mode.SCALP):
+        tf = MODE_CONFIG[mode]["tf"]
+        raw = self.exchange.fetch_ohlcv(self.symbol, timeframe=tf, limit=15)
         if not raw or len(raw) < 10:
             raise RuntimeError("мало данных")
         df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
@@ -351,4 +352,4 @@ class Friday:
             tp = price * 0.999
             sl = price * 1.001
 
-        return Signal(Mode.SCALP, action, 0.5, price, ["микро-импульс 1m"], sl, tp, self.symbol)
+        return Signal(mode, action, 0.5, price, ["микро-импульс " + tf], sl, tp, self.symbol)
