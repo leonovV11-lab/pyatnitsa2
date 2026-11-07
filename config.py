@@ -25,4 +25,10 @@ PROFILES = {
         "tp_mult": 4.0,
         "cooldown": 180,
     },
+    "rapid": {
+        "label": "быстрый (микро-профит)",
+        "min_confidence": 0.50,
+        "tp_mult": 1.2,
+        "cooldown": 60,
+    },
 }
