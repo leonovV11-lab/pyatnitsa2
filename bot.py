@@ -120,7 +120,8 @@ def kb_profile_select(ex, symbol):
 
 def kb_type_select(ex, symbol):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("сигналы (BUY/SELL + кнопки)", callback_data="stype:signals")],
+        [InlineKeyboardButton("сигналы (умный анализ)", callback_data="stype:signals")],
+        [InlineKeyboardButton("быстрый (микро-профит)", callback_data="stype:rapid")],
         [InlineKeyboardButton("прогноз (вверх / вниз)", callback_data="stype:forecast")],
         [InlineKeyboardButton("микро-шаг (свечи)", callback_data="stype:micro")],
         [InlineKeyboardButton("назад", callback_data="pair:" + ex + ":USDT:" + symbol.split("/")[0])],
@@ -283,15 +284,18 @@ async def _live_loop(chat_id, ctx, st):
     ex = st["exchange"]
     sym = st["symbol"]
     mode = st["mode"]
-    profile = PROFILES[st.get("profile", "high")]
+    
+    # Если выбран "быстрый", принудительно берем профиль rapid
+    profile_key = "rapid" if st.get("signal_type") == "rapid" else st.get("profile", "high")
+    profile = PROFILES[profile_key]
+    
     min_conf = profile["min_confidence"]
     cooldown = profile["cooldown"]
     tp_mult = profile["tp_mult"]
 
     await ctx.bot.send_message(
         chat_id,
-        "сигналы запущены. " + sym + " на " + EXCHANGES[ex] + "\n"
-        + "профиль: " + profile["label"] + "\n"
+        "режим " + profile["label"] + " запущен. " + sym + " на " + EXCHANGES[ex] + "\n"
         + "порог " + str(int(min_conf * 100)) + "% · тейк " + str(tp_mult) + "R\n"
         + "проверка каждые " + str(interval) + " сек.",
         reply_markup=kb_running(ex, sym),
@@ -307,7 +311,7 @@ async def _live_loop(chat_id, ctx, st):
                 last_time = st["last_sent"].get(sig.action, 0)
                 if now - last_time >= cooldown:
                     st["last_sent"][sig.action] = now
-                    header = "СИГНАЛ"
+                    header = "СИГНАЛ (" + profile["label"] + ")"
                     pos = portfolio.load().get("open")
                     if pos:
                         cp = portfolio.current_pnl(sig.price)
@@ -316,7 +320,7 @@ async def _live_loop(chat_id, ctx, st):
                                       + str(round(cp["pnl_abs"], 4)) + ")\n"
                                       + "вход " + str(cp["entry"]) + " · " + cp["side"]
                                       + " · кол-во " + str(cp["qty"])
-                                      + "\n\nСИГНАЛ")
+                                      + "\n\n" + header)
                     has_pos = pos is not None
                     await ctx.bot.send_message(
                         chat_id,
@@ -615,7 +619,9 @@ async def on_button(update, ctx):
                                        reply_markup=kb_type_select(st["exchange"], st["symbol"]))
             return
         st["signal_type"] = arg
-        if arg == "signals": label = "сигналы (BUY/SELL)"
+        
+        if arg == "signals": label = "сигналы (умный анализ)"
+        elif arg == "rapid": label = "быстрый (микро-профит)"
         elif arg == "forecast": label = "прогноз (вверх/вниз)"
         else: label = "микро-шаг (свечи)"
         
@@ -656,16 +662,15 @@ async def on_button(update, ctx):
         st["exchange"] = ex
         st["symbol"] = symbol
         st["mode"] = mode_name
-        profile = PROFILES.get(st.get("profile", "high"), {})
         
         if st.get("signal_type") == "signals": label = "сигналы"
+        elif st.get("signal_type") == "rapid": label = "быстрый (микро-профит)"
         elif st.get("signal_type") == "forecast": label = "прогноз"
         else: label = "микро-шаг"
         
         await q.message.reply_text(
             "тип " + label + "\n"
             + "режим " + mode_name + "\n"
-            + "профиль " + profile.get("label", "—") + "\n"
             + "биржа " + EXCHANGES[ex] + "\n"
             + "пара " + symbol + "\n\nжми ЗАПУСТИТЬ",
             reply_markup=kb_confirm_start(ex, symbol, mode_name),
