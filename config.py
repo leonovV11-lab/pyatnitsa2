@@ -26,8 +26,8 @@ PROFILES = {
         "cooldown": 180,
     },
     "rapid": {
-        "label": "микро-профит (85%)",
-        "min_confidence": 0.85,
+        "label": "микро-профит (75%)",
+        "min_confidence": 0.75,
         "tp_mult": 1.0,
         "cooldown": 60,
     },
