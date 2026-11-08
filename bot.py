@@ -53,6 +53,9 @@ def get_state(chat_id):
         "new_sym": None,
         "new_mode": None,
         "new_profile": None,
+        "has_coins": False,
+        "awaiting_has_coins": False,
+        "pending_auto_ex": None,
     })
 
 
@@ -84,6 +87,12 @@ def kb_change_symbol():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Да, меняем", callback_data="autochange:yes")],
         [InlineKeyboardButton("Нет, оставляем эту", callback_data="autochange:no")],
+    ])
+
+def kb_has_coins():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Да, есть", callback_data="hascoins:yes")],
+        [InlineKeyboardButton("Нет, нету", callback_data="hascoins:no")],
     ])
 
 
@@ -350,6 +359,13 @@ async def _live_loop(chat_id, ctx, st):
         try:
             friday = await asyncio.to_thread(Friday, sym, ex)
             sig = await asyncio.to_thread(friday.analyze_filtered, Mode(mode), tp_mult)
+            
+            # Если у нас НЕТ монет, мы не принимаем сигналы SELL. Ждем только BUY.
+            if not st["has_coins"] and sig.action == "SELL":
+                # сбрасываем сигнал в HOLD
+                sig.action = "HOLD"
+                sig.reasons.append("[фильтр] у тебя нет монет — SELL отменён")
+
             if sig.action in ("BUY", "SELL") and sig.confidence >= min_conf:
                 now = time.time()
                 last_time = st["last_sent"].get(sig.action, 0)
@@ -410,6 +426,8 @@ async def _auto_loop(chat_id, ctx, st, hours):
     profile = PROFILES[best_profile]
     tf_label = MODE_CONFIG[Mode(best_mode)]["tf"]
     
+    # Спрашиваем, есть ли монеты
+    coin_name = best_sym.split("/")[0]
     await ctx.bot.send_message(
         chat_id,
         "🎯 <b>Лучший сетап найден:</b>\n"
@@ -417,10 +435,12 @@ async def _auto_loop(chat_id, ctx, st, hours):
         + "Волатильность 24ч: <b>" + str(round(best_vol, 2)) + "%</b>\n"
         + "Режим: <b>" + best_mode + " (" + tf_label + ")</b>\n"
         + "Профиль: <b>" + profile["label"] + "</b>\n\n"
-        + "Следим и ждем идеального входа.",
+        + "У тебя есть <b>" + coin_name + "</b> в наличии?",
         parse_mode=ParseMode.HTML,
-        reply_markup=kb_running(ex, "AUTO")
+        reply_markup=kb_has_coins()
     )
+    
+    st["awaiting_has_coins"] = True
 
     tp_mult = profile["tp_mult"]
     min_conf = profile["min_confidence"]
@@ -431,11 +451,16 @@ async def _auto_loop(chat_id, ctx, st, hours):
 
     while st["live"]:
         try:
+            # Если ждем ответа про монеты, ничего не делаем
+            if st["awaiting_has_coins"]:
+                await asyncio.sleep(2)
+                continue
+
             now = time.time()
             
-            # Если мы ждем ответа от пользователя, не спамим сигналами
+            # Если мы ждем ответа от пользователя по смене монеты, не спамим сигналами
             if st["change_suggested"]:
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
                 continue
 
             # Проверяем, не вышло ли время
@@ -477,6 +502,11 @@ async def _auto_loop(chat_id, ctx, st, hours):
             friday = await asyncio.to_thread(Friday, st["symbol"], ex)
             sig = await asyncio.to_thread(friday.analyze_filtered, Mode(st["mode"]), tp_mult)
             
+            # ФИЛЬТР: если нет монет, SELL отменяется
+            if not st["has_coins"] and sig.action == "SELL":
+                sig.action = "HOLD"
+                sig.reasons.append("[фильтр] у тебя нет монет — SELL отменён")
+
             if sig.action in ("BUY", "SELL") and sig.confidence >= min_conf:
                 now = time.time()
                 last_time = st["last_sent"].get(sig.action, 0)
@@ -580,6 +610,17 @@ async def on_button(update, ctx):
         if st.get("task"):
             st["task"].cancel()
         st["task"] = asyncio.create_task(_auto_loop(chat_id, ctx, st, hours))
+        return
+
+    if data.startswith("hascoins:"):
+        arg = data.split(":")[1]
+        st["awaiting_has_coins"] = False
+        if arg == "yes":
+            st["has_coins"] = True
+            await q.message.reply_text("✅ Принято. У тебя есть эта монета. Жду сигналов BUY (докупить) или SELL (продать твои).")
+        else:
+            st["has_coins"] = False
+            await q.message.reply_text("✅ Принято. У тебя нет этой монеты. Жду только сигналов BUY.")
         return
 
     if data.startswith("autochange:"):
@@ -1064,4 +1105,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
