@@ -3,6 +3,7 @@ import asyncio
 import logging
 import time
 import ccxt
+import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
@@ -46,6 +47,8 @@ def get_state(chat_id):
         "pending_sell": None,
         "demo_pos": None,
         "pending_hours": False,
+        "auto_hours": 12,
+        "auto_end_time": 0,
     })
 
 
@@ -64,6 +67,13 @@ def kb_auto_time():
         [InlineKeyboardButton("Весь день (12ч+)", callback_data="autotime:12")],
         [InlineKeyboardButton("Указать свое время (часы)", callback_data="autotime:custom")],
         [InlineKeyboardButton("назад", callback_data="menu:start")],
+    ])
+
+
+def kb_auto_continue():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Да, продолжить", callback_data="autocont:yes")],
+        [InlineKeyboardButton("Нет, в меню", callback_data="autocont:no")],
     ])
 
 
@@ -221,16 +231,12 @@ def get_cached_pairs(ex, quote):
 
 
 def find_best_asset(ex, hours):
-    """Сканирует ВЕСЬ рынок и ищет лучшую монету под заданное время (в часах)"""
     try:
         exchange = getattr(ccxt, ex)({"enableRateLimit": True})
         markets = exchange.load_markets()
-        
-        # Берем абсолютно все пары в USDT (до 300 штук с высоким объемом)
         usdt_pairs = [s for s in markets if s.endswith("/USDT") and markets[s]["active"] and markets[s]["spot"]]
         usdt_pairs = usdt_pairs[:300] 
         
-        # Загружаем тикеры пачкой
         tickers = exchange.fetch_tickers(usdt_pairs)
         
         best_sym = "BTC/USDT"
@@ -248,23 +254,13 @@ def find_best_asset(ex, hours):
                 best_volatility = volatility
                 best_sym = sym
                 
-                # Подбираем режим и профиль под время
                 if hours <= 4:
-                    # Быстрая торговля, берем волатильные монеты
                     best_mode = "scalp"
-                    if volatility > 8.0:
-                        best_profile = "rapid"
-                    else:
-                        best_profile = "low"
+                    best_profile = "rapid" if volatility > 8.0 else "low"
                 elif hours <= 12:
-                    # Среднесрочная торговля
                     best_mode = "intraday"
-                    if volatility > 6.0:
-                        best_profile = "low"
-                    else:
-                        best_profile = "high"
+                    best_profile = "low" if volatility > 6.0 else "high"
                 else:
-                    # Долгосрочная (весь день)
                     best_mode = "swing"
                     best_profile = "high"
 
@@ -383,7 +379,7 @@ async def _live_loop(chat_id, ctx, st):
 
 
 async def _auto_loop(chat_id, ctx, st, hours):
-    interval = st["interval"]
+    interval = 60 # Проверка смены монеты раз в минуту
     ex = st["exchange"]
     
     await ctx.bot.send_message(
@@ -418,18 +414,56 @@ async def _auto_loop(chat_id, ctx, st, hours):
 
     tp_mult = profile["tp_mult"]
     min_conf = profile["min_confidence"]
-    cooldown = interval
-
+    
     st["last_sent"] = {}
+    last_scan_time = time.time()
+
     while st["live"]:
         try:
+            now = time.time()
+            # Проверяем, не вышло ли время
+            if now >= st["auto_end_time"]:
+                st["live"] = False
+                await ctx.bot.send_message(
+                    chat_id,
+                    "⏰ <b>Время вышло!</b>\nТвоя сессия автопилота (" + str(hours) + " ч.) завершена.\nПродолжаем работу?",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_auto_continue()
+                )
+                return
+
+            # Раз в минуту проверяем смену лидера
+            if now - last_scan_time >= 60:
+                last_scan_time = now
+                new_sym, new_mode, new_profile, new_vol = await asyncio.to_thread(find_best_asset, ex, hours)
+                
+                if new_sym != st["symbol"]:
+                    old_sym = st["symbol"]
+                    st["symbol"] = new_sym
+                    st["mode"] = new_mode
+                    st["profile"] = new_profile
+                    
+                    new_profile_data = PROFILES[new_profile]
+                    new_tf = MODE_CONFIG[Mode(new_mode)]["tf"]
+                    
+                    await ctx.bot.send_message(
+                        chat_id,
+                        "🔄 <b>Смена лидера!</b>\n"
+                        + "Было: " + old_sym + "\n"
+                        + "Стало: " + new_sym + " (волатильность " + str(round(new_vol, 2)) + "%)\n"
+                        + "Режим: " + new_mode + " (" + new_tf + ")\n"
+                        + "Профиль: " + new_profile_data["label"],
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=kb_running(ex, "AUTO")
+                    )
+
             friday = await asyncio.to_thread(Friday, st["symbol"], ex)
             sig = await asyncio.to_thread(friday.analyze_filtered, Mode(st["mode"]), tp_mult)
             
             if sig.action in ("BUY", "SELL") and sig.confidence >= min_conf:
                 now = time.time()
                 last_time = st["last_sent"].get(sig.action, 0)
-                if now - last_time >= cooldown:
+                if now - last_time >= interval:
                     st["last_sent"][sig.action] = now
                     header = "🤖 АВТО-СИГНАЛ (" + st["symbol"] + " · " + tf_label + ")"
                     pos = portfolio.load().get("open")
@@ -500,7 +534,7 @@ async def on_button(update, ctx):
         return
 
     if data == "auto:start":
-        await q.message.reply_text("🤖 <b>АВТОПИЛОТ</b>\nСначала выбери время работы, чтобы я нашел лучшую монету:", parse_mode=ParseMode.HTML, reply_markup=kb_auto_time())
+        await q.message.reply_text("🤖 <b>АВТОПИЛОТ</b>\nСначала выбери время работы:", parse_mode=ParseMode.HTML, reply_markup=kb_auto_time())
         return
 
     if data.startswith("autotime:"):
@@ -512,9 +546,8 @@ async def on_button(update, ctx):
         else:
             hours = float(arg)
             st["pending_hours"] = False
-            await q.message.reply_text("Принято. Теперь выбери биржу для сканирования:", reply_markup=kb_exchanges_auto())
-            # сохраняем hours в стейт временно
             st["auto_hours"] = hours
+            await q.message.reply_text("Принято. Теперь выбери биржу для сканирования:", reply_markup=kb_exchanges_auto())
         return
         
     if data.startswith("autoex:"):
@@ -525,11 +558,24 @@ async def on_button(update, ctx):
         st["interval"] = 60
         
         hours = st.get("auto_hours", 12)
+        # Ставим таймер окончания
+        st["auto_end_time"] = time.time() + (hours * 3600)
         
         if st.get("task"):
             st["task"].cancel()
         st["task"] = asyncio.create_task(_auto_loop(chat_id, ctx, st, hours))
         return
+
+    if data.startswith("autocont:"):
+        arg = data.split(":")[1]
+        if arg == "no":
+            await q.message.reply_text("Ок, возвращаемся в меню.", reply_markup=kb_start())
+            return
+        else:
+            await q.message.reply_text("Сколько еще часов будем торговать?\nНапиши число, например: 1 или 0.5")
+            st["pending_hours"] = True
+            st["is_continuing"] = True
+            return
 
     if data == "menu:stats":
         await q.message.reply_text(stats_text(), reply_markup=kb_start())
@@ -823,6 +869,16 @@ async def on_text(update, ctx):
             return
         st["pending_hours"] = False
         st["auto_hours"] = hours
+        st["auto_end_time"] = time.time() + (hours * 3600)
+        st["live"] = True
+        
+        if st.get("is_continuing"):
+            st["is_continuing"] = False
+            if st.get("task"):
+                st["task"].cancel()
+            st["task"] = asyncio.create_task(_auto_loop(update.effective_chat.id, ctx, st, hours))
+            return
+            
         await update.message.reply_text(
             "Принято: " + str(hours) + " ч.\nТеперь выбери биржу для сканирования:",
             reply_markup=kb_exchanges_auto()
