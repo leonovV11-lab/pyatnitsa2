@@ -31,6 +31,17 @@ SENIOR_TF = {
 MAX_VOTES = 8.0
 
 
+# ФУНКЦИЯ УМНОГО ОКРУГЛЕНИЯ
+def fmt_price(price):
+    if price == 0: return "0"
+    p = float(price)
+    if p < 0.0001:
+        return f"{p:.8f}"
+    elif p < 0.01:
+        return f"{p:.6f}"
+    else:
+        return f"{p:.4f}"
+
 def ema(series, length):
     return series.ewm(span=length, adjust=False).mean()
 
@@ -78,11 +89,11 @@ class Signal:
         lines = []
         lines.append("<b>" + self.action + "</b> · " + self.mode.value.upper())
         lines.append("пара: <code>" + escape(self.symbol) + "</code>")
-        lines.append("цена: <code>" + str(round(self.price, 4)) + "</code>")
+        lines.append("цена: <code>" + fmt_price(self.price) + "</code>")
         lines.append("уверенность: <b>" + str(int(self.confidence * 100)) + "%</b>")
         if self.action != "HOLD":
-            lines.append("стоп: <code>" + str(round(self.stop_loss, 4)) + "</code>")
-            lines.append("тейк: <code>" + str(round(self.take_profit, 4)) + "</code>")
+            lines.append("стоп: <code>" + fmt_price(self.stop_loss) + "</code>")
+            lines.append("тейк: <code>" + fmt_price(self.take_profit) + "</code>")
         lines.append("")
         lines.append("причины:")
         for r in self.reasons:
@@ -318,7 +329,6 @@ class Friday:
             sig.reasons.append("[фильтр] старший ТФ " + trend + " — согласовано")
         return sig
 
-    # ОБНОВЛЕННЫЙ МЕТОД МИКРО-ШАГА (принимает таймфрейм)
     def micro_predict(self, mode=Mode.SCALP):
         tf = MODE_CONFIG[mode]["tf"]
         raw = self.exchange.fetch_ohlcv(self.symbol, timeframe=tf, limit=15)
