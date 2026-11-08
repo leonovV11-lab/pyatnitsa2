@@ -49,6 +49,10 @@ def get_state(chat_id):
         "pending_hours": False,
         "auto_hours": 12,
         "auto_end_time": 0,
+        "change_suggested": False,
+        "new_sym": None,
+        "new_mode": None,
+        "new_profile": None,
     })
 
 
@@ -74,6 +78,12 @@ def kb_auto_continue():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Да, продолжить", callback_data="autocont:yes")],
         [InlineKeyboardButton("Нет, в меню", callback_data="autocont:no")],
+    ])
+
+def kb_change_symbol():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Да, меняем", callback_data="autochange:yes")],
+        [InlineKeyboardButton("Нет, оставляем эту", callback_data="autochange:no")],
     ])
 
 
@@ -417,10 +427,17 @@ async def _auto_loop(chat_id, ctx, st, hours):
     
     st["last_sent"] = {}
     last_scan_time = time.time()
+    st["change_suggested"] = False
 
     while st["live"]:
         try:
             now = time.time()
+            
+            # Если мы ждем ответа от пользователя, не спамим сигналами
+            if st["change_suggested"]:
+                await asyncio.sleep(5)
+                continue
+
             # Проверяем, не вышло ли время
             if now >= st["auto_end_time"]:
                 st["live"] = False
@@ -438,24 +455,24 @@ async def _auto_loop(chat_id, ctx, st, hours):
                 new_sym, new_mode, new_profile, new_vol = await asyncio.to_thread(find_best_asset, ex, hours)
                 
                 if new_sym != st["symbol"]:
-                    old_sym = st["symbol"]
-                    st["symbol"] = new_sym
-                    st["mode"] = new_mode
-                    st["profile"] = new_profile
-                    
-                    new_profile_data = PROFILES[new_profile]
-                    new_tf = MODE_CONFIG[Mode(new_mode)]["tf"]
+                    # Нашли лидера, спрашиваем
+                    st["change_suggested"] = True
+                    st["new_sym"] = new_sym
+                    st["new_mode"] = new_mode
+                    st["new_profile"] = new_profile
+                    st["new_vol"] = new_vol
                     
                     await ctx.bot.send_message(
                         chat_id,
                         "🔄 <b>Смена лидера!</b>\n"
-                        + "Было: " + old_sym + "\n"
+                        + "Было: " + st["symbol"] + "\n"
                         + "Стало: " + new_sym + " (волатильность " + str(round(new_vol, 2)) + "%)\n"
-                        + "Режим: " + new_mode + " (" + new_tf + ")\n"
-                        + "Профиль: " + new_profile_data["label"],
+                        + "Режим: " + new_mode + "\n"
+                        + "Меняем?",
                         parse_mode=ParseMode.HTML,
-                        reply_markup=kb_running(ex, "AUTO")
+                        reply_markup=kb_change_symbol()
                     )
+                    continue # Ждем ответа, цикл пропускаем
 
             friday = await asyncio.to_thread(Friday, st["symbol"], ex)
             sig = await asyncio.to_thread(friday.analyze_filtered, Mode(st["mode"]), tp_mult)
@@ -558,12 +575,35 @@ async def on_button(update, ctx):
         st["interval"] = 60
         
         hours = st.get("auto_hours", 12)
-        # Ставим таймер окончания
         st["auto_end_time"] = time.time() + (hours * 3600)
         
         if st.get("task"):
             st["task"].cancel()
         st["task"] = asyncio.create_task(_auto_loop(chat_id, ctx, st, hours))
+        return
+
+    if data.startswith("autochange:"):
+        arg = data.split(":")[1]
+        st["change_suggested"] = False
+        if arg == "yes":
+            st["symbol"] = st["new_sym"]
+            st["mode"] = st["new_mode"]
+            st["profile"] = st["new_profile"]
+            await q.message.reply_text(
+                "✅ <b>Отлично, переключился!</b>\n"
+                + "Теперь работаем с: " + st["symbol"] + "\n"
+                + "Режим: " + st["mode"] + "\n\nПродолжаем поиск сигналов.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_running(st["exchange"], "AUTO")
+            )
+        else:
+            await q.message.reply_text(
+                "✅ <b>Ок, продолжаем смотреть за старой.</b>\n"
+                + "Монета: " + st["symbol"] + "\n"
+                + "Продолжаю искать лучшие варианты...",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_running(st["exchange"], "AUTO")
+            )
         return
 
     if data.startswith("autocont:"):
