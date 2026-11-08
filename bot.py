@@ -45,16 +45,25 @@ def get_state(chat_id):
         "pending_buy": None,
         "pending_sell": None,
         "demo_pos": None,
+        "pending_hours": False,
     })
 
 
 def kb_start():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Начать вручную", callback_data="menu:exchanges")],
-        [InlineKeyboardButton("🚀 УМНЫЙ АВТОПИЛОТ", callback_data="auto:start")],
+        [InlineKeyboardButton("АВТОПИЛОТ", callback_data="auto:start")],
         [InlineKeyboardButton("📁 История сделок", callback_data="hist:menu")],
         [InlineKeyboardButton("Статистика", callback_data="menu:stats")],
         [InlineKeyboardButton("Демо-тест", callback_data="demo:start")],
+    ])
+
+
+def kb_auto_time():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Весь день (12ч+)", callback_data="autotime:12")],
+        [InlineKeyboardButton("Указать свое время (часы)", callback_data="autotime:custom")],
+        [InlineKeyboardButton("назад", callback_data="menu:start")],
     ])
 
 
@@ -211,18 +220,17 @@ def get_cached_pairs(ex, quote):
     return CACHE[key]
 
 
-def find_best_asset(ex):
-    """Сканирует ВЕСЬ рынок и ищет лучшую монету + режим"""
+def find_best_asset(ex, hours):
+    """Сканирует ВЕСЬ рынок и ищет лучшую монету под заданное время (в часах)"""
     try:
         exchange = getattr(ccxt, ex)({"enableRateLimit": True})
         markets = exchange.load_markets()
         
-        # Берем абсолютно все пары в USDT
+        # Берем абсолютно все пары в USDT (до 300 штук с высоким объемом)
         usdt_pairs = [s for s in markets if s.endswith("/USDT") and markets[s]["active"] and markets[s]["spot"]]
-        
-        # Ограничим до 300, чтобы не привысить лимиты биржи, но это уже весь цвет рынка
         usdt_pairs = usdt_pairs[:300] 
         
+        # Загружаем тикеры пачкой
         tickers = exchange.fetch_tickers(usdt_pairs)
         
         best_sym = "BTC/USDT"
@@ -232,26 +240,31 @@ def find_best_asset(ex):
 
         for sym, data in tickers.items():
             if not data['percentage'] or not data['quoteVolume']: continue
-            if data['quoteVolume'] < 100000: continue # Отсекаем мертвые монеты с низким объемом
+            if data['quoteVolume'] < 100000: continue
             
-            # Считаем волатильность (абсолютное изменение за 24ч)
             volatility = abs(data['percentage'])
             
             if volatility > best_volatility:
                 best_volatility = volatility
                 best_sym = sym
                 
-                # Адаптивный выбор профиля и таймфрейма
-                if volatility > 8.0:
-                    # Если монета летает как безумная, берем минутку и микро-профит 1:1, чтобы быстро забрать
+                # Подбираем режим и профиль под время
+                if hours <= 4:
+                    # Быстрая торговля, берем волатильные монеты
                     best_mode = "scalp"
-                    best_profile = "rapid"
-                elif volatility > 4.0:
-                    # Средняя волатильность, 15 минут, забираем 4R
+                    if volatility > 8.0:
+                        best_profile = "rapid"
+                    else:
+                        best_profile = "low"
+                elif hours <= 12:
+                    # Среднесрочная торговля
                     best_mode = "intraday"
-                    best_profile = "low"
+                    if volatility > 6.0:
+                        best_profile = "low"
+                    else:
+                        best_profile = "high"
                 else:
-                    # Слабая волатильность, 4 часа, забираем 7R
+                    # Долгосрочная (весь день)
                     best_mode = "swing"
                     best_profile = "high"
 
@@ -369,20 +382,21 @@ async def _live_loop(chat_id, ctx, st):
             await asyncio.sleep(1)
 
 
-async def _auto_loop(chat_id, ctx, st):
+async def _auto_loop(chat_id, ctx, st, hours):
     interval = st["interval"]
     ex = st["exchange"]
     
     await ctx.bot.send_message(
         chat_id,
-        "🤖 <b>УМНЫЙ АВТОПИЛОТ (ВЕСЬ РЫНОК)</b>\n"
+        "🤖 <b>АВТОПИЛОТ ЗАПУЩЕН</b>\n"
         "Биржа: " + EXCHANGES[ex] + "\n"
-        "Сканирую все монеты, ищу максимальную волатильность...",
+        "Время работы: " + str(hours) + " ч.\n"
+        "Сканирую ВЕСЬ рынок...",
         parse_mode=ParseMode.HTML,
         reply_markup=kb_running(ex, "AUTO")
     )
 
-    best_sym, best_mode, best_profile, best_vol = await asyncio.to_thread(find_best_asset, ex)
+    best_sym, best_mode, best_profile, best_vol = await asyncio.to_thread(find_best_asset, ex, hours)
     st["symbol"] = best_sym
     st["mode"] = best_mode
     st["profile"] = best_profile
@@ -451,5 +465,506 @@ async def _auto_loop(chat_id, ctx, st):
             await asyncio.sleep(1)
 
 
-# ... остальные функции (on_button, on_text, main) остаются без изменений ...
-# Полный код bot.py нужен для замены файла, поэтому я объединю всё в один блок ниже.
+async def cmd_start(update, ctx):
+    await update.message.reply_text("Пятница на связи.", reply_markup=kb_start())
+
+
+async def cmd_stats(update, ctx):
+    await update.message.reply_text(stats_text(), reply_markup=kb_start())
+
+
+async def cmd_stop(update, ctx):
+    st = get_state(update.effective_chat.id)
+    st["live"] = False
+    st["pending_buy"] = None
+    st["pending_sell"] = None
+    if st.get("task"):
+        st["task"].cancel()
+        st["task"] = None
+    await update.message.reply_text("остановлено. состояние сброшено. что дальше?",
+                                    reply_markup=kb_after_stop(st["exchange"], st["symbol"]))
+
+
+async def on_button(update, ctx):
+    q = update.callback_query
+    await q.answer()
+    chat_id = q.message.chat_id
+    st = get_state(chat_id)
+    data = q.data
+
+    if data == "noop":
+        return
+
+    if data == "menu:start":
+        await q.message.reply_text("меню:", reply_markup=kb_start())
+        return
+
+    if data == "auto:start":
+        await q.message.reply_text("🤖 <b>АВТОПИЛОТ</b>\nСначала выбери время работы, чтобы я нашел лучшую монету:", parse_mode=ParseMode.HTML, reply_markup=kb_auto_time())
+        return
+
+    if data.startswith("autotime:"):
+        arg = data.split(":")[1]
+        if arg == "custom":
+            st["pending_hours"] = True
+            await q.message.reply_text("Сколько часов планируешь работать?\nНапиши число, например: 3 или 0.5")
+            return
+        else:
+            hours = float(arg)
+            st["pending_hours"] = False
+            await q.message.reply_text("Принято. Теперь выбери биржу для сканирования:", reply_markup=kb_exchanges_auto())
+            # сохраняем hours в стейт временно
+            st["auto_hours"] = hours
+        return
+        
+    if data.startswith("autoex:"):
+        ex = data.split(":")[1]
+        st["exchange"] = ex
+        st["signal_type"] = "rapid"
+        st["live"] = True
+        st["interval"] = 60
+        
+        hours = st.get("auto_hours", 12)
+        
+        if st.get("task"):
+            st["task"].cancel()
+        st["task"] = asyncio.create_task(_auto_loop(chat_id, ctx, st, hours))
+        return
+
+    if data == "menu:stats":
+        await q.message.reply_text(stats_text(), reply_markup=kb_start())
+        return
+
+    if data == "hist:menu":
+        await q.message.reply_text("📁 <b>Папка с историей.</b>\nВыбери категорию:", 
+                                   parse_mode=ParseMode.HTML, reply_markup=kb_history_menu())
+        return
+
+    if data.startswith("hist:view:"):
+        filter_type = data.split(":")[2]
+        text = history_text(filter_type)
+        await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_history_menu())
+        return
+
+    if data == "demo:start":
+        st["demo_pos"] = None
+        text = (
+            "СИГНАЛ (ДЕМО)\n"
+            "BUY · SCALP\n"
+            "пара: DEMO/USDT\n"
+            "цена: 100.00\n"
+            "уверенность: 85%\n"
+            "стоп: 95.00\n"
+            "тейк: 115.00\n\n"
+            "причины:\n"
+            "  • демо тренд\n"
+            "  • демо MACD"
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("купил", callback_data="demo:bought")],
+            [InlineKeyboardButton("пропустил", callback_data="demo:skip")]
+        ])
+        await q.message.reply_text(text, reply_markup=markup)
+        return
+
+    if data == "demo:bought":
+        st["pending_buy"] = {"symbol": "DEMO/USDT", "action": "BUY", "price": 100.0, "is_demo": True}
+        await q.message.reply_text("сколько купил?\nнапиши число, например 5")
+        return
+
+    if data == "demo:skip":
+        await q.message.reply_text("демо пропущено.", reply_markup=kb_start())
+        return
+
+    if data == "demo:sold":
+        pos = st.get("demo_pos")
+        if not pos:
+            await q.message.reply_text("нет демо-позиции", reply_markup=kb_start())
+            return
+        st["pending_sell"] = {"price": 110.0, "is_demo": True, "available": pos["qty"]}
+        await q.message.reply_text("сколько продал?\nв позиции: " + str(pos["qty"]))
+        return
+
+    if data == "menu:current":
+        profile = PROFILES.get(st.get("profile", "high"), {})
+        extra = ""
+        pos = portfolio.load().get("open")
+        if pos:
+            extra = ("\nоткрыта: " + pos["symbol"] + " " + pos["side"]
+                     + " @ " + fmt_price(pos["entry"]) + " · " + str(pos.get("qty", 1)))
+        await q.message.reply_text(
+            "биржа " + st["exchange"] + "\nпара " + st["symbol"]
+            + "\nтип " + st.get("signal_type", "signals")
+            + "\nрежим " + str(st["mode"])
+            + "\nпрофиль " + profile.get("label", "—") + extra,
+            reply_markup=kb_start(),
+        )
+        return
+
+    if data == "menu:exchanges":
+        await q.message.reply_text("шаг 1: биржа", reply_markup=kb_exchanges())
+        return
+
+    if data.startswith("ex:"):
+        ex = data.split(":", 1)[1]
+        st["exchange"] = ex
+        await q.message.reply_text("биржа " + EXCHANGES[ex] + "\nшаг 2: котировка", reply_markup=kb_quotes(ex))
+        return
+
+    if data.startswith("quote:"):
+        _, ex, quote = data.split(":")
+        st["quote"] = quote
+        st["page"] = 0
+        await q.message.reply_text("загружаю пары...")
+        try:
+            pairs = await asyncio.to_thread(get_cached_pairs, ex, quote)
+        except Exception as e:
+            await q.message.reply_text("ошибка: " + str(e))
+            return
+        await q.message.reply_text("найдено " + str(len(pairs)) + " пар",
+                                   reply_markup=kb_pairs(ex, quote, pairs, 0))
+        return
+
+    if data.startswith("page:"):
+        _, ex, quote, page_str = data.split(":")
+        page = int(page_str)
+        st["page"] = page
+        pairs = get_cached_pairs(ex, quote)
+        await q.message.reply_text("страница " + str(page + 1),
+                                   reply_markup=kb_pairs(ex, quote, pairs, page))
+        return
+
+    if data.startswith("back:quotes:"):
+        ex = data.split(":")[2]
+        await q.message.reply_text("котировка:", reply_markup=kb_quotes(ex))
+        return
+
+    if data.startswith("pair:"):
+        _, ex, quote, base = data.split(":")
+        symbol = base + "/" + quote
+        st["symbol"] = symbol
+        st["quote"] = quote
+        await q.message.reply_text("пара " + symbol + "\nшаг 4: профиль",
+                                   reply_markup=kb_profile_select(ex, symbol))
+        return
+
+    if data.startswith("profile:"):
+        profile_key = data.split(":")[1]
+        st["profile"] = profile_key
+        profile = PROFILES[profile_key]
+        await q.message.reply_text(
+            "профиль: " + profile["label"] + "\n"
+            + "порог " + str(int(profile["min_confidence"] * 100)) + "%\n"
+            + "тейк " + str(profile["tp_mult"]) + "R\n\n"
+            + "шаг 5: тип сигнала",
+            reply_markup=kb_type_select(st["exchange"], st["symbol"]),
+        )
+        return
+
+    if data.startswith("stype:"):
+        arg = data.split(":")[1]
+        if arg == "back":
+            await q.message.reply_text("выбери тип:",
+                                       reply_markup=kb_type_select(st["exchange"], st["symbol"]))
+            return
+        st["signal_type"] = arg
+        
+        if arg == "signals": label = "сигналы (умный анализ)"
+        elif arg == "rapid": label = "быстрый (микро-профит)"
+        elif arg == "forecast": label = "прогноз (вверх/вниз)"
+        else: label = "микро-шаг (свечи)"
+        
+        await q.message.reply_text(
+            "тип: " + label + "\n\nшаг 6: режим",
+            reply_markup=kb_mode_select(st["exchange"], st["symbol"]),
+        )
+        return
+
+    if data.startswith("back:pairs:"):
+        ex = data.split(":")[2]
+        quote = st.get("quote", "USDT")
+        pairs = get_cached_pairs(ex, quote)
+        await q.message.reply_text("выбери пару",
+                                   reply_markup=kb_pairs(ex, quote, pairs, st.get("page", 0)))
+        return
+
+    if data.startswith("sort:"):
+        _, ex, quote, order = data.split(":")
+        await q.message.reply_text("считаю цены...")
+        pairs = get_cached_pairs(ex, quote)
+        rows = await asyncio.to_thread(sort_pairs_by_price, ex, quote, order, pairs)
+        if not rows:
+            await q.message.reply_text("не удалось получить цены")
+            return
+        await q.message.reply_text("сортировка:",
+                                   reply_markup=kb_pairs_sorted(ex, quote, rows, order))
+        return
+
+    if data.startswith("search:"):
+        _, ex, quote = data.split(":")
+        st["search_mode"] = True
+        await q.message.reply_text("напиши код монеты, например SOL")
+        return
+
+    if data.startswith("lmode:"):
+        _, mode_name, ex, symbol = data.split(":")
+        st["exchange"] = ex
+        st["symbol"] = symbol
+        st["mode"] = mode_name
+        
+        if st.get("signal_type") == "signals": label = "сигналы"
+        elif st.get("signal_type") == "rapid": label = "микро-профит"
+        elif st.get("signal_type") == "forecast": label = "прогноз"
+        else: label = "микро-шаг"
+        
+        await q.message.reply_text(
+            "тип " + label + "\n"
+            + "режим " + mode_name + "\n"
+            + "биржа " + EXCHANGES[ex] + "\n"
+            + "пара " + symbol + "\n\nжми ЗАПУСТИТЬ",
+            reply_markup=kb_confirm_start(ex, symbol, mode_name),
+        )
+        return
+
+    if data.startswith("start_live:"):
+        _, ex, symbol, mode = data.split(":")
+        st["exchange"] = ex
+        st["symbol"] = symbol
+        st["mode"] = mode
+        if mode == "scalp":
+            st["interval"] = 60
+        elif mode == "intraday":
+            st["interval"] = 300
+        else:
+            st["interval"] = 900
+            
+        st["live"] = True
+        if st.get("task"):
+            st["task"].cancel()
+            
+        if st.get("signal_type") == "forecast":
+            st["task"] = asyncio.create_task(_forecast_loop(chat_id, ctx, st))
+        elif st.get("signal_type") == "micro":
+            st["task"] = asyncio.create_task(_micro_loop(chat_id, ctx, st))
+        else:
+            st["task"] = asyncio.create_task(_live_loop(chat_id, ctx, st))
+        return
+
+    if data.startswith("go:"):
+        _, ex, symbol, interval_str = data.split(":")
+        st["exchange"] = ex
+        st["symbol"] = symbol
+        st["interval"] = int(interval_str)
+        st["live"] = True
+        if st.get("task"):
+            st["task"].cancel()
+            
+        if st.get("signal_type") == "forecast":
+            st["task"] = asyncio.create_task(_forecast_loop(chat_id, ctx, st))
+        elif st.get("signal_type") == "micro":
+            st["task"] = asyncio.create_task(_micro_loop(chat_id, ctx, st))
+        else:
+            st["task"] = asyncio.create_task(_live_loop(chat_id, ctx, st))
+        return
+
+    if data.startswith("stop:"):
+        st["live"] = False
+        st["pending_buy"] = None
+        st["pending_sell"] = None
+        if st.get("task"):
+            st["task"].cancel()
+            st["task"] = None
+        await q.message.reply_text("остановлено. состояние сброшено. что дальше?",
+                                   reply_markup=kb_after_stop(st["exchange"], st["symbol"]))
+        return
+
+    if data.startswith("bought:"):
+        _, symbol, action, price_str = data.split(":")
+        price = float(price_str)
+        st["pending_buy"] = {"symbol": symbol, "action": action, "price": price, "is_demo": False}
+        word = "купил" if action == "BUY" else "открыл шорт"
+        await q.message.reply_text(
+            word + "\nсколько?\nнапиши число, например 100 или 0.5\nцена входа: " + fmt_price(price))
+        return
+
+    if data.startswith("skip:"):
+        st["pending_buy"] = None
+        st["pending_sell"] = None
+        await q.message.reply_text("пропущено. ждём следующий сигнал.")
+        return
+
+    if data.startswith("sold:"):
+        _, symbol, price_str = data.split(":")
+        price = float(price_str)
+        pos = portfolio.load().get("open")
+        if not pos:
+            await q.message.reply_text("нет открытой позиции")
+            return
+        st["pending_sell"] = {"symbol": symbol, "price": price, "is_demo": False, "available": pos["qty"]}
+        await q.message.reply_text("сколько продал?\nв позиции: " + str(pos["qty"]))
+        return
+
+    if data.startswith("hold:"):
+        await q.message.reply_text("держим позицию дальше.")
+        return
+
+
+async def on_text(update, ctx):
+    st = get_state(update.effective_chat.id)
+
+    if st.get("pending_hours"):
+        text = update.message.text.strip().replace(",", ".")
+        try:
+            hours = float(text)
+            if hours <= 0:
+                raise ValueError
+        except Exception:
+            await update.message.reply_text("нужно положительное число, например 3 или 0.5")
+            return
+        st["pending_hours"] = False
+        st["auto_hours"] = hours
+        await update.message.reply_text(
+            "Принято: " + str(hours) + " ч.\nТеперь выбери биржу для сканирования:",
+            reply_markup=kb_exchanges_auto()
+        )
+        return
+
+    if st.get("pending_buy"):
+        text = update.message.text.strip().replace(",", ".")
+        try:
+            qty = float(text)
+            if qty <= 0:
+                raise ValueError
+        except Exception:
+            await update.message.reply_text("нужно положительное число, например 100 или 0.5")
+            return
+        pb = st["pending_buy"]
+        st["pending_buy"] = None
+
+        if pb.get("is_demo"):
+            st["demo_pos"] = {"entry": pb["price"], "qty": qty, "side": pb["action"]}
+            msg = (
+                "СИГНАЛ (ДЕМО)\n"
+                "SELL · SCALP\n"
+                "пара: DEMO/USDT\n"
+                "цена: 110.00\n"
+                "уверенность: 80%\n"
+                "стоп: 115.00\n"
+                "тейк: 95.00\n\n"
+                "причины:\n"
+                "  • демо тренд вниз\n"
+                "  • демо MACD"
+            )
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("продал", callback_data="demo:sold")],
+                [InlineKeyboardButton("пропустил", callback_data="demo:skip")]
+            ])
+            await update.message.reply_text(msg, reply_markup=markup)
+            return
+
+        portfolio.open_position(pb["symbol"], pb["action"], pb["price"], qty)
+        side_word = "лонг" if pb["action"] == "BUY" else "шорт"
+        await update.message.reply_text(
+            "позиция открыта\n"
+            + side_word + " " + pb["symbol"] + "\n"
+            + "вход " + fmt_price(pb["price"]) + " · кол-во " + str(qty) + "\n\n"
+            + "при следующем сигнале увидишь PnL."
+        )
+        return
+
+    if st.get("pending_sell"):
+        text = update.message.text.strip().replace(",", ".")
+        try:
+            qty = float(text)
+            if qty <= 0:
+                raise ValueError
+        except Exception:
+            await update.message.reply_text("нужно положительное число, например 3 или 0.5")
+            return
+        ps = st["pending_sell"]
+        st["pending_sell"] = None
+
+        if ps.get("is_demo"):
+            pos = st.get("demo_pos")
+            if not pos:
+                await update.message.reply_text("нет демо позиции")
+                return
+            if qty > pos["qty"] + 1e-8:
+                await update.message.reply_text("у тебя только " + str(pos["qty"]))
+                return
+            pnl = (ps["price"] - pos["entry"]) * qty
+            pnl_pct = (ps["price"] - pos["entry"]) / pos["entry"] * 100
+            pos["qty"] -= qty
+            rem = pos["qty"] if pos["qty"] > 1e-8 else 0
+            st["demo_pos"] = pos if rem > 0 else None
+            
+            rem_str = "\nосталось в позиции: " + str(rem) if rem > 0 else "\nпозиция полностью закрыта"
+            await update.message.reply_text(
+                "Сделка закрыта (ДЕМО) и занесена в историю\n"
+                "вход " + fmt_price(pos['entry']) + " · выход " + fmt_price(ps['price']) + "\n"
+                "кол-во " + str(qty) + "\n"
+                "PnL: " + str(round(pnl_pct,2)) + "% (" + str(round(pnl,2)) + " USDT)" + rem_str,
+                reply_markup=kb_running(st["exchange"], st["symbol"])
+            )
+            return
+
+        trade = portfolio.close_position(ps["price"], qty)
+        if "error" in trade:
+            await update.message.reply_text(trade["error"])
+            return
+        s = portfolio.stats()
+        sign = "+" if trade["pnl_pct"] > 0 else ""
+        abs_sign = "+" if trade["pnl_abs"] > 0 else ""
+        
+        rem = trade["remaining"]
+        rem_str = "\nосталось в позиции: " + str(rem) if rem > 0 else "\nпозиция полностью закрыта"
+
+        await update.message.reply_text(
+            "сделка закрыта и занесена в историю\n"
+            + trade["side"] + " " + trade["symbol"] + "\n"
+            + "вход " + fmt_price(trade["entry"]) + " · выход " + fmt_price(trade["exit"]) + "\n"
+            + "продано " + str(trade["qty"]) + "\n"
+            + "PnL: " + sign + str(trade["pnl_pct"]) + "%  (" + abs_sign + str(trade["pnl_abs"]) + ")" + rem_str + "\n\n"
+            + "всего сделок: " + str(s["total"]) + " · winrate " + str(round(s["winrate"], 1)) + "%",
+            reply_markup=kb_running(st["exchange"], st["symbol"])
+        )
+        return
+
+    if not st.get("search_mode"):
+        return
+    st["search_mode"] = False
+    query = update.message.text.strip().upper()
+    if not query:
+        return
+    ex = st["exchange"]
+    quote = st.get("quote", "USDT")
+    try:
+        pairs = await asyncio.to_thread(get_cached_pairs, ex, quote)
+        matches = [p for p in pairs if query in p.split("/")[0]]
+        if not matches:
+            await update.message.reply_text("пара с " + query + " не найдена")
+            return
+        rows = []
+        for m in matches[:15]:
+            rows.append([InlineKeyboardButton(m, callback_data="pair:" + ex + ":" + quote + ":" + m.split("/")[0])])
+        await update.message.reply_text("нашёл " + str(len(matches)) + ":",
+                                        reply_markup=InlineKeyboardMarkup(rows))
+    except Exception as e:
+        await update.message.reply_text("ошибка: " + str(e))
+
+
+def main():
+    if not TELEGRAM_TOKEN:
+        raise SystemExit("нет TELEGRAM_TOKEN")
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    log.info("Пятница запущена. polling...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
