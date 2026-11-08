@@ -730,4 +730,283 @@ async def on_button(update, ctx):
         
         if arg == "signals": label = "сигналы (умный анализ)"
         elif arg == "rapid": label = "быстрый (микро-профит)"
-        elif arg == "forecast": label = "прогноз (
+        elif arg == "forecast": label = "прогноз (вверх/вниз)"
+        else: label = "микро-шаг (свечи)"
+        
+        await q.message.reply_text(
+            "тип: " + label + "\n\nшаг 6: режим",
+            reply_markup=kb_mode_select(st["exchange"], st["symbol"]),
+        )
+        return
+
+    if data.startswith("back:pairs:"):
+        ex = data.split(":")[2]
+        quote = st.get("quote", "USDT")
+        pairs = get_cached_pairs(ex, quote)
+        await q.message.reply_text("выбери пару",
+                                   reply_markup=kb_pairs(ex, quote, pairs, st.get("page", 0)))
+        return
+
+    if data.startswith("sort:"):
+        _, ex, quote, order = data.split(":")
+        await q.message.reply_text("считаю цены...")
+        pairs = get_cached_pairs(ex, quote)
+        rows = await asyncio.to_thread(sort_pairs_by_price, ex, quote, order, pairs)
+        if not rows:
+            await q.message.reply_text("не удалось получить цены")
+            return
+        await q.message.reply_text("сортировка:",
+                                   reply_markup=kb_pairs_sorted(ex, quote, rows, order))
+        return
+
+    if data.startswith("search:"):
+        _, ex, quote = data.split(":")
+        st["search_mode"] = True
+        await q.message.reply_text("напиши код монеты, например SOL")
+        return
+
+    if data.startswith("lmode:"):
+        _, mode_name, ex, symbol = data.split(":")
+        st["exchange"] = ex
+        st["symbol"] = symbol
+        st["mode"] = mode_name
+        
+        if st.get("signal_type") == "signals": label = "сигналы"
+        elif st.get("signal_type") == "rapid": label = "микро-профит"
+        elif st.get("signal_type") == "forecast": label = "прогноз"
+        else: label = "микро-шаг"
+        
+        await q.message.reply_text(
+            "тип " + label + "\n"
+            + "режим " + mode_name + "\n"
+            + "биржа " + EXCHANGES[ex] + "\n"
+            + "пара " + symbol + "\n\nжми ЗАПУСТИТЬ",
+            reply_markup=kb_confirm_start(ex, symbol, mode_name),
+        )
+        return
+
+    if data.startswith("start_live:"):
+        _, ex, symbol, mode = data.split(":")
+        st["exchange"] = ex
+        st["symbol"] = symbol
+        st["mode"] = mode
+        if mode == "scalp":
+            st["interval"] = 60
+        elif mode == "intraday":
+            st["interval"] = 300
+        else:
+            st["interval"] = 900
+            
+        st["live"] = True
+        if st.get("task"):
+            st["task"].cancel()
+            
+        if st.get("signal_type") == "forecast":
+            st["task"] = asyncio.create_task(_forecast_loop(chat_id, ctx, st))
+        elif st.get("signal_type") == "micro":
+            st["task"] = asyncio.create_task(_micro_loop(chat_id, ctx, st))
+        else:
+            st["task"] = asyncio.create_task(_live_loop(chat_id, ctx, st))
+        return
+
+    if data.startswith("go:"):
+        _, ex, symbol, interval_str = data.split(":")
+        st["exchange"] = ex
+        st["symbol"] = symbol
+        st["interval"] = int(interval_str)
+        st["live"] = True
+        if st.get("task"):
+            st["task"].cancel()
+            
+        if st.get("signal_type") == "forecast":
+            st["task"] = asyncio.create_task(_forecast_loop(chat_id, ctx, st))
+        elif st.get("signal_type") == "micro":
+            st["task"] = asyncio.create_task(_micro_loop(chat_id, ctx, st))
+        else:
+            st["task"] = asyncio.create_task(_live_loop(chat_id, ctx, st))
+        return
+
+    if data.startswith("stop:"):
+        st["live"] = False
+        st["pending_buy"] = None
+        st["pending_sell"] = None
+        if st.get("task"):
+            st["task"].cancel()
+            st["task"] = None
+        await q.message.reply_text("остановлено. состояние сброшено. что дальше?",
+                                   reply_markup=kb_after_stop(st["exchange"], st["symbol"]))
+        return
+
+    if data.startswith("bought:"):
+        _, symbol, action, price_str = data.split(":")
+        price = float(price_str)
+        st["pending_buy"] = {"symbol": symbol, "action": action, "price": price, "is_demo": False}
+        word = "купил" if action == "BUY" else "открыл шорт"
+        await q.message.reply_text(
+            word + "\nсколько?\nнапиши число, например 100 или 0.5\nцена входа: " + fmt_price(price))
+        return
+
+    if data.startswith("skip:"):
+        st["pending_buy"] = None
+        st["pending_sell"] = None
+        await q.message.reply_text("пропущено. ждём следующий сигнал.")
+        return
+
+    if data.startswith("sold:"):
+        _, symbol, price_str = data.split(":")
+        price = float(price_str)
+        pos = portfolio.load().get("open")
+        if not pos:
+            await q.message.reply_text("нет открытой позиции")
+            return
+        st["pending_sell"] = {"symbol": symbol, "price": price, "is_demo": False, "available": pos["qty"]}
+        await q.message.reply_text("сколько продал?\nв позиции: " + str(pos["qty"]))
+        return
+
+    if data.startswith("hold:"):
+        await q.message.reply_text("держим позицию дальше.")
+        return
+
+
+async def on_text(update, ctx):
+    st = get_state(update.effective_chat.id)
+
+    if st.get("pending_buy"):
+        text = update.message.text.strip().replace(",", ".")
+        try:
+            qty = float(text)
+            if qty <= 0:
+                raise ValueError
+        except Exception:
+            await update.message.reply_text("нужно положительное число, например 100 или 0.5")
+            return
+        pb = st["pending_buy"]
+        st["pending_buy"] = None
+
+        if pb.get("is_demo"):
+            st["demo_pos"] = {"entry": pb["price"], "qty": qty, "side": pb["action"]}
+            msg = (
+                "СИГНАЛ (ДЕМО)\n"
+                "SELL · SCALP\n"
+                "пара: DEMO/USDT\n"
+                "цена: 110.00\n"
+                "уверенность: 80%\n"
+                "стоп: 115.00\n"
+                "тейк: 95.00\n\n"
+                "причины:\n"
+                "  • демо тренд вниз\n"
+                "  • демо MACD"
+            )
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("продал", callback_data="demo:sold")],
+                [InlineKeyboardButton("пропустил", callback_data="demo:skip")]
+            ])
+            await update.message.reply_text(msg, reply_markup=markup)
+            return
+
+        portfolio.open_position(pb["symbol"], pb["action"], pb["price"], qty)
+        side_word = "лонг" if pb["action"] == "BUY" else "шорт"
+        await update.message.reply_text(
+            "позиция открыта\n"
+            + side_word + " " + pb["symbol"] + "\n"
+            + "вход " + fmt_price(pb["price"]) + " · кол-во " + str(qty) + "\n\n"
+            + "при следующем сигнале увидишь PnL."
+        )
+        return
+
+    if st.get("pending_sell"):
+        text = update.message.text.strip().replace(",", ".")
+        try:
+            qty = float(text)
+            if qty <= 0:
+                raise ValueError
+        except Exception:
+            await update.message.reply_text("нужно положительное число, например 3 или 0.5")
+            return
+        ps = st["pending_sell"]
+        st["pending_sell"] = None
+
+        if ps.get("is_demo"):
+            pos = st.get("demo_pos")
+            if not pos:
+                await update.message.reply_text("нет демо позиции")
+                return
+            if qty > pos["qty"] + 1e-8:
+                await update.message.reply_text("у тебя только " + str(pos["qty"]))
+                return
+            pnl = (ps["price"] - pos["entry"]) * qty
+            pnl_pct = (ps["price"] - pos["entry"]) / pos["entry"] * 100
+            pos["qty"] -= qty
+            rem = pos["qty"] if pos["qty"] > 1e-8 else 0
+            st["demo_pos"] = pos if rem > 0 else None
+            
+            rem_str = "\nосталось в позиции: " + str(rem) if rem > 0 else "\nпозиция полностью закрыта"
+            await update.message.reply_text(
+                "Сделка закрыта (ДЕМО) и занесена в историю\n"
+                "вход " + fmt_price(pos['entry']) + " · выход " + fmt_price(ps['price']) + "\n"
+                "кол-во " + str(qty) + "\n"
+                "PnL: " + str(round(pnl_pct,2)) + "% (" + str(round(pnl,2)) + " USDT)" + rem_str,
+                reply_markup=kb_running(st["exchange"], st["symbol"])
+            )
+            return
+
+        trade = portfolio.close_position(ps["price"], qty)
+        if "error" in trade:
+            await update.message.reply_text(trade["error"])
+            return
+        s = portfolio.stats()
+        sign = "+" if trade["pnl_pct"] > 0 else ""
+        abs_sign = "+" if trade["pnl_abs"] > 0 else ""
+        
+        rem = trade["remaining"]
+        rem_str = "\nосталось в позиции: " + str(rem) if rem > 0 else "\nпозиция полностью закрыта"
+
+        await update.message.reply_text(
+            "сделка закрыта и занесена в историю\n"
+            + trade["side"] + " " + trade["symbol"] + "\n"
+            + "вход " + fmt_price(trade["entry"]) + " · выход " + fmt_price(trade["exit"]) + "\n"
+            + "продано " + str(trade["qty"]) + "\n"
+            + "PnL: " + sign + str(trade["pnl_pct"]) + "%  (" + abs_sign + str(trade["pnl_abs"]) + ")" + rem_str + "\n\n"
+            + "всего сделок: " + str(s["total"]) + " · winrate " + str(round(s["winrate"], 1)) + "%",
+            reply_markup=kb_running(st["exchange"], st["symbol"])
+        )
+        return
+
+    if not st.get("search_mode"):
+        return
+    st["search_mode"] = False
+    query = update.message.text.strip().upper()
+    if not query:
+        return
+    ex = st["exchange"]
+    quote = st.get("quote", "USDT")
+    try:
+        pairs = await asyncio.to_thread(get_cached_pairs, ex, quote)
+        matches = [p for p in pairs if query in p.split("/")[0]]
+        if not matches:
+            await update.message.reply_text("пара с " + query + " не найдена")
+            return
+        rows = []
+        for m in matches[:15]:
+            rows.append([InlineKeyboardButton(m, callback_data="pair:" + ex + ":" + quote + ":" + m.split("/")[0])])
+        await update.message.reply_text("нашёл " + str(len(matches)) + ":",
+                                        reply_markup=InlineKeyboardMarkup(rows))
+    except Exception as e:
+        await update.message.reply_text("ошибка: " + str(e))
+
+
+def main():
+    if not TELEGRAM_TOKEN:
+        raise SystemExit("нет TELEGRAM_TOKEN")
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    log.info("Пятница запущена. polling...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
