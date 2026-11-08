@@ -4,7 +4,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 import pandas as pd
-from friday import Friday, Mode, MODE_CONFIG, ema
+from friday import Friday, Mode, MODE_CONFIG, ema, fmt_price
 
 
 def build_chart(symbol: str, mode: Mode, signal, out_path: str = "signal.png", bars: int = 100) -> str:
@@ -32,7 +32,7 @@ def build_chart(symbol: str, mode: Mode, signal, out_path: str = "signal.png", b
     ax = axes[0]
     last_price = ohlc["Close"].iloc[-1]
     ax.axhline(last_price, color="#9ca3af", linestyle="--", linewidth=0.8)
-    ax.annotate(f"{signal.action} @ {signal.price:.4f}",
+    ax.annotate(f"{signal.action} @ {fmt_price(signal.price)}",
                 xy=(len(ohlc) - 1, last_price),
                 xytext=(len(ohlc) - 25, last_price),
                 color="#111827", fontsize=10, fontweight="bold",
