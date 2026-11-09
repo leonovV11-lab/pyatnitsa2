@@ -173,7 +173,6 @@ class Friday:
         votes = 0
         reasons = []
 
-        # Прогноз следующей свечи
         closes = df["close"].tail(30).values
         opens = df["open"].tail(30).values
         green_candles = sum(1 for i in range(len(closes)) if closes[i] > opens[i])
