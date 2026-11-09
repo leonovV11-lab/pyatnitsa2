@@ -14,19 +14,19 @@ PORTFOLIO_FILE = "portfolio.json"
 
 PROFILES = {
     "high": {
-        "label": "большая прибыль (7R)",
+        "label": "большая прибыль",
         "min_confidence": 0.85,
         "tp_mult": 7.0,
         "cooldown": 900,
     },
     "low": {
-        "label": "малая прибыль (4R)",
+        "label": "малая прибыль",
         "min_confidence": 0.65,
         "tp_mult": 4.0,
         "cooldown": 180,
     },
     "rapid": {
-        "label": "микро-профит (75%)",
+        "label": "микро-профит",
         "min_confidence": 0.75,
         "tp_mult": 1.0,
         "cooldown": 60,
