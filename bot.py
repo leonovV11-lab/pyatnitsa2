@@ -57,6 +57,10 @@ def get_state(chat_id):
         "awaiting_has_coins": False,
         "awaiting_tf": False,
         "current_vol": 0.0,
+        "last_entry": 0.0,
+        "last_stop": 0.0,
+        "last_tp": 0.0,
+        "breakeven_set": False,
     })
 
 
@@ -266,8 +270,6 @@ def find_best_asset(ex, hours):
         exchange = getattr(ccxt, ex)({"enableRateLimit": True})
         markets = exchange.load_markets()
         usdt_pairs = [s for s in markets if s.endswith("/USDT") and markets[s]["active"] and markets[s]["spot"]]
-        
-        # Берем только топ-100 по объему, чтобы не было проблем с ликвидностью
         usdt_pairs = usdt_pairs[:100] 
         
         tickers = exchange.fetch_tickers(usdt_pairs)
@@ -279,7 +281,7 @@ def find_best_asset(ex, hours):
 
         for sym, data in tickers.items():
             if not data['percentage'] or not data['quoteVolume']: continue
-            if data['quoteVolume'] < 1000000: continue # Обязательно высокая ликвидность
+            if data['quoteVolume'] < 1000000: continue 
             
             volatility = abs(data['percentage'])
             
@@ -287,17 +289,13 @@ def find_best_asset(ex, hours):
                 best_volatility = volatility
                 best_sym = sym
                 
-                # УМНАЯ ЛОГИКА: Если времени мало — берем мелкие сделки. Если много — крупные.
                 if hours <= 3:
-                    # Короткая сессия: много маленькой прибыли (скальп/интрадей)
                     best_mode = "scalp" if volatility > 5.0 else "intraday"
                     best_profile = "rapid"
                 elif hours <= 12:
-                    # Средняя сессия: 15 минут, баланс
                     best_mode = "intraday"
                     best_profile = "low" if volatility > 6.0 else "high"
                 else:
-                    # Долгая сессия: крупные сделки на 4h
                     best_mode = "swing"
                     best_profile = "high"
 
@@ -381,6 +379,34 @@ async def _live_loop(chat_id, ctx, st):
             if not st["has_coins"] and sig.action == "SELL":
                 sig.action = "HOLD"
                 sig.reasons.append("[фильтр] у тебя нет монет — SELL отменён")
+
+            # Защита в безубыток
+            pos = portfolio.load().get("open")
+            if pos and not st["breakeven_set"]:
+                entry = pos["entry"]
+                side = pos["side"]
+                current_price = sig.price
+                
+                # Если прошли половину пути до тейка
+                if side == "BUY":
+                    dist_to_tp = st["last_tp"] - entry
+                    curr_dist = current_price - entry
+                    if curr_dist >= dist_to_tp * 0.5:
+                        st["breakeven_set"] = True
+                        await ctx.bot.send_message(chat_id, "🛡 <b>Защита в безубыток!</b>\nЦена прошла половину пути. Стоп передвинут в цену входа.")
+                elif side == "SELL":
+                    dist_to_tp = entry - st["last_tp"]
+                    curr_dist = entry - current_price
+                    if curr_dist >= dist_to_tp * 0.5:
+                        st["breakeven_set"] = True
+                        await ctx.bot.send_message(chat_id, "🛡 <b>Защита в безубыток!</b>\nЦена прошла половину пути. Стоп передвинут в цену входа.")
+
+            # Сигнал на срочный выход, если в позиции и пришел противоположный
+            if pos and sig.action != "HOLD":
+                if pos["side"] == "BUY" and sig.action == "SELL":
+                    await ctx.bot.send_message(chat_id, "🚨 <b>СРОЧНО ЗАКРЫВАЙ!</b>\nТренд развернулся вниз (пришел SELL).")
+                elif pos["side"] == "SELL" and sig.action == "BUY":
+                    await ctx.bot.send_message(chat_id, "🚨 <b>СРОЧНО ЗАКРЫВАЙ!</b>\nТренд развернулся вверх (пришел BUY).")
 
             if sig.action in ("BUY", "SELL") and sig.confidence >= min_conf:
                 now = time.time()
@@ -491,7 +517,6 @@ async def _auto_loop(chat_id, ctx, st, hours):
                 )
                 return
 
-            # Раз в 15 секунд сканируем рынок на предмет лучшей монеты
             if now - last_scan_time >= 15:
                 last_scan_time = now
                 new_sym, new_mode, new_profile, new_vol = await asyncio.to_thread(find_best_asset, ex, hours)
@@ -514,7 +539,6 @@ async def _auto_loop(chat_id, ctx, st, hours):
                     )
                     continue 
 
-            # Проверяем сигнал по текущей монете
             friday = await asyncio.to_thread(Friday, st["symbol"], ex)
             sig = await asyncio.to_thread(friday.analyze_filtered, Mode(st["mode"]), tp_mult)
             
@@ -522,11 +546,33 @@ async def _auto_loop(chat_id, ctx, st, hours):
                 sig.action = "HOLD"
                 sig.reasons.append("[фильтр] у тебя нет монет — SELL отменён")
 
+            # Защита в безубыток (Автопилот)
+            pos = portfolio.load().get("open")
+            if pos and not st["breakeven_set"]:
+                entry = pos["entry"]
+                side = pos["side"]
+                current_price = sig.price
+                if side == "BUY":
+                    dist_to_tp = st["last_tp"] - entry
+                    curr_dist = current_price - entry
+                    if dist_to_tp > 0 and curr_dist >= dist_to_tp * 0.5:
+                        st["breakeven_set"] = True
+                        await ctx.bot.send_message(chat_id, "🛡 <b>Защита в безубыток!</b> (Автопилот)\nСтоп передвинут в цену входа.")
+                elif side == "SELL":
+                    dist_to_tp = entry - st["last_tp"]
+                    curr_dist = entry - current_price
+                    if dist_to_tp > 0 and curr_dist >= dist_to_tp * 0.5:
+                        st["breakeven_set"] = True
+                        await ctx.bot.send_message(chat_id, "🛡 <b>Защита в безубыток!</b> (Автопилот)\nСтоп передвинут в цену входа.")
+
+            # Срочный выход
+            if pos and sig.action != "HOLD":
+                if pos["side"] == "BUY" and sig.action == "SELL":
+                    await ctx.bot.send_message(chat_id, "🚨 <b>СРОЧНО ЗАКРЫВАЙ!</b>\nТренд развернулся вниз (пришел SELL).")
+                elif pos["side"] == "SELL" and sig.action == "BUY":
+                    await ctx.bot.send_message(chat_id, "🚨 <b>СРОЧНО ЗАКРЫВАЙ!</b>\nТренд развернулся вверх (пришел BUY).")
+
             if sig.action in ("BUY", "SELL") and sig.confidence >= min_conf:
-                # Проверяем, нет ли уже открытой позиции в портфеле
-                pos = portfolio.load().get("open")
-                
-                # Если позиции нет, шлем сигнал на вход (раз в 60 сек)
                 if not pos:
                     now_time = time.time()
                     last_time = st["last_sent"].get(sig.action, 0)
@@ -550,7 +596,7 @@ async def _auto_loop(chat_id, ctx, st, hours):
         except Exception as e:
             log.warning("auto error: " + str(e))
             
-        await asyncio.sleep(5) # Пауза 5 секунд перед следующим циклом
+        await asyncio.sleep(5)
 
 
 async def cmd_start(update, ctx):
@@ -566,6 +612,7 @@ async def cmd_stop(update, ctx):
     st["live"] = False
     st["pending_buy"] = None
     st["pending_sell"] = None
+    st["breakeven_set"] = False
     if st.get("task"):
         st["task"].cancel()
         st["task"] = None
@@ -677,6 +724,7 @@ async def on_button(update, ctx):
             st["mode"] = st["new_mode"]
             st["profile"] = st["new_profile"]
             st["current_vol"] = st["new_vol"]
+            st["breakeven_set"] = False
             await q.message.reply_text(
                 "✅ <b>Отлично, переключился!</b>\n"
                 + "Теперь работаем с: " + st["symbol"] + "\n"
@@ -905,6 +953,7 @@ async def on_button(update, ctx):
         st["exchange"] = ex
         st["symbol"] = symbol
         st["mode"] = mode
+        st["breakeven_set"] = False
         if mode == "scalp":
             st["interval"] = 60
         elif mode == "intraday":
@@ -930,6 +979,7 @@ async def on_button(update, ctx):
         st["symbol"] = symbol
         st["interval"] = int(interval_str)
         st["live"] = True
+        st["breakeven_set"] = False
         if st.get("task"):
             st["task"].cancel()
             
@@ -945,6 +995,7 @@ async def on_button(update, ctx):
         st["live"] = False
         st["pending_buy"] = None
         st["pending_sell"] = None
+        st["breakeven_set"] = False
         if st.get("task"):
             st["task"].cancel()
             st["task"] = None
@@ -956,9 +1007,20 @@ async def on_button(update, ctx):
         _, symbol, action, price_str = data.split(":")
         price = float(price_str)
         st["pending_buy"] = {"symbol": symbol, "action": action, "price": price, "is_demo": False}
+        st["breakeven_set"] = False
+        
+        # Умный расчет лота (риск 1% от 100 USDT = 1 USDT)
+        risk_usdt = 1.0
+        if price > 0:
+            suggested_qty = risk_usdt / price
+            suggest_text = "\n💡 Для риска в 1 USDT купи примерно: <code>" + fmt_price(suggested_qty) + "</code> монет."
+        else:
+            suggest_text = ""
+            
         word = "купил" if action == "BUY" else "открыл шорт"
         await q.message.reply_text(
-            word + "\nсколько?\nнапиши число, например 100 или 0.5\nцена входа: " + fmt_price(price))
+            word + "\nсколько?\nнапиши число, например 100 или 0.5\nцена входа: " + fmt_price(price) + suggest_text,
+            parse_mode=ParseMode.HTML)
         return
 
     if data.startswith("skip:"):
@@ -1074,6 +1136,10 @@ async def on_text(update, ctx):
             return
 
         portfolio.open_position(pb["symbol"], pb["action"], pb["price"], qty)
+        st["last_entry"] = pb["price"]
+        st["last_tp"] = pb["price"] * (1.05 if pb["action"] == "BUY" else 0.95) # Примерный тейк
+        st["breakeven_set"] = False
+        
         side_word = "лонг" if pb["action"] == "BUY" else "шорт"
         await update.message.reply_text(
             "позиция открыта\n"
