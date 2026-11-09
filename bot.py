@@ -84,6 +84,14 @@ def kb_auto_continue():
         [InlineKeyboardButton("Нет, в меню", callback_data="autocont:no")],
     ])
 
+
+def kb_change_symbol():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Да, меняем", callback_data="autochange:yes")],
+        [InlineKeyboardButton("Нет, оставляем эту", callback_data="autochange:no")],
+    ])
+
+
 def kb_has_coins():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Да, есть", callback_data="hascoins:yes")],
@@ -254,7 +262,6 @@ def get_cached_pairs(ex, quote):
 
 
 def find_best_asset(ex, hours):
-    """Сканирует ВЕСЬ рынок и ищет лучшую монету + режим"""
     try:
         exchange = getattr(ccxt, ex)({"enableRateLimit": True})
         markets = exchange.load_markets()
@@ -636,6 +643,7 @@ async def on_button(update, ctx):
             await q.message.reply_text("Напиши число минут (например: 5 или 30):")
             return
             
+        # БЕРЕМ ИМЯ МОНЕТЫ ИЗ НАЙДЕННОГО СЕТАПА (ONE), А НЕ ДЕФОЛТНОЕ (BTC)
         coin_name = st["symbol"].split("/")[0]
         tf_label = MODE_CONFIG[Mode(st["mode"])]["tf"]
         await q.message.reply_text(
