@@ -31,7 +31,6 @@ SENIOR_TF = {
 MAX_VOTES = 8.0
 
 
-# ФУНКЦИЯ УМНОГО ОКРУГЛЕНИЯ
 def fmt_price(price):
     if price == 0: return "0"
     p = float(price)
@@ -173,6 +172,19 @@ class Friday:
         prev = df.iloc[-2]
         votes = 0
         reasons = []
+
+        # Прогноз следующей свечи
+        closes = df["close"].tail(30).values
+        opens = df["open"].tail(30).values
+        green_candles = sum(1 for i in range(len(closes)) if closes[i] > opens[i])
+        candle_bias = green_candles / len(closes)
+        
+        if candle_bias > 0.6:
+            votes += 1
+            reasons.append("история свечей за BUY (" + str(int(candle_bias*100)) + "%)")
+        elif candle_bias < 0.4:
+            votes -= 1
+            reasons.append("история свечей за SELL (" + str(int((1-candle_bias)*100)) + "%)")
 
         if last["ema_fast"] > last["ema_slow"]:
             votes += 1
