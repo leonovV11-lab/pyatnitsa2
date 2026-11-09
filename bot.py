@@ -266,7 +266,9 @@ def find_best_asset(ex, hours):
         exchange = getattr(ccxt, ex)({"enableRateLimit": True})
         markets = exchange.load_markets()
         usdt_pairs = [s for s in markets if s.endswith("/USDT") and markets[s]["active"] and markets[s]["spot"]]
-        usdt_pairs = usdt_pairs[:300] 
+        
+        # Берем только топ-100 по объему, чтобы не было проблем с ликвидностью
+        usdt_pairs = usdt_pairs[:100] 
         
         tickers = exchange.fetch_tickers(usdt_pairs)
         
@@ -277,7 +279,7 @@ def find_best_asset(ex, hours):
 
         for sym, data in tickers.items():
             if not data['percentage'] or not data['quoteVolume']: continue
-            if data['quoteVolume'] < 100000: continue
+            if data['quoteVolume'] < 1000000: continue # Обязательно высокая ликвидность
             
             volatility = abs(data['percentage'])
             
@@ -285,13 +287,17 @@ def find_best_asset(ex, hours):
                 best_volatility = volatility
                 best_sym = sym
                 
-                if hours <= 4:
-                    best_mode = "scalp"
-                    best_profile = "rapid" if volatility > 8.0 else "low"
+                # УМНАЯ ЛОГИКА: Если времени мало — берем мелкие сделки. Если много — крупные.
+                if hours <= 3:
+                    # Короткая сессия: много маленькой прибыли (скальп/интрадей)
+                    best_mode = "scalp" if volatility > 5.0 else "intraday"
+                    best_profile = "rapid"
                 elif hours <= 12:
+                    # Средняя сессия: 15 минут, баланс
                     best_mode = "intraday"
                     best_profile = "low" if volatility > 6.0 else "high"
                 else:
+                    # Долгая сессия: крупные сделки на 4h
                     best_mode = "swing"
                     best_profile = "high"
 
@@ -643,7 +649,6 @@ async def on_button(update, ctx):
             await q.message.reply_text("Напиши число минут (например: 5 или 30):")
             return
             
-        # БЕРЕМ ИМЯ МОНЕТЫ ИЗ НАЙДЕННОГО СЕТАПА (ONE), А НЕ ДЕФОЛТНОЕ (BTC)
         coin_name = st["symbol"].split("/")[0]
         tf_label = MODE_CONFIG[Mode(st["mode"])]["tf"]
         await q.message.reply_text(
