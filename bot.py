@@ -3,6 +3,7 @@ import asyncio
 import logging
 import time
 import ccxt
+import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
@@ -55,13 +56,14 @@ def get_state(chat_id):
         "has_coins": False,
         "awaiting_has_coins": False,
         "awaiting_tf": False,
+        "current_vol": 0.0,
     })
 
 
 def kb_start():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Начать вручную", callback_data="menu:exchanges")],
-        [InlineKeyboardButton("АВТОПИЛОТ", callback_data="auto:start")],
+        [InlineKeyboardButton("АВТОПИЛОТ (Сканер всего рынка)", callback_data="auto:start")],
         [InlineKeyboardButton("📁 История сделок", callback_data="hist:menu")],
         [InlineKeyboardButton("Статистика", callback_data="menu:stats")],
         [InlineKeyboardButton("Демо-тест", callback_data="demo:start")],
@@ -81,14 +83,6 @@ def kb_auto_continue():
         [InlineKeyboardButton("Да, продолжить", callback_data="autocont:yes")],
         [InlineKeyboardButton("Нет, в меню", callback_data="autocont:no")],
     ])
-
-
-def kb_change_symbol():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Да, меняем", callback_data="autochange:yes")],
-        [InlineKeyboardButton("Нет, оставляем эту", callback_data="autochange:no")],
-    ])
-
 
 def kb_has_coins():
     return InlineKeyboardMarkup([
@@ -260,6 +254,7 @@ def get_cached_pairs(ex, quote):
 
 
 def find_best_asset(ex, hours):
+    """Сканирует ВЕСЬ рынок и ищет лучшую монету + режим"""
     try:
         exchange = getattr(ccxt, ex)({"enableRateLimit": True})
         markets = exchange.load_markets()
@@ -413,15 +408,14 @@ async def _live_loop(chat_id, ctx, st):
 
 
 async def _auto_loop(chat_id, ctx, st, hours):
-    interval = 60
     ex = st["exchange"]
     
     await ctx.bot.send_message(
         chat_id,
-        "🤖 <b>АВТОПИЛОТ ЗАПУЩЕН</b>\n"
+        "🤖 <b>АВТОПИЛОТ ЗАПУЩЕН (СКАНЕР ВСЕГО РЫНКА)</b>\n"
         "Биржа: " + EXCHANGES[ex] + "\n"
         "Время работы: " + str(hours) + " ч.\n"
-        "Сканирую ВЕСЬ рынок...",
+        "Ищу лучший сетап среди сотен пар...",
         parse_mode=ParseMode.HTML,
         reply_markup=kb_running(ex, "AUTO")
     )
@@ -430,10 +424,10 @@ async def _auto_loop(chat_id, ctx, st, hours):
     st["symbol"] = best_sym
     st["mode"] = best_mode
     st["profile"] = best_profile
+    st["current_vol"] = best_vol
     
     profile = PROFILES[best_profile]
     tf_label = MODE_CONFIG[Mode(best_mode)]["tf"]
-    
     coin_name = best_sym.split("/")[0]
     
     markup = InlineKeyboardMarkup([
@@ -443,12 +437,12 @@ async def _auto_loop(chat_id, ctx, st, hours):
     
     await ctx.bot.send_message(
         chat_id,
-        "🎯 <b>Лучший сетап найден:</b>\n"
+        "🎯 <b>Первый сетап найден:</b>\n"
         + "Монета: <b>" + best_sym + "</b>\n"
-        + "Волатильность 24ч: <b>" + str(round(best_vol, 2)) + "%</b>\n"
+        + "Волатильность: <b>" + str(round(best_vol, 2)) + "%</b>\n"
         + "Режим: <b>" + best_mode + " (" + tf_label + ")</b>\n"
         + "Профиль: <b>" + profile["label"] + "</b>\n\n"
-        + "Устраивает время? Если нет, жми сменить.",
+        + "Устраивает время?",
         parse_mode=ParseMode.HTML,
         reply_markup=markup
     )
@@ -484,11 +478,12 @@ async def _auto_loop(chat_id, ctx, st, hours):
                 )
                 return
 
-            if now - last_scan_time >= 60:
+            # Раз в 15 секунд сканируем рынок на предмет лучшей монеты
+            if now - last_scan_time >= 15:
                 last_scan_time = now
                 new_sym, new_mode, new_profile, new_vol = await asyncio.to_thread(find_best_asset, ex, hours)
                 
-                if new_sym != st["symbol"]:
+                if new_sym != st["symbol"] and (new_vol - st["current_vol"]) >= 2.0:
                     st["change_suggested"] = True
                     st["new_sym"] = new_sym
                     st["new_mode"] = new_mode
@@ -497,16 +492,16 @@ async def _auto_loop(chat_id, ctx, st, hours):
                     
                     await ctx.bot.send_message(
                         chat_id,
-                        "🔄 <b>Смена лидера!</b>\n"
-                        + "Было: " + st["symbol"] + "\n"
-                        + "Стало: " + new_sym + " (волатильность " + str(round(new_vol, 2)) + "%)\n"
-                        + "Режим: " + new_mode + "\n"
+                        "🔄 <b>Найдена монета лучше!</b>\n"
+                        + "Было: " + st["symbol"] + " (" + str(round(st["current_vol"], 1)) + "%)\n"
+                        + "Стало: " + new_sym + " (" + str(round(new_vol, 1)) + "%)\n"
                         + "Меняем?",
                         parse_mode=ParseMode.HTML,
                         reply_markup=kb_change_symbol()
                     )
-                    continue
+                    continue 
 
+            # Проверяем сигнал по текущей монете
             friday = await asyncio.to_thread(Friday, st["symbol"], ex)
             sig = await asyncio.to_thread(friday.analyze_filtered, Mode(st["mode"]), tp_mult)
             
@@ -515,42 +510,34 @@ async def _auto_loop(chat_id, ctx, st, hours):
                 sig.reasons.append("[фильтр] у тебя нет монет — SELL отменён")
 
             if sig.action in ("BUY", "SELL") and sig.confidence >= min_conf:
-                now = time.time()
-                last_time = st["last_sent"].get(sig.action, 0)
-                if now - last_time >= interval:
-                    st["last_sent"][sig.action] = now
-                    header = "🤖 АВТО-СИГНАЛ (" + st["symbol"] + " · " + tf_label + ")"
-                    pos = portfolio.load().get("open")
-                    if pos:
-                        cp = portfolio.current_pnl(sig.price)
-                        if cp:
-                            header = ("твой PnL: " + str(round(cp["pnl_pct"], 2)) + "% ("
-                                      + str(round(cp["pnl_abs"], 4)) + ")\n"
-                                      + "вход " + fmt_price(cp["entry"]) + " · " + cp["side"]
-                                      + " · кол-во " + str(cp["qty"])
-                                      + "\n\n" + header)
-                    has_pos = pos is not None
-                    await ctx.bot.send_message(
-                        chat_id,
-                        header + "\n" + sig.pretty(),
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=kb_signal_buttons(st["symbol"], sig.action, sig.price, has_pos),
-                    )
-                    try:
-                        path = await asyncio.to_thread(build_chart, st["symbol"], Mode(st["mode"]), sig, "chart_auto.png")
-                        with open(path, "rb") as f:
-                            await ctx.bot.send_photo(chat_id, photo=f,
-                                                     caption=sig.action + " " + st["mode"] + " " + st["symbol"],
-                                                     reply_markup=kb_running(ex, "AUTO"))
-                    except Exception as e:
-                        log.warning("chart error: " + str(e))
+                # Проверяем, нет ли уже открытой позиции в портфеле
+                pos = portfolio.load().get("open")
+                
+                # Если позиции нет, шлем сигнал на вход (раз в 60 сек)
+                if not pos:
+                    now_time = time.time()
+                    last_time = st["last_sent"].get(sig.action, 0)
+                    if now_time - last_time >= 60:
+                        st["last_sent"][sig.action] = now_time
+                        header = "🤖 ВХОД (" + st["symbol"] + " · " + tf_label + ")"
+                        await ctx.bot.send_message(
+                            chat_id,
+                            header + "\n" + sig.pretty(),
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=kb_signal_buttons(st["symbol"], sig.action, sig.price, False),
+                        )
+                        try:
+                            path = await asyncio.to_thread(build_chart, st["symbol"], Mode(st["mode"]), sig, "chart_auto.png")
+                            with open(path, "rb") as f:
+                                await ctx.bot.send_photo(chat_id, photo=f,
+                                                         caption=sig.action + " " + st["mode"] + " " + st["symbol"],
+                                                         reply_markup=kb_running(ex, "AUTO"))
+                        except Exception as e:
+                            log.warning("chart error: " + str(e))
         except Exception as e:
             log.warning("auto error: " + str(e))
             
-        for _ in range(interval):
-            if not st["live"]:
-                return
-            await asyncio.sleep(1)
+        await asyncio.sleep(5) # Пауза 5 секунд перед следующим циклом
 
 
 async def cmd_start(update, ctx):
@@ -676,6 +663,7 @@ async def on_button(update, ctx):
             st["symbol"] = st["new_sym"]
             st["mode"] = st["new_mode"]
             st["profile"] = st["new_profile"]
+            st["current_vol"] = st["new_vol"]
             await q.message.reply_text(
                 "✅ <b>Отлично, переключился!</b>\n"
                 + "Теперь работаем с: " + st["symbol"] + "\n"
@@ -996,13 +984,12 @@ async def on_text(update, ctx):
             return
         st["awaiting_custom_tf"] = False
         
-        # Определяем режим по минутам
         if mins <= 2:
             st["mode"] = "scalp"
         elif mins <= 60:
-            st["mode"] = "intraday"  # 15m
+            st["mode"] = "intraday"
         else:
-            st["mode"] = "swing"     # 4h
+            st["mode"] = "swing"
             
         coin_name = st["symbol"].split("/")[0]
         tf_label = MODE_CONFIG[Mode(st["mode"])]["tf"]
