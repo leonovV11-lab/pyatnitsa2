@@ -3,7 +3,6 @@ import asyncio
 import logging
 import time
 import ccxt
-import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
@@ -55,7 +54,7 @@ def get_state(chat_id):
         "new_profile": None,
         "has_coins": False,
         "awaiting_has_coins": False,
-        "pending_auto_ex": None,
+        "awaiting_tf": False,
     })
 
 
@@ -83,16 +82,27 @@ def kb_auto_continue():
         [InlineKeyboardButton("Нет, в меню", callback_data="autocont:no")],
     ])
 
+
 def kb_change_symbol():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Да, меняем", callback_data="autochange:yes")],
         [InlineKeyboardButton("Нет, оставляем эту", callback_data="autochange:no")],
     ])
 
+
 def kb_has_coins():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Да, есть", callback_data="hascoins:yes")],
         [InlineKeyboardButton("Нет, нету", callback_data="hascoins:no")],
+    ])
+
+
+def kb_tf_select():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("скальп 1m", callback_data="autotf:1m")],
+        [InlineKeyboardButton("интрадей 15m", callback_data="autotf:15m")],
+        [InlineKeyboardButton("свинг 4h", callback_data="autotf:4h")],
+        [InlineKeyboardButton("свое время (минуты)", callback_data="autotf:custom")],
     ])
 
 
@@ -360,9 +370,7 @@ async def _live_loop(chat_id, ctx, st):
             friday = await asyncio.to_thread(Friday, sym, ex)
             sig = await asyncio.to_thread(friday.analyze_filtered, Mode(mode), tp_mult)
             
-            # Если у нас НЕТ монет, мы не принимаем сигналы SELL. Ждем только BUY.
             if not st["has_coins"] and sig.action == "SELL":
-                # сбрасываем сигнал в HOLD
                 sig.action = "HOLD"
                 sig.reasons.append("[фильтр] у тебя нет монет — SELL отменён")
 
@@ -405,7 +413,7 @@ async def _live_loop(chat_id, ctx, st):
 
 
 async def _auto_loop(chat_id, ctx, st, hours):
-    interval = 60 # Проверка смены монеты раз в минуту
+    interval = 60
     ex = st["exchange"]
     
     await ctx.bot.send_message(
@@ -426,8 +434,13 @@ async def _auto_loop(chat_id, ctx, st, hours):
     profile = PROFILES[best_profile]
     tf_label = MODE_CONFIG[Mode(best_mode)]["tf"]
     
-    # Спрашиваем, есть ли монеты
     coin_name = best_sym.split("/")[0]
+    
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Устраивает", callback_data="tf_ok:yes")],
+        [InlineKeyboardButton("Сменить время", callback_data="tf_ok:no")],
+    ])
+    
     await ctx.bot.send_message(
         chat_id,
         "🎯 <b>Лучший сетап найден:</b>\n"
@@ -435,12 +448,12 @@ async def _auto_loop(chat_id, ctx, st, hours):
         + "Волатильность 24ч: <b>" + str(round(best_vol, 2)) + "%</b>\n"
         + "Режим: <b>" + best_mode + " (" + tf_label + ")</b>\n"
         + "Профиль: <b>" + profile["label"] + "</b>\n\n"
-        + "У тебя есть <b>" + coin_name + "</b> в наличии?",
+        + "Устраивает время? Если нет, жми сменить.",
         parse_mode=ParseMode.HTML,
-        reply_markup=kb_has_coins()
+        reply_markup=markup
     )
     
-    st["awaiting_has_coins"] = True
+    st["awaiting_tf"] = True
 
     tp_mult = profile["tp_mult"]
     min_conf = profile["min_confidence"]
@@ -451,19 +464,16 @@ async def _auto_loop(chat_id, ctx, st, hours):
 
     while st["live"]:
         try:
-            # Если ждем ответа про монеты, ничего не делаем
-            if st["awaiting_has_coins"]:
+            if st["awaiting_tf"] or st["awaiting_has_coins"]:
                 await asyncio.sleep(2)
                 continue
 
             now = time.time()
             
-            # Если мы ждем ответа от пользователя по смене монеты, не спамим сигналами
             if st["change_suggested"]:
                 await asyncio.sleep(2)
                 continue
 
-            # Проверяем, не вышло ли время
             if now >= st["auto_end_time"]:
                 st["live"] = False
                 await ctx.bot.send_message(
@@ -474,13 +484,11 @@ async def _auto_loop(chat_id, ctx, st, hours):
                 )
                 return
 
-            # Раз в минуту проверяем смену лидера
             if now - last_scan_time >= 60:
                 last_scan_time = now
                 new_sym, new_mode, new_profile, new_vol = await asyncio.to_thread(find_best_asset, ex, hours)
                 
                 if new_sym != st["symbol"]:
-                    # Нашли лидера, спрашиваем
                     st["change_suggested"] = True
                     st["new_sym"] = new_sym
                     st["new_mode"] = new_mode
@@ -497,12 +505,11 @@ async def _auto_loop(chat_id, ctx, st, hours):
                         parse_mode=ParseMode.HTML,
                         reply_markup=kb_change_symbol()
                     )
-                    continue # Ждем ответа, цикл пропускаем
+                    continue
 
             friday = await asyncio.to_thread(Friday, st["symbol"], ex)
             sig = await asyncio.to_thread(friday.analyze_filtered, Mode(st["mode"]), tp_mult)
             
-            # ФИЛЬТР: если нет монет, SELL отменяется
             if not st["has_coins"] and sig.action == "SELL":
                 sig.action = "HOLD"
                 sig.reasons.append("[фильтр] у тебя нет монет — SELL отменён")
@@ -610,6 +617,45 @@ async def on_button(update, ctx):
         if st.get("task"):
             st["task"].cancel()
         st["task"] = asyncio.create_task(_auto_loop(chat_id, ctx, st, hours))
+        return
+
+    if data.startswith("tf_ok:"):
+        arg = data.split(":")[1]
+        st["awaiting_tf"] = False
+        if arg == "yes":
+            coin_name = st["symbol"].split("/")[0]
+            await q.message.reply_text(
+                "✅ Отлично. Режим: " + st["mode"] + "\nТеперь скажи, у тебя есть " + coin_name + " в наличии?",
+                reply_markup=kb_has_coins()
+            )
+            st["awaiting_has_coins"] = True
+        else:
+            await q.message.reply_text(
+                "Выбери удобный таймфрейм:",
+                reply_markup=kb_tf_select()
+            )
+        return
+        
+    if data.startswith("autotf:"):
+        arg = data.split(":")[1]
+        if arg == "1m":
+            st["mode"] = "scalp"
+        elif arg == "15m":
+            st["mode"] = "intraday"
+        elif arg == "4h":
+            st["mode"] = "swing"
+        elif arg == "custom":
+            st["awaiting_custom_tf"] = True
+            await q.message.reply_text("Напиши число минут (например: 5 или 30):")
+            return
+            
+        coin_name = st["symbol"].split("/")[0]
+        tf_label = MODE_CONFIG[Mode(st["mode"])]["tf"]
+        await q.message.reply_text(
+            "✅ Установлено: " + tf_label + " (" + st["mode"] + ")\nТеперь скажи, у тебя есть " + coin_name + " в наличии?",
+            reply_markup=kb_has_coins()
+        )
+        st["awaiting_has_coins"] = True
         return
 
     if data.startswith("hascoins:"):
@@ -938,6 +984,34 @@ async def on_button(update, ctx):
 
 async def on_text(update, ctx):
     st = get_state(update.effective_chat.id)
+
+    if st.get("awaiting_custom_tf"):
+        text = update.message.text.strip().replace(",", ".")
+        try:
+            mins = float(text)
+            if mins <= 0:
+                raise ValueError
+        except Exception:
+            await update.message.reply_text("нужно положительное число, например 5 или 30")
+            return
+        st["awaiting_custom_tf"] = False
+        
+        # Определяем режим по минутам
+        if mins <= 2:
+            st["mode"] = "scalp"
+        elif mins <= 60:
+            st["mode"] = "intraday"  # 15m
+        else:
+            st["mode"] = "swing"     # 4h
+            
+        coin_name = st["symbol"].split("/")[0]
+        tf_label = MODE_CONFIG[Mode(st["mode"])]["tf"]
+        await update.message.reply_text(
+            "✅ Установлено: " + tf_label + " (" + st["mode"] + ")\nТеперь скажи, у тебя есть " + coin_name + " в наличии?",
+            reply_markup=kb_has_coins()
+        )
+        st["awaiting_has_coins"] = True
+        return
 
     if st.get("pending_hours"):
         text = update.message.text.strip().replace(",", ".")
