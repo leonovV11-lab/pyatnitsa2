@@ -35,6 +35,7 @@ def get_state(chat_id):
         "symbol": "BTC/USDT",
         "quote": "USDT",
         "mode": "scalp",
+        "custom_tf": None,
         "profile": "high",
         "signal_type": "signals",
         "interval": 60,
@@ -355,16 +356,18 @@ async def _live_loop(chat_id, ctx, st):
     interval = st["interval"]
     ex = st["exchange"]
     sym = st["symbol"]
-    mode = st["mode"]
+    tf_or_mode = st["custom_tf"] if st.get("custom_tf") else Mode(st["mode"])
     profile_key = "rapid" if st.get("signal_type") == "rapid" else st.get("profile", "high")
     profile = PROFILES[profile_key]
     min_conf = profile["min_confidence"]
     cooldown = profile["cooldown"]
     tp_mult = profile["tp_mult"]
 
+    tf_label = tf_or_mode if isinstance(tf_or_mode, str) else MODE_CONFIG[tf_or_mode]["tf"]
+
     await ctx.bot.send_message(
         chat_id,
-        "режим " + profile["label"] + " запущен. " + sym + " на " + EXCHANGES[ex] + "\n"
+        "режим " + profile["label"] + " запущен. " + sym + " (" + tf_label + ")\n"
         + "порог " + str(int(min_conf * 100)) + "% · тейк " + str(tp_mult) + "R\n"
         + "проверка каждые " + str(interval) + " сек.",
         reply_markup=kb_running(ex, sym),
@@ -374,34 +377,31 @@ async def _live_loop(chat_id, ctx, st):
     while st["live"]:
         try:
             friday = await asyncio.to_thread(Friday, sym, ex)
-            sig = await asyncio.to_thread(friday.analyze_filtered, Mode(mode), tp_mult)
+            sig = await asyncio.to_thread(friday.analyze_filtered, tf_or_mode, tp_mult)
             
             if not st["has_coins"] and sig.action == "SELL":
                 sig.action = "HOLD"
                 sig.reasons.append("[фильтр] у тебя нет монет — SELL отменён")
 
-            # Защита в безубыток
             pos = portfolio.load().get("open")
             if pos and not st["breakeven_set"]:
                 entry = pos["entry"]
                 side = pos["side"]
                 current_price = sig.price
                 
-                # Если прошли половину пути до тейка
                 if side == "BUY":
                     dist_to_tp = st["last_tp"] - entry
                     curr_dist = current_price - entry
-                    if curr_dist >= dist_to_tp * 0.5:
+                    if dist_to_tp > 0 and curr_dist >= dist_to_tp * 0.5:
                         st["breakeven_set"] = True
                         await ctx.bot.send_message(chat_id, "🛡 <b>Защита в безубыток!</b>\nЦена прошла половину пути. Стоп передвинут в цену входа.")
                 elif side == "SELL":
                     dist_to_tp = entry - st["last_tp"]
                     curr_dist = entry - current_price
-                    if curr_dist >= dist_to_tp * 0.5:
+                    if dist_to_tp > 0 and curr_dist >= dist_to_tp * 0.5:
                         st["breakeven_set"] = True
                         await ctx.bot.send_message(chat_id, "🛡 <b>Защита в безубыток!</b>\nЦена прошла половину пути. Стоп передвинут в цену входа.")
 
-            # Сигнал на срочный выход, если в позиции и пришел противоположный
             if pos and sig.action != "HOLD":
                 if pos["side"] == "BUY" and sig.action == "SELL":
                     await ctx.bot.send_message(chat_id, "🚨 <b>СРОЧНО ЗАКРЫВАЙ!</b>\nТренд развернулся вниз (пришел SELL).")
@@ -431,10 +431,10 @@ async def _live_loop(chat_id, ctx, st):
                         reply_markup=kb_signal_buttons(sym, sig.action, sig.price, has_pos),
                     )
                     try:
-                        path = await asyncio.to_thread(build_chart, sym, Mode(mode), sig, "chart_" + mode + ".png")
+                        path = await asyncio.to_thread(build_chart, sym, tf_or_mode, sig, "chart_" + str(tf_label) + ".png")
                         with open(path, "rb") as f:
                             await ctx.bot.send_photo(chat_id, photo=f,
-                                                     caption=sig.action + " " + mode + " " + sym,
+                                                     caption=sig.action + " " + str(tf_label) + " " + sym,
                                                      reply_markup=kb_running(ex, sym))
                     except Exception as e:
                         log.warning("chart error: " + str(e))
@@ -464,6 +464,7 @@ async def _auto_loop(chat_id, ctx, st, hours):
     st["mode"] = best_mode
     st["profile"] = best_profile
     st["current_vol"] = best_vol
+    st["custom_tf"] = None
     
     profile = PROFILES[best_profile]
     tf_label = MODE_CONFIG[Mode(best_mode)]["tf"]
@@ -521,7 +522,11 @@ async def _auto_loop(chat_id, ctx, st, hours):
                 last_scan_time = now
                 new_sym, new_mode, new_profile, new_vol = await asyncio.to_thread(find_best_asset, ex, hours)
                 
-                if new_sym != st["symbol"] and (new_vol - st["current_vol"]) >= 2.0:
+                # Проверяем, открыта ли позиция. Если да, не меняем монету
+                pos_check = portfolio.load().get("open")
+                
+                # Если нашли монету с волатильностью НАМНОГО выше (разница > 5%), и позиции нет
+                if new_sym != st["symbol"] and (new_vol - st["current_vol"]) >= 5.0 and not pos_check:
                     st["change_suggested"] = True
                     st["new_sym"] = new_sym
                     st["new_mode"] = new_mode
@@ -530,7 +535,7 @@ async def _auto_loop(chat_id, ctx, st, hours):
                     
                     await ctx.bot.send_message(
                         chat_id,
-                        "🔄 <b>Найдена монета лучше!</b>\n"
+                        "🔄 <b>Найдена монета НАМНОГО лучше!</b>\n"
                         + "Было: " + st["symbol"] + " (" + str(round(st["current_vol"], 1)) + "%)\n"
                         + "Стало: " + new_sym + " (" + str(round(new_vol, 1)) + "%)\n"
                         + "Меняем?",
@@ -539,14 +544,16 @@ async def _auto_loop(chat_id, ctx, st, hours):
                     )
                     continue 
 
+            tf_or_mode = st["custom_tf"] if st.get("custom_tf") else Mode(st["mode"])
+            tf_label = tf_or_mode if isinstance(tf_or_mode, str) else MODE_CONFIG[tf_or_mode]["tf"]
+
             friday = await asyncio.to_thread(Friday, st["symbol"], ex)
-            sig = await asyncio.to_thread(friday.analyze_filtered, Mode(st["mode"]), tp_mult)
+            sig = await asyncio.to_thread(friday.analyze_filtered, tf_or_mode, tp_mult)
             
             if not st["has_coins"] and sig.action == "SELL":
                 sig.action = "HOLD"
                 sig.reasons.append("[фильтр] у тебя нет монет — SELL отменён")
 
-            # Защита в безубыток (Автопилот)
             pos = portfolio.load().get("open")
             if pos and not st["breakeven_set"]:
                 entry = pos["entry"]
@@ -565,7 +572,6 @@ async def _auto_loop(chat_id, ctx, st, hours):
                         st["breakeven_set"] = True
                         await ctx.bot.send_message(chat_id, "🛡 <b>Защита в безубыток!</b> (Автопилот)\nСтоп передвинут в цену входа.")
 
-            # Срочный выход
             if pos and sig.action != "HOLD":
                 if pos["side"] == "BUY" and sig.action == "SELL":
                     await ctx.bot.send_message(chat_id, "🚨 <b>СРОЧНО ЗАКРЫВАЙ!</b>\nТренд развернулся вниз (пришел SELL).")
@@ -586,10 +592,10 @@ async def _auto_loop(chat_id, ctx, st, hours):
                             reply_markup=kb_signal_buttons(st["symbol"], sig.action, sig.price, False),
                         )
                         try:
-                            path = await asyncio.to_thread(build_chart, st["symbol"], Mode(st["mode"]), sig, "chart_auto.png")
+                            path = await asyncio.to_thread(build_chart, st["symbol"], tf_or_mode, sig, "chart_auto.png")
                             with open(path, "rb") as f:
                                 await ctx.bot.send_photo(chat_id, photo=f,
-                                                         caption=sig.action + " " + st["mode"] + " " + st["symbol"],
+                                                         caption=sig.action + " " + str(tf_label) + " " + st["symbol"],
                                                          reply_markup=kb_running(ex, "AUTO"))
                         except Exception as e:
                             log.warning("chart error: " + str(e))
@@ -687,19 +693,22 @@ async def on_button(update, ctx):
         arg = data.split(":")[1]
         if arg == "1m":
             st["mode"] = "scalp"
+            st["custom_tf"] = None
         elif arg == "15m":
             st["mode"] = "intraday"
+            st["custom_tf"] = None
         elif arg == "4h":
             st["mode"] = "swing"
+            st["custom_tf"] = None
         elif arg == "custom":
             st["awaiting_custom_tf"] = True
             await q.message.reply_text("Напиши число минут (например: 5 или 30):")
             return
             
         coin_name = st["symbol"].split("/")[0]
-        tf_label = MODE_CONFIG[Mode(st["mode"])]["tf"]
+        tf_label = MODE_CONFIG[Mode(st["mode"])]["tf"] if st.get("custom_tf") is None else st["custom_tf"]
         await q.message.reply_text(
-            "✅ Установлено: " + tf_label + " (" + st["mode"] + ")\nТеперь скажи, у тебя есть " + coin_name + " в наличии?",
+            "✅ Установлено: " + tf_label + "\nТеперь скажи, у тебя есть " + coin_name + " в наличии?",
             reply_markup=kb_has_coins()
         )
         st["awaiting_has_coins"] = True
@@ -933,6 +942,7 @@ async def on_button(update, ctx):
         st["exchange"] = ex
         st["symbol"] = symbol
         st["mode"] = mode_name
+        st["custom_tf"] = None
         
         if st.get("signal_type") == "signals": label = "сигналы"
         elif st.get("signal_type") == "rapid": label = "микро-профит"
@@ -953,6 +963,7 @@ async def on_button(update, ctx):
         st["exchange"] = ex
         st["symbol"] = symbol
         st["mode"] = mode
+        st["custom_tf"] = None
         st["breakeven_set"] = False
         if mode == "scalp":
             st["interval"] = 60
@@ -1009,7 +1020,6 @@ async def on_button(update, ctx):
         st["pending_buy"] = {"symbol": symbol, "action": action, "price": price, "is_demo": False}
         st["breakeven_set"] = False
         
-        # Умный расчет лота (риск 1% от 100 USDT = 1 USDT)
         risk_usdt = 1.0
         if price > 0:
             suggested_qty = risk_usdt / price
@@ -1058,18 +1068,11 @@ async def on_text(update, ctx):
             await update.message.reply_text("нужно положительное число, например 5 или 30")
             return
         st["awaiting_custom_tf"] = False
+        st["custom_tf"] = str(int(mins)) + "m"
         
-        if mins <= 2:
-            st["mode"] = "scalp"
-        elif mins <= 60:
-            st["mode"] = "intraday"
-        else:
-            st["mode"] = "swing"
-            
         coin_name = st["symbol"].split("/")[0]
-        tf_label = MODE_CONFIG[Mode(st["mode"])]["tf"]
         await update.message.reply_text(
-            "✅ Установлено: " + tf_label + " (" + st["mode"] + ")\nТеперь скажи, у тебя есть " + coin_name + " в наличии?",
+            "✅ Установлено: " + st["custom_tf"] + "\nТеперь скажи, у тебя есть " + coin_name + " в наличии?",
             reply_markup=kb_has_coins()
         )
         st["awaiting_has_coins"] = True
@@ -1137,7 +1140,7 @@ async def on_text(update, ctx):
 
         portfolio.open_position(pb["symbol"], pb["action"], pb["price"], qty)
         st["last_entry"] = pb["price"]
-        st["last_tp"] = pb["price"] * (1.05 if pb["action"] == "BUY" else 0.95) # Примерный тейк
+        st["last_tp"] = pb["price"] * (1.05 if pb["action"] == "BUY" else 0.95)
         st["breakeven_set"] = False
         
         side_word = "лонг" if pb["action"] == "BUY" else "шорт"
