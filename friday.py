@@ -5,7 +5,7 @@ import ccxt
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Union
 from enum import Enum
 import analysis
 
@@ -75,7 +75,7 @@ def macd_calc(series, fast=12, slow=26, signal=9):
 
 @dataclass
 class Signal:
-    mode: Mode
+    mode: str
     action: Literal["BUY", "SELL", "HOLD"]
     confidence: float
     price: float
@@ -86,7 +86,7 @@ class Signal:
 
     def pretty(self) -> str:
         lines = []
-        lines.append("<b>" + self.action + "</b> · " + self.mode.value.upper())
+        lines.append("<b>" + self.action + "</b> · " + self.mode.upper())
         lines.append("пара: <code>" + escape(self.symbol) + "</code>")
         lines.append("цена: <code>" + fmt_price(self.price) + "</code>")
         lines.append("уверенность: <b>" + str(int(self.confidence * 100)) + "%</b>")
@@ -105,17 +105,28 @@ class Friday:
         self.symbol = symbol
         self.exchange = getattr(ccxt, exchange_name)({"enableRateLimit": True})
 
-    def fetch(self, mode):
-        cfg = MODE_CONFIG[mode]
-        raw = self.exchange.fetch_ohlcv(self.symbol, timeframe=cfg["tf"], limit=cfg["lookback"])
+    def fetch(self, mode_cfg_or_tf):
+        if isinstance(mode_cfg_or_tf, Mode):
+            cfg = MODE_CONFIG[mode_cfg_or_tf]
+            tf = cfg["tf"]
+            lookback = cfg["lookback"]
+        else:
+            tf = mode_cfg_or_tf
+            lookback = 300
+            
+        raw = self.exchange.fetch_ohlcv(self.symbol, timeframe=tf, limit=lookback)
         if not raw or len(raw) < 60:
-            raise RuntimeError("мало данных для " + mode.value)
+            raise RuntimeError("мало данных для ТФ " + tf)
         df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
         df["ts"] = pd.to_datetime(df["ts"], unit="ms")
         return df
 
-    def enrich(self, df, mode):
-        cfg = MODE_CONFIG[mode]
+    def enrich(self, df, mode_cfg_or_tf):
+        if isinstance(mode_cfg_or_tf, Mode):
+            cfg = MODE_CONFIG[mode_cfg_or_tf]
+        else:
+            cfg = MODE_CONFIG[Mode.INTRADAY] # берем стандартные настройки
+            
         df["ema_fast"] = ema(df["close"], cfg["ema_fast"])
         df["ema_slow"] = ema(df["close"], cfg["ema_slow"])
         df["rsi"] = rsi(df["close"], cfg["rsi_len"])
@@ -283,16 +294,22 @@ class Friday:
 
         return votes, reasons
 
-    def analyze(self, mode, tp_mult=3.0):
-        df = self.fetch(mode)
-        df = self.enrich(df, mode).dropna().reset_index(drop=True)
+    def analyze(self, mode_or_tf, tp_mult=3.0):
+        if isinstance(mode_or_tf, Mode):
+            mode_name = mode_or_tf.value
+            cfg = MODE_CONFIG[mode_or_tf]
+        else:
+            mode_name = str(mode_or_tf)
+            cfg = MODE_CONFIG[Mode.INTRADAY]
+            
+        df = self.fetch(mode_or_tf)
+        df = self.enrich(df, mode_or_tf).dropna().reset_index(drop=True)
         if len(df) < 2:
             raise RuntimeError("недостаточно данных после индикаторов")
         votes, reasons = self.score(df)
         last = df.iloc[-1]
         price = float(last["close"])
         atr_v = float(last["atr"])
-        cfg = MODE_CONFIG[mode]
         conf = min(abs(votes) / MAX_VOTES, 1.0)
 
         if votes >= cfg["min_votes"]:
@@ -307,7 +324,26 @@ class Friday:
             action = "HOLD"
             sl = tp = price
 
-        return Signal(mode, action, conf, price, reasons, sl, tp, self.symbol)
+        return Signal(mode_name, action, conf, price, reasons, sl, tp, self.symbol)
+
+    def analyze_filtered(self, mode_or_tf, tp_mult=3.0):
+        sig = self.analyze(mode_or_tf, tp_mult=tp_mult)
+        # Пропускаем фильтр старшего ТФ, если это кастомный таймфрейм
+        if not isinstance(mode_or_tf, Mode):
+            return sig
+            
+        trend = self.senior_trend(mode_or_tf)
+        if trend is None:
+            return sig
+        if sig.action == "BUY" and trend == "down":
+            sig.reasons.append("[фильтр] старший ТФ вниз — BUY отменён")
+            sig.action = "HOLD"
+        elif sig.action == "SELL" and trend == "up":
+            sig.reasons.append("[фильтр] старший ТФ вверх — SELL отменён")
+            sig.action = "HOLD"
+        else:
+            sig.reasons.append("[фильтр] старший ТФ " + trend + " — согласовано")
+        return sig
 
     def senior_trend(self, mode):
         senior = SENIOR_TF.get(mode)
@@ -324,21 +360,6 @@ class Friday:
             return "down"
         except Exception:
             return None
-
-    def analyze_filtered(self, mode, tp_mult=3.0):
-        sig = self.analyze(mode, tp_mult=tp_mult)
-        trend = self.senior_trend(mode)
-        if trend is None:
-            return sig
-        if sig.action == "BUY" and trend == "down":
-            sig.reasons.append("[фильтр] старший ТФ вниз — BUY отменён")
-            sig.action = "HOLD"
-        elif sig.action == "SELL" and trend == "up":
-            sig.reasons.append("[фильтр] старший ТФ вверх — SELL отменён")
-            sig.action = "HOLD"
-        else:
-            sig.reasons.append("[фильтр] старший ТФ " + trend + " — согласовано")
-        return sig
 
     def micro_predict(self, mode=Mode.SCALP):
         tf = MODE_CONFIG[mode]["tf"]
@@ -373,4 +394,4 @@ class Friday:
             tp = price * 0.999
             sl = price * 1.001
 
-        return Signal(mode, action, 0.5, price, ["микро-импульс " + tf], sl, tp, self.symbol)
+        return Signal(mode.value, action, 0.5, price, ["микро-импульс " + tf], sl, tp, self.symbol)
