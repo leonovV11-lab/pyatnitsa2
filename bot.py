@@ -3,7 +3,6 @@ import asyncio
 import logging
 import time
 import ccxt
-import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
@@ -56,11 +55,9 @@ def get_state(chat_id):
         "new_profile": None,
         "has_coins": False,
         "awaiting_has_coins": False,
+        "awaiting_coin_qty": False, # Новый стейт для ввода количества
         "awaiting_tf": False,
         "current_vol": 0.0,
-        "last_entry": 0.0,
-        "last_stop": 0.0,
-        "last_tp": 0.0,
         "breakeven_set": False,
     })
 
@@ -498,7 +495,7 @@ async def _auto_loop(chat_id, ctx, st, hours):
 
     while st["live"]:
         try:
-            if st["awaiting_tf"] or st["awaiting_has_coins"]:
+            if st["awaiting_tf"] or st["awaiting_has_coins"] or st["awaiting_coin_qty"]:
                 await asyncio.sleep(2)
                 continue
 
@@ -522,10 +519,9 @@ async def _auto_loop(chat_id, ctx, st, hours):
                 last_scan_time = now
                 new_sym, new_mode, new_profile, new_vol = await asyncio.to_thread(find_best_asset, ex, hours)
                 
-                # Проверяем, открыта ли позиция. Если да, не меняем монету
                 pos_check = portfolio.load().get("open")
                 
-                # Если нашли монету с волатильностью НАМНОГО выше (разница > 5%), и позиции нет
+                # Меняем монету только если она дико волатильнее и нет открытой позиции
                 if new_sym != st["symbol"] and (new_vol - st["current_vol"]) >= 5.0 and not pos_check:
                     st["change_suggested"] = True
                     st["new_sym"] = new_sym
@@ -619,6 +615,7 @@ async def cmd_stop(update, ctx):
     st["pending_buy"] = None
     st["pending_sell"] = None
     st["breakeven_set"] = False
+    st["awaiting_coin_qty"] = False
     if st.get("task"):
         st["task"].cancel()
         st["task"] = None
@@ -719,7 +716,9 @@ async def on_button(update, ctx):
         st["awaiting_has_coins"] = False
         if arg == "yes":
             st["has_coins"] = True
-            await q.message.reply_text("✅ Принято. У тебя есть эта монета. Жду сигналов BUY (докупить) или SELL (продать твои).")
+            st["awaiting_coin_qty"] = True
+            coin_name = st["symbol"].split("/")[0]
+            await q.message.reply_text("Сколько монет " + coin_name + " у тебя есть? Напиши число:")
         else:
             st["has_coins"] = False
             await q.message.reply_text("✅ Принято. У тебя нет этой монеты. Жду только сигналов BUY.")
@@ -1007,6 +1006,7 @@ async def on_button(update, ctx):
         st["pending_buy"] = None
         st["pending_sell"] = None
         st["breakeven_set"] = False
+        st["awaiting_coin_qty"] = False
         if st.get("task"):
             st["task"].cancel()
             st["task"] = None
@@ -1057,6 +1057,36 @@ async def on_button(update, ctx):
 
 async def on_text(update, ctx):
     st = get_state(update.effective_chat.id)
+
+    if st.get("awaiting_coin_qty"):
+        text = update.message.text.strip().replace(",", ".")
+        try:
+            qty = float(text)
+            if qty <= 0:
+                raise ValueError
+        except Exception:
+            await update.message.reply_text("нужно положительное число, например 100 или 0.5")
+            return
+            
+        st["awaiting_coin_qty"] = False
+        st["has_coins"] = True
+        
+        # Открываем виртуальную позицию, чтобы считать PnL
+        exchange = getattr(ccxt, st["exchange"])({"enableRateLimit": True})
+        ticker = exchange.fetch_ticker(st["symbol"])
+        current_price = float(ticker["last"])
+        
+        portfolio.open_position(st["symbol"], "BUY", current_price, qty)
+        st["last_entry"] = current_price
+        st["last_tp"] = current_price * 1.05
+        st["breakeven_set"] = False
+        
+        await update.message.reply_text(
+            "✅ Принято. " + str(qty) + " " + st["symbol"].split("/")[0] + " добавлено в портфель.\n"
+            + "Цена входа для расчёта: " + fmt_price(current_price) + "\n\n"
+            + "Жду сигналов BUY (докупить) или SELL (продать твои)."
+        )
+        return
 
     if st.get("awaiting_custom_tf"):
         text = update.message.text.strip().replace(",", ".")
