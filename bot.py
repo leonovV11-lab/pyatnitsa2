@@ -61,7 +61,6 @@ def get_state(chat_id):
         "awaiting_balance": False,
         "awaiting_budget": False,
         "auto_pending": False,
-        "market_mood": "normal",
     })
 
 def kb_start():
@@ -72,13 +71,6 @@ def kb_start():
         [InlineKeyboardButton("Статистика", callback_data="menu:stats")],
         [InlineKeyboardButton("🎮 Демо-тест кнопок", callback_data="demo:start")],
         [InlineKeyboardButton("🔴 Закрыть сделку", callback_data="close_pos")],
-    ])
-
-def kb_market_mood():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🟢 Спокойный день", callback_data="mood:normal")],
-        [InlineKeyboardButton("🟡 Высокая волатильность", callback_data="mood:volatile")],
-        [InlineKeyboardButton("🔴 Плохой день / Флэт", callback_data="mood:bad")],
     ])
 
 def kb_auto_time():
@@ -454,13 +446,14 @@ async def _auto_loop(chat_id, ctx, st, hours):
     profile = PROFILES[best_profile]
     tf_label = best_mode
     
+    # Анализ рынка (волатильность)
     risk_modifier = 1.0
-    if st.get("market_mood") == "volatile":
+    if st["current_vol"] > 100:  # Если потенциал слишком высокий (рынок безумный)
         risk_modifier = 0.5
-        await ctx.bot.send_message(chat_id, "⚠️ <b>Высокая волатильность!</b>\nРиск урезан в 2 раза, стопы расширены.")
-    elif st.get("market_mood") == "bad":
+        await ctx.bot.send_message(chat_id, "⚠️ <b>Высокая волатильность на рынке!</b>\nРиск урезан в 2 раза, чтобы не слить депо.")
+    elif st["current_vol"] < 5:  # Если потенциал слишком низкий (рынок стоит)
         st["live"] = False
-        await ctx.bot.send_message(chat_id, "🛑 <b>Плохой день.</b>\nТорговля отменена. Отдыхаем.")
+        await ctx.bot.send_message(chat_id, "🛑 <b>Рынок стоит на месте (флэт).</b>\nТорговать сегодня не выгодно. Отдыхаем.")
         return
 
     markup = InlineKeyboardMarkup([
@@ -614,17 +607,7 @@ async def on_button(update, ctx):
         return
 
     if data == "auto:start":
-        await q.message.reply_text("🌤 <b>Какая ситуация на рынке?</b>", parse_mode=ParseMode.HTML, reply_markup=kb_market_mood())
-        return
-
-    if data.startswith("mood:"):
-        mood = data.split(":")[1]
-        st["market_mood"] = mood
-        if mood == "bad":
-            st["live"] = False
-            await q.message.reply_text("🛑 Понял. Плохой день — не торгуем. Отдыхай!")
-            return
-        await q.message.reply_text("🤖 <b>АВТОПИЛОТ</b>\nВыбери время:", parse_mode=ParseMode.HTML, reply_markup=kb_auto_time())
+        await q.message.reply_text("🤖 <b>АВТОПИЛОТ</b>\nСначала выбери время:", parse_mode=ParseMode.HTML, reply_markup=kb_auto_time())
         return
 
     if data.startswith("autotime:"):
