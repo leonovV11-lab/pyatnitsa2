@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("friday")
 
 STATE = {}
-PAGE_SIZE = 50  # Увеличили до 50 монет на страницу (максимум для Телеграма)
+PAGE_SIZE = 50
 CACHE = {}
 
 def get_state(chat_id):
@@ -38,6 +38,7 @@ def get_state(chat_id):
         "pending_sell": None,
         "demo_pos": None,
         "pending_hours": False,
+        "pending_days": False,
         "auto_hours": 12,
         "auto_end_time": 0,
         "change_suggested": False,
@@ -60,6 +61,7 @@ def get_state(chat_id):
         "awaiting_balance": False,
         "awaiting_budget": False,
         "auto_pending": False,
+        "market_mood": "normal",
     })
 
 def kb_start():
@@ -72,10 +74,18 @@ def kb_start():
         [InlineKeyboardButton("🔴 Закрыть сделку", callback_data="close_pos")],
     ])
 
+def kb_market_mood():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Спокойный день", callback_data="mood:normal")],
+        [InlineKeyboardButton("🟡 Высокая волатильность", callback_data="mood:volatile")],
+        [InlineKeyboardButton("🔴 Плохой день / Флэт", callback_data="mood:bad")],
+    ])
+
 def kb_auto_time():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Весь день (12ч+)", callback_data="autotime:12")],
-        [InlineKeyboardButton("Свое время", callback_data="autotime:custom")],
+        [InlineKeyboardButton("Свое время (часы)", callback_data="autotime:custom_hours")],
+        [InlineKeyboardButton("Несколько дней", callback_data="autotime:custom_days")],
         [InlineKeyboardButton("назад", callback_data="menu:start")],
     ])
 
@@ -445,6 +455,15 @@ async def _auto_loop(chat_id, ctx, st, hours):
     tf_label = best_mode
     coin_name = best_sym.split("/")[0]
     
+    risk_modifier = 1.0
+    if st.get("market_mood") == "volatile":
+        risk_modifier = 0.5
+        await ctx.bot.send_message(chat_id, "⚠️ <b>Высокая волатильность!</b>\nРиск урезан в 2 раза, стопы расширены.")
+    elif st.get("market_mood") == "bad":
+        st["live"] = False
+        await ctx.bot.send_message(chat_id, "🛑 <b>Плохой день.</b>\nТорговля отменена. Отдыхаем.")
+        return
+
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("Устраивает", callback_data="tf_ok:yes")],
         [InlineKeyboardButton("Сменить время", callback_data="tf_ok:no")],
@@ -526,7 +545,7 @@ async def _auto_loop(chat_id, ctx, st, hours):
                     if now - st["last_sent"].get(sig.action, 0) >= 60:
                         st["last_sent"][sig.action] = now
                         risk_pct = RISK_PERCENT[0.85] if sig.confidence >= 0.85 else (RISK_PERCENT[0.75] if sig.confidence >= 0.75 else RISK_PERCENT[0.00])
-                        risk_usdt = st["balance"] * risk_pct if st["balance"] > 0 else 1.0
+                        risk_usdt = st["balance"] * risk_pct * risk_modifier if st["balance"] > 0 else 1.0
                         await ctx.bot.send_message(chat_id, "🤖 ВХОД\n" + sig.pretty() + "\n💡 Риск: " + str(round(risk_usdt, 2)) + " USDT", parse_mode=ParseMode.HTML, reply_markup=kb_signal_buttons(st["symbol"], sig.action, sig.price, False))
                         try:
                             path = await asyncio.to_thread(build_chart, st["symbol"], tf_or_mode, sig, "chart_auto.png")
@@ -581,14 +600,27 @@ async def on_button(update, ctx):
         return
 
     if data == "auto:start":
+        await q.message.reply_text("🌤 <b>Какая ситуация на рынке?</b>", parse_mode=ParseMode.HTML, reply_markup=kb_market_mood())
+        return
+
+    if data.startswith("mood:"):
+        mood = data.split(":")[1]
+        st["market_mood"] = mood
+        if mood == "bad":
+            st["live"] = False
+            await q.message.reply_text("🛑 Понял. Плохой день — не торгуем. Отдыхай!")
+            return
         await q.message.reply_text("🤖 <b>АВТОПИЛОТ</b>\nВыбери время:", parse_mode=ParseMode.HTML, reply_markup=kb_auto_time())
         return
 
     if data.startswith("autotime:"):
         arg = data.split(":")[1]
-        if arg == "custom":
+        if arg == "custom_hours":
             st["pending_hours"] = True
             await q.message.reply_text("Сколько часов?")
+        elif arg == "custom_days":
+            st["pending_days"] = True
+            await q.message.reply_text("Сколько дней?")
         else:
             st["auto_hours"] = float(arg)
             await q.message.reply_text("Принято. Теперь выбери биржу для сканирования:", reply_markup=kb_exchanges_auto())
@@ -845,6 +877,13 @@ async def on_text(update, ctx):
         st["auto_hours"] = float(text)
         st["pending_hours"] = False
         await update.message.reply_text("Принято: " + str(st["auto_hours"]) + " ч.\nТеперь выбери биржу для сканирования:", reply_markup=kb_exchanges_auto())
+        return
+
+    if st.get("pending_days"):
+        days = float(text)
+        st["auto_hours"] = days * 24
+        st["pending_days"] = False
+        await update.message.reply_text("Принято: " + str(days) + " дн.\nТеперь выбери биржу для сканирования:", reply_markup=kb_exchanges_auto())
         return
 
     if st.get("search_mode"):
