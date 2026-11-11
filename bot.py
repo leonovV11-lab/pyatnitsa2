@@ -49,6 +49,7 @@ def get_state(chat_id):
         "awaiting_has_coins": False,
         "awaiting_coin_qty": False,
         "awaiting_tf": False,
+        "awaiting_custom_tf": False,
         "current_vol": 0.0,
         "breakeven_set": False,
         "spam_guard": False,
@@ -471,7 +472,7 @@ async def _auto_loop(chat_id, ctx, st, hours):
 
     while st["live"]:
         try:
-            if st["awaiting_tf"] or st["awaiting_has_coins"] or st["awaiting_coin_qty"] or time.time() < st["pause_until"]:
+            if st["awaiting_tf"] or st["awaiting_has_coins"] or st["awaiting_coin_qty"] or st["awaiting_custom_tf"] or time.time() < st["pause_until"]:
                 await asyncio.sleep(2)
                 continue
 
