@@ -55,10 +55,13 @@ def get_state(chat_id):
         "new_profile": None,
         "has_coins": False,
         "awaiting_has_coins": False,
-        "awaiting_coin_qty": False, # Новый стейт для ввода количества
+        "awaiting_coin_qty": False,
         "awaiting_tf": False,
         "current_vol": 0.0,
+        "last_entry": 0.0,
+        "last_tp": 0.0,
         "breakeven_set": False,
+        "spam_guard": False,
     })
 
 
@@ -68,7 +71,7 @@ def kb_start():
         [InlineKeyboardButton("АВТОПИЛОТ (Сканер всего рынка)", callback_data="auto:start")],
         [InlineKeyboardButton("📁 История сделок", callback_data="hist:menu")],
         [InlineKeyboardButton("Статистика", callback_data="menu:stats")],
-        [InlineKeyboardButton("Демо-тест", callback_data="demo:start")],
+        [InlineKeyboardButton("🔴 Закрыть открытую сделку", callback_data="close_pos")],
     ])
 
 
@@ -212,6 +215,7 @@ def kb_confirm_start(ex, symbol, mode):
 def kb_running(ex, symbol):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("СТОП", callback_data="stop:" + ex + ":" + symbol)],
+        [InlineKeyboardButton("🔴 Закрыть позицию", callback_data="close_pos")],
     ])
 
 
@@ -371,6 +375,7 @@ async def _live_loop(chat_id, ctx, st):
     )
 
     st["last_sent"] = {}
+    st["spam_guard"] = False
     while st["live"]:
         try:
             friday = await asyncio.to_thread(Friday, sym, ex)
@@ -391,19 +396,21 @@ async def _live_loop(chat_id, ctx, st):
                     curr_dist = current_price - entry
                     if dist_to_tp > 0 and curr_dist >= dist_to_tp * 0.5:
                         st["breakeven_set"] = True
-                        await ctx.bot.send_message(chat_id, "🛡 <b>Защита в безубыток!</b>\nЦена прошла половину пути. Стоп передвинут в цену входа.")
+                        await ctx.bot.send_message(chat_id, "🛡 <b>Защита в безубыток!</b>\nЦена прошла половину пути. Стоп передвинут в цену входа.", parse_mode=ParseMode.HTML)
                 elif side == "SELL":
                     dist_to_tp = entry - st["last_tp"]
                     curr_dist = entry - current_price
                     if dist_to_tp > 0 and curr_dist >= dist_to_tp * 0.5:
                         st["breakeven_set"] = True
-                        await ctx.bot.send_message(chat_id, "🛡 <b>Защита в безубыток!</b>\nЦена прошла половину пути. Стоп передвинут в цену входа.")
+                        await ctx.bot.send_message(chat_id, "🛡 <b>Защита в безубыток!</b>\nЦена прошла половину пути. Стоп передвинут в цену входа.", parse_mode=ParseMode.HTML)
 
-            if pos and sig.action != "HOLD":
+            if pos and sig.action != "HOLD" and not st["spam_guard"]:
                 if pos["side"] == "BUY" and sig.action == "SELL":
-                    await ctx.bot.send_message(chat_id, "🚨 <b>СРОЧНО ЗАКРЫВАЙ!</b>\nТренд развернулся вниз (пришел SELL).")
+                    await ctx.bot.send_message(chat_id, "🚨 <b>СРОЧНО ЗАКРЫВАЙ!</b>\nТренд развернулся вниз (пришел SELL).", parse_mode=ParseMode.HTML)
+                    st["spam_guard"] = True
                 elif pos["side"] == "SELL" and sig.action == "BUY":
-                    await ctx.bot.send_message(chat_id, "🚨 <b>СРОЧНО ЗАКРЫВАЙ!</b>\nТренд развернулся вверх (пришел BUY).")
+                    await ctx.bot.send_message(chat_id, "🚨 <b>СРОЧНО ЗАКРЫВАЙ!</b>\nТренд развернулся вверх (пришел BUY).", parse_mode=ParseMode.HTML)
+                    st["spam_guard"] = True
 
             if sig.action in ("BUY", "SELL") and sig.confidence >= min_conf:
                 now = time.time()
@@ -492,6 +499,7 @@ async def _auto_loop(chat_id, ctx, st, hours):
     st["last_sent"] = {}
     last_scan_time = time.time()
     st["change_suggested"] = False
+    st["spam_guard"] = False
 
     while st["live"]:
         try:
@@ -521,7 +529,6 @@ async def _auto_loop(chat_id, ctx, st, hours):
                 
                 pos_check = portfolio.load().get("open")
                 
-                # Меняем монету только если она дико волатильнее и нет открытой позиции
                 if new_sym != st["symbol"] and (new_vol - st["current_vol"]) >= 5.0 and not pos_check:
                     st["change_suggested"] = True
                     st["new_sym"] = new_sym
@@ -560,19 +567,21 @@ async def _auto_loop(chat_id, ctx, st, hours):
                     curr_dist = current_price - entry
                     if dist_to_tp > 0 and curr_dist >= dist_to_tp * 0.5:
                         st["breakeven_set"] = True
-                        await ctx.bot.send_message(chat_id, "🛡 <b>Защита в безубыток!</b> (Автопилот)\nСтоп передвинут в цену входа.")
+                        await ctx.bot.send_message(chat_id, "🛡 <b>Защита в безубыток!</b> (Автопилот)\nСтоп передвинут в цену входа.", parse_mode=ParseMode.HTML)
                 elif side == "SELL":
                     dist_to_tp = entry - st["last_tp"]
                     curr_dist = entry - current_price
                     if dist_to_tp > 0 and curr_dist >= dist_to_tp * 0.5:
                         st["breakeven_set"] = True
-                        await ctx.bot.send_message(chat_id, "🛡 <b>Защита в безубыток!</b> (Автопилот)\nСтоп передвинут в цену входа.")
+                        await ctx.bot.send_message(chat_id, "🛡 <b>Защита в безубыток!</b> (Автопилот)\nСтоп передвинут в цену входа.", parse_mode=ParseMode.HTML)
 
-            if pos and sig.action != "HOLD":
+            if pos and sig.action != "HOLD" and not st["spam_guard"]:
                 if pos["side"] == "BUY" and sig.action == "SELL":
-                    await ctx.bot.send_message(chat_id, "🚨 <b>СРОЧНО ЗАКРЫВАЙ!</b>\nТренд развернулся вниз (пришел SELL).")
+                    await ctx.bot.send_message(chat_id, "🚨 <b>СРОЧНО ЗАКРЫВАЙ!</b>\nТренд развернулся вниз (пришел SELL).", parse_mode=ParseMode.HTML)
+                    st["spam_guard"] = True
                 elif pos["side"] == "SELL" and sig.action == "BUY":
-                    await ctx.bot.send_message(chat_id, "🚨 <b>СРОЧНО ЗАКРЫВАЙ!</b>\nТренд развернулся вверх (пришел BUY).")
+                    await ctx.bot.send_message(chat_id, "🚨 <b>СРОЧНО ЗАКРЫВАЙ!</b>\nТренд развернулся вверх (пришел BUY).", parse_mode=ParseMode.HTML)
+                    st["spam_guard"] = True
 
             if sig.action in ("BUY", "SELL") and sig.confidence >= min_conf:
                 if not pos:
@@ -616,6 +625,7 @@ async def cmd_stop(update, ctx):
     st["pending_sell"] = None
     st["breakeven_set"] = False
     st["awaiting_coin_qty"] = False
+    st["spam_guard"] = False
     if st.get("task"):
         st["task"].cancel()
         st["task"] = None
@@ -631,6 +641,15 @@ async def on_button(update, ctx):
     data = q.data
 
     if data == "noop":
+        return
+
+    if data == "close_pos":
+        pos = portfolio.load().get("open")
+        if not pos:
+            await q.message.reply_text("Нет открытой позиции для закрытия.")
+            return
+        st["pending_sell"] = {"symbol": pos["symbol"], "price": 0.0, "is_demo": False, "available": pos["qty"]}
+        await q.message.reply_text("Напиши цену, по которой ты продал (или 0, чтобы взять текущую с биржи):")
         return
 
     if data == "menu:start":
@@ -964,6 +983,7 @@ async def on_button(update, ctx):
         st["mode"] = mode
         st["custom_tf"] = None
         st["breakeven_set"] = False
+        st["spam_guard"] = False
         if mode == "scalp":
             st["interval"] = 60
         elif mode == "intraday":
@@ -990,6 +1010,7 @@ async def on_button(update, ctx):
         st["interval"] = int(interval_str)
         st["live"] = True
         st["breakeven_set"] = False
+        st["spam_guard"] = False
         if st.get("task"):
             st["task"].cancel()
             
@@ -1007,6 +1028,7 @@ async def on_button(update, ctx):
         st["pending_sell"] = None
         st["breakeven_set"] = False
         st["awaiting_coin_qty"] = False
+        st["spam_guard"] = False
         if st.get("task"):
             st["task"].cancel()
             st["task"] = None
@@ -1019,6 +1041,7 @@ async def on_button(update, ctx):
         price = float(price_str)
         st["pending_buy"] = {"symbol": symbol, "action": action, "price": price, "is_demo": False}
         st["breakeven_set"] = False
+        st["spam_guard"] = False
         
         risk_usdt = 1.0
         if price > 0:
@@ -1071,7 +1094,6 @@ async def on_text(update, ctx):
         st["awaiting_coin_qty"] = False
         st["has_coins"] = True
         
-        # Открываем виртуальную позицию, чтобы считать PnL
         exchange = getattr(ccxt, st["exchange"])({"enableRateLimit": True})
         ticker = exchange.fetch_ticker(st["symbol"])
         current_price = float(ticker["last"])
@@ -1172,6 +1194,7 @@ async def on_text(update, ctx):
         st["last_entry"] = pb["price"]
         st["last_tp"] = pb["price"] * (1.05 if pb["action"] == "BUY" else 0.95)
         st["breakeven_set"] = False
+        st["spam_guard"] = False
         
         side_word = "лонг" if pb["action"] == "BUY" else "шорт"
         await update.message.reply_text(
@@ -1185,40 +1208,23 @@ async def on_text(update, ctx):
     if st.get("pending_sell"):
         text = update.message.text.strip().replace(",", ".")
         try:
-            qty = float(text)
-            if qty <= 0:
-                raise ValueError
+            price = float(text)
         except Exception:
-            await update.message.reply_text("нужно положительное число, например 3 или 0.5")
+            await update.message.reply_text("нужно число (цена продажи) или 0 для текущей")
             return
+            
         ps = st["pending_sell"]
         st["pending_sell"] = None
+        
+        if price == 0.0:
+            exchange = getattr(ccxt, st["exchange"])({"enableRateLimit": True})
+            ticker = exchange.fetch_ticker(ps["symbol"])
+            price = float(ticker["last"])
+            await update.message.reply_text("Беру текущую цену: " + fmt_price(price))
 
-        if ps.get("is_demo"):
-            pos = st.get("demo_pos")
-            if not pos:
-                await update.message.reply_text("нет демо позиции")
-                return
-            if qty > pos["qty"] + 1e-8:
-                await update.message.reply_text("у тебя только " + str(pos["qty"]))
-                return
-            pnl = (ps["price"] - pos["entry"]) * qty
-            pnl_pct = (ps["price"] - pos["entry"]) / pos["entry"] * 100
-            pos["qty"] -= qty
-            rem = pos["qty"] if pos["qty"] > 1e-8 else 0
-            st["demo_pos"] = pos if rem > 0 else None
-            
-            rem_str = "\nосталось в позиции: " + str(rem) if rem > 0 else "\nпозиция полностью закрыта"
-            await update.message.reply_text(
-                "Сделка закрыта (ДЕМО) и занесена в историю\n"
-                "вход " + fmt_price(pos['entry']) + " · выход " + fmt_price(ps['price']) + "\n"
-                "кол-во " + str(qty) + "\n"
-                "PnL: " + str(round(pnl_pct,2)) + "% (" + str(round(pnl,2)) + " USDT)" + rem_str,
-                reply_markup=kb_running(st["exchange"], st["symbol"])
-            )
-            return
-
-        trade = portfolio.close_position(ps["price"], qty)
+        qty = ps["available"]
+        
+        trade = portfolio.close_position(price, qty)
         if "error" in trade:
             await update.message.reply_text(trade["error"])
             return
@@ -1226,18 +1232,17 @@ async def on_text(update, ctx):
         sign = "+" if trade["pnl_pct"] > 0 else ""
         abs_sign = "+" if trade["pnl_abs"] > 0 else ""
         
-        rem = trade["remaining"]
-        rem_str = "\nосталось в позиции: " + str(rem) if rem > 0 else "\nпозиция полностью закрыта"
-
         await update.message.reply_text(
             "сделка закрыта и занесена в историю\n"
             + trade["side"] + " " + trade["symbol"] + "\n"
             + "вход " + fmt_price(trade["entry"]) + " · выход " + fmt_price(trade["exit"]) + "\n"
             + "продано " + str(trade["qty"]) + "\n"
-            + "PnL: " + sign + str(trade["pnl_pct"]) + "%  (" + abs_sign + str(trade["pnl_abs"]) + ")" + rem_str + "\n\n"
+            + "PnL: " + sign + str(trade["pnl_pct"]) + "%  (" + abs_sign + str(trade["pnl_abs"]) + ")" + "\n\n"
             + "всего сделок: " + str(s["total"]) + " · winrate " + str(round(s["winrate"], 1)) + "%",
-            reply_markup=kb_running(st["exchange"], st["symbol"])
+            reply_markup=kb_start()
         )
+        st["spam_guard"] = False
+        st["breakeven_set"] = False
         return
 
     if not st.get("search_mode"):
