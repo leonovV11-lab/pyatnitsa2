@@ -12,7 +12,7 @@ from exchanges import EXCHANGES, DEFAULT_QUOTES, load_all_pairs
 from config import TELEGRAM_TOKEN, DEFAULT_SYMBOL, PROFILES
 import portfolio
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("friday")
 
 STATE = {}
@@ -268,29 +268,40 @@ def get_cached_pairs(ex, quote):
 
 
 def find_best_asset(ex, hours):
+    """
+    Ищет лучшую монету не по волатильности, а по ПОТЕНЦИАЛУ ПРИБЫЛИ.
+    Учитывает ликвидность (объем) и процент движения.
+    """
     try:
         exchange = getattr(ccxt, ex)({"enableRateLimit": True})
         markets = exchange.load_markets()
+        # Берем топ-150 по объему, чтобы было из чего выбирать
         usdt_pairs = [s for s in markets if s.endswith("/USDT") and markets[s]["active"] and markets[s]["spot"]]
-        usdt_pairs = usdt_pairs[:100] 
+        usdt_pairs = usdt_pairs[:150]
         
         tickers = exchange.fetch_tickers(usdt_pairs)
         
         best_sym = "BTC/USDT"
         best_mode = "scalp"
-        best_volatility = 0.0
+        best_potential = 0.0
         best_profile = "rapid"
 
         for sym, data in tickers.items():
             if not data['percentage'] or not data['quoteVolume']: continue
-            if data['quoteVolume'] < 1000000: continue 
+            # Фильтр ликвидности: минимум 1 млн USDT за 24 часа
+            if data['quoteVolume'] < 1000000: continue
             
             volatility = abs(data['percentage'])
             
-            if volatility > best_volatility:
-                best_volatility = volatility
+            # МАТЕМАТИКА ПРИБЫЛИ: (Объем торгов / 1 млн) * Волатильность
+            # Это дает нам "Денежный импульс". Чем больше денег в монете и чем сильнее движение, тем выше потенциал.
+            profit_potential = (data['quoteVolume'] / 1000000) * volatility
+            
+            if profit_potential > best_potential:
+                best_potential = profit_potential
                 best_sym = sym
                 
+                # Подбираем режим под время
                 if hours <= 3:
                     best_mode = "scalp" if volatility > 5.0 else "intraday"
                     best_profile = "rapid"
@@ -301,7 +312,7 @@ def find_best_asset(ex, hours):
                     best_mode = "swing"
                     best_profile = "high"
 
-        return best_sym, best_mode, best_profile, best_volatility
+        return best_sym, best_mode, best_profile, best_potential
     except Exception as e:
         log.warning("scan error: " + str(e))
         return "BTC/USDT", "scalp", "rapid", 0.0
@@ -455,24 +466,23 @@ async def _auto_loop(chat_id, ctx, st, hours):
     
     await ctx.bot.send_message(
         chat_id,
-        "🤖 <b>АВТОПИЛОТ ЗАПУЩЕН (СКАНЕР ВСЕГО РЫНКА)</b>\n"
+        "🤖 <b>АВТОПИЛОТ ЗАПУЩЕН (ПОИСК МАКСИМАЛЬНОЙ ПРИБЫЛИ)</b>\n"
         "Биржа: " + EXCHANGES[ex] + "\n"
         "Время работы: " + str(hours) + " ч.\n"
-        "Ищу лучший сетап среди сотен пар...",
+        "Анализирую объемы и волатильность...",
         parse_mode=ParseMode.HTML,
         reply_markup=kb_running(ex, "AUTO")
     )
 
-    best_sym, best_mode, best_profile, best_vol = await asyncio.to_thread(find_best_asset, ex, hours)
+    best_sym, best_mode, best_profile, best_potential = await asyncio.to_thread(find_best_asset, ex, hours)
     st["symbol"] = best_sym
     st["mode"] = best_mode
     st["profile"] = best_profile
-    st["current_vol"] = best_vol
+    st["current_vol"] = best_potential
     st["custom_tf"] = None
     
     profile = PROFILES[best_profile]
     tf_label = MODE_CONFIG[Mode(best_mode)]["tf"]
-    coin_name = best_sym.split("/")[0]
     
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("Устраивает", callback_data="tf_ok:yes")],
@@ -481,9 +491,9 @@ async def _auto_loop(chat_id, ctx, st, hours):
     
     await ctx.bot.send_message(
         chat_id,
-        "🎯 <b>Первый сетап найден:</b>\n"
+        "🎯 <b>Лучший сетап найден:</b>\n"
         + "Монета: <b>" + best_sym + "</b>\n"
-        + "Волатильность: <b>" + str(round(best_vol, 2)) + "%</b>\n"
+        + "Потенциал прибыли: <b>" + str(round(best_potential, 2)) + "</b> (усл. ед.)\n"
         + "Режим: <b>" + best_mode + " (" + tf_label + ")</b>\n"
         + "Профиль: <b>" + profile["label"] + "</b>\n\n"
         + "Устраивает время?",
@@ -523,24 +533,26 @@ async def _auto_loop(chat_id, ctx, st, hours):
                 )
                 return
 
-            if now - last_scan_time >= 15:
+            # Раз в 30 секунд сканируем рынок на предмет лучшего потенциала
+            if now - last_scan_time >= 30:
                 last_scan_time = now
-                new_sym, new_mode, new_profile, new_vol = await asyncio.to_thread(find_best_asset, ex, hours)
+                new_sym, new_mode, new_profile, new_potential = await asyncio.to_thread(find_best_asset, ex, hours)
                 
                 pos_check = portfolio.load().get("open")
                 
-                if new_sym != st["symbol"] and (new_vol - st["current_vol"]) >= 5.0 and not pos_check:
+                # Если нашли вариант с потенциалом НАМНОГО выше (в 2 раза лучше), и позиции нет
+                if new_sym != st["symbol"] and new_potential >= (st["current_vol"] * 1.5) and not pos_check:
                     st["change_suggested"] = True
                     st["new_sym"] = new_sym
                     st["new_mode"] = new_mode
                     st["new_profile"] = new_profile
-                    st["new_vol"] = new_vol
+                    st["new_vol"] = new_potential
                     
                     await ctx.bot.send_message(
                         chat_id,
-                        "🔄 <b>Найдена монета НАМНОГО лучше!</b>\n"
-                        + "Было: " + st["symbol"] + " (" + str(round(st["current_vol"], 1)) + "%)\n"
-                        + "Стало: " + new_sym + " (" + str(round(new_vol, 1)) + "%)\n"
+                        "🔄 <b>Найдена монета с бОльшим потенциалом!</b>\n"
+                        + "Было: " + st["symbol"] + "\n"
+                        + "Стало: " + new_sym + "\n"
                         + "Меняем?",
                         parse_mode=ParseMode.HTML,
                         reply_markup=kb_change_symbol()
