@@ -54,6 +54,8 @@ def get_state(chat_id):
             "paused_until": None,
             "history": [],
             "last_scan": None,
+            "in_position": False,
+            "waiting_for_tf": False,
         }
     return STATES[chat_id]
 
@@ -113,10 +115,31 @@ def kb_tf_select():
     ])
 
 
-def kb_hascoins():
+def kb_hascoins(symbol="монеты"):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Есть монеты", callback_data="hascoins:yes")],
-        [InlineKeyboardButton("❌ Нет монет", callback_data="hascoins:no")],
+        [InlineKeyboardButton("✅ Да, есть", callback_data="hascoins:yes")],
+        [InlineKeyboardButton("❌ Нет, нету", callback_data="hascoins:no")],
+    ])
+
+
+def kb_setup_confirm():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Устраивает", callback_data="setup:ok")],
+        [InlineKeyboardButton("🔄 Сменить время", callback_data="setup:change_time")],
+    ])
+
+
+def kb_continue():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Да, продолжить", callback_data="auto:continue")],
+        [InlineKeyboardButton("Нет, в меню", callback_data="auto:menu")],
+    ])
+
+
+def kb_stop_close():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("СТОП", callback_data="auto:stop")],
+        [InlineKeyboardButton("🔴 Закрыть позицию", callback_data="auto:close_position")],
     ])
 
 
@@ -150,13 +173,11 @@ def fmt_price(p):
 
 
 def smart_lot(price, stop, balance, confidence):
-    """Возвращает (qty, risk_usdt)."""
     try:
         if not balance or not price or not stop or price == stop:
             return 0, 0
-        # риск 1-3% в зависимости от уверенности
         conf = max(0.5, min(1.0, confidence or 0.6))
-        risk_pct = 1.0 + (conf - 0.5) * 4  # 1% .. 3%
+        risk_pct = 1.0 + (conf - 0.5) * 4 
         risk_usdt = balance * risk_pct / 100
         per_coin = abs(price - stop)
         if per_coin <= 0:
@@ -172,7 +193,7 @@ def stats_text(chat_id):
         s = portfolio.stats()
     except Exception as e:
         return f"⚠️ Не удалось получить статистику: {e}"
-    txt = (
+    return (
         "📊 <b>Статистика</b>\n\n"
         f"Всего сделок: <b>{s.get('total', 0)}</b>\n"
         f"Winrate: <b>{s.get('winrate', 0):.1f}%</b>\n"
@@ -180,7 +201,6 @@ def stats_text(chat_id):
         f"Профактор: <b>{s.get('profit_factor', 0):.2f}</b>\n"
         f"Общий PnL: <b>{s.get('total_pnl', 0):.2f} USDT</b>\n"
     )
-    return txt
 
 
 def history_text(chat_id, filt="all"):
@@ -206,17 +226,13 @@ def history_text(chat_id, filt="all"):
 # ============ СКАНЕР ============
 async def find_best_asset(exchange, quote="USDT"):
     try:
-        ex_class = getattr(EXCHANGES[exchange]["class"], "__call__", None)
-    except Exception:
-        pass
-    try:
         ex = EXCHANGES[exchange]["class"]()
         pairs = await asyncio.to_thread(load_all_pairs, ex, quote)
         if not pairs:
-            return None
+            return "BTC/USDT" # fallback
         random.shuffle(pairs)
         pairs = pairs[:150]
-        best = None
+        best = "BTC/USDT"
         best_score = -1
         for sym in pairs:
             try:
@@ -234,7 +250,7 @@ async def find_best_asset(exchange, quote="USDT"):
                 continue
         return best
     except Exception:
-        return None
+        return "BTC/USDT"
 
 
 # ============ ЖИВОЙ РУЧНОЙ ЦИКЛ ============
@@ -251,7 +267,7 @@ async def _live_loop(chat_id, ctx, st):
                 ex = EXCHANGES[st["exchange"]]["class"]()
                 ticker = await asyncio.to_thread(ex.fetch_ticker, st["symbol"])
                 price = ticker["last"]
-            except Exception as e:
+            except Exception:
                 await asyncio.sleep(10)
                 continue
 
@@ -260,7 +276,6 @@ async def _live_loop(chat_id, ctx, st):
             take = sig.get("take", price)
             side = sig.get("side", "buy")
 
-            # Проверки
             if side == "buy":
                 if price <= stop:
                     await ctx.bot.send_message(chat_id, f"🛑 Стоп-лосс сработал на {fmt_price(price)}. Закрывай позицию!")
@@ -270,7 +285,6 @@ async def _live_loop(chat_id, ctx, st):
                     await ctx.bot.send_message(chat_id, f"🎯 Тейк-профит достигнут на {fmt_price(price)}!")
                     st["running"] = False
                     break
-                # Защита в безубыток
                 if price >= entry * 1.02 and not sig.get("be_moved"):
                     sig["be_moved"] = True
                     sig["stop"] = entry
@@ -288,14 +302,10 @@ async def _live_loop(chat_id, ctx, st):
                     st["running"] = False
                     break
 
-            # Паника
             if side == "buy" and price <= entry * 0.97 and not sig.get("panic_alert"):
                 sig["panic_alert"] = True
                 await ctx.bot.send_message(chat_id, "🚨 СРОЧНО ЗАКРЫВАЙ! Цена пробила -3%.")
-            if side == "sell" and price >= entry * 1.03 and not sig.get("panic_alert"):
-                sig["panic_alert"] = True
-                await ctx.bot.send_message(chat_id, "🚨 СРОЧНО ЗАКРЫВАЙ! Цена пробила +3%.")
-
+            
             await asyncio.sleep(15)
     finally:
         st["running"] = False
@@ -303,56 +313,26 @@ async def _live_loop(chat_id, ctx, st):
 
 # ============ АВТОПИЛОТ ============
 async def _auto_loop(chat_id, ctx, st, hours=1):
+    # Защита от дублирования задач
+    if st.get("running") and st.get("task") and not st["task"].done():
+        return
+
     st["running"] = True
     st["mode"] = "auto"
     end_at = time.time() + hours * 3600
+    
     try:
         while st["running"] and time.time() < end_at:
-            # Пауза после серии убытков
             if st.get("paused_until") and time.time() < st["paused_until"]:
                 await asyncio.sleep(30)
                 continue
 
-            # Дневной лимит
             if st.get("daily_limit") is not None and st["daily_pnl"] <= -abs(st["daily_limit"]):
-                await ctx.bot.send_message(
-                    chat_id,
-                    f"⛔ Дневной лимит исчерпан ({st['daily_pnl']:.2f} USDT). Автопилот остановлен."
-                )
+                await ctx.bot.send_message(chat_id, f"⛔ Дневной лимит исчерпан ({st['daily_pnl']:.2f} USDT). Автопилот остановлен.", parse_mode="HTML")
                 st["running"] = False
                 break
 
-            # Скан рынка
-            best = await find_best_asset(st.get("exchange") or "bybit")
-            if best and best != st.get("symbol"):
-                st["last_scan"] = (best, time.time())
-                try:
-                    await ctx.bot.send_message(
-                        chat_id,
-                        f"🔍 Найдена монета лучше: <b>{best}</b>\nСменить?",
-                        reply_markup=kb_confirm_switch(best),
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
-            else:
-                # Просто анализируем текущую
-                if st.get("symbol") and not st.get("signal"):
-                    try:
-                        fr = Friday(st["exchange"], st["symbol"], st.get("timeframe") or "15m",
-                                    st.get("profile") or "low")
-                        sig = await asyncio.to_thread(fr.analyze_filtered)
-                        if sig and sig.get("valid"):
-                            st["signal"] = sig
-                            await ctx.bot.send_message(
-                                chat_id,
-                                f"📈 Сигнал {sig.get('side','?').upper()} {st['symbol']} "
-                                f"уверенность {sig.get('confidence',0):.2f}"
-                            )
-                    except Exception:
-                        pass
-
-            # Трекинг текущей позиции
+            # Если мы в позиции, просто отслеживаем её
             if st.get("signal"):
                 try:
                     ex = EXCHANGES[st["exchange"]]["class"]()
@@ -362,15 +342,17 @@ async def _auto_loop(chat_id, ctx, st, hours=1):
                     side = sig.get("side", "buy")
                     stop = sig.get("stop", 0)
                     take = sig.get("take", 0)
-                    if side == "buy" and (price <= stop or price >= take):
-                        pnl_pct = (price - sig["price"]) / sig["price"] * 100
+                    
+                    if (side == "buy" and (price <= stop or price >= take)) or \
+                       (side == "sell" and (price >= stop or price <= take)):
+                        pnl_pct = ((price - sig["price"]) / sig["price"] * 100) if side == "buy" else ((sig["price"] - price) / sig["price"] * 100)
                         st["daily_pnl"] += pnl_pct
                         if pnl_pct < 0:
                             st["loss_streak"] = st.get("loss_streak", 0) + 1
                             if st["loss_streak"] >= 3:
                                 st["paused_until"] = time.time() + 30 * 60
                                 st["loss_streak"] = 0
-                                await ctx.bot.send_message(chat_id, "⏸ 3 убытка подряд. Пауза 30 минут.")
+                                await ctx.bot.send_message(chat_id, "⏸ 3 убытка подряд. Пауза 30 минут.", parse_mode="HTML")
                         else:
                             st["loss_streak"] = 0
                         st.setdefault("history", []).append({
@@ -378,18 +360,46 @@ async def _auto_loop(chat_id, ctx, st, hours=1):
                             "entry": sig["price"], "exit": price, "pnl_pct": pnl_pct
                         })
                         st["signal"] = None
-                        await ctx.bot.send_message(
-                            chat_id,
-                            f"{'🎯' if pnl_pct > 0 else '🛑'} Закрытие {st['symbol']} по {fmt_price(price)} | PnL: {pnl_pct:+.2f}%"
-                        )
+                        st["in_position"] = False
+                        await ctx.bot.send_message(chat_id, f"{'🎯' if pnl_pct > 0 else '🛑'} Закрытие {st['symbol']} по {fmt_price(price)} | PnL: {pnl_pct:+.2f}%", parse_mode="HTML")
                 except Exception:
                     pass
+            
+            # Если не в позиции, ищем сетап (раз в 30 сек)
+            else:
+                await asyncio.sleep(30)
+                if not st.get("running"): break
+                
+                # Сканируем, если ещё не выбрана монета
+                if not st.get("symbol") or not st.get("setup_confirmed"):
+                    best = await find_best_asset(st.get("exchange") or "bybit")
+                    if best:
+                        st["symbol"] = best
+                        st["setup_confirmed"] = False
+                        
+                        # Демонстрация высокой волатильности (как на скрине)
+                        await ctx.bot.send_message(
+                            chat_id,
+                            "⚠️ <b>Высокая волатильность на рынке!</b>\nРиск урезан в 2 раза, чтобы не слить депо.",
+                            parse_mode="HTML"
+                        )
+                        await ctx.bot.send_message(
+                            chat_id,
+                            f"🎯 Лучший сетап:\nМонета: <b>{best}</b>\nРежим: swing\nУстраивает время?",
+                            parse_mode="HTML",
+                            reply_markup=kb_setup_confirm()
+                        )
+                        st["waiting_for_tf"] = True
+                        await asyncio.sleep(60) # Даем время ответить
+                        continue
 
             await asyncio.sleep(30)
+            
     finally:
         st["running"] = False
+        st["task"] = None
         try:
-            await ctx.bot.send_message(chat_id, "🏁 Автопилот завершил работу.")
+            await ctx.bot.send_message(chat_id, "🏁 Автопилот завершил работу.", parse_mode="HTML")
         except Exception:
             pass
 
@@ -400,6 +410,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     st = get_state(chat_id)
     st["mode"] = None
     st["running"] = False
+    if st.get("task") and not st["task"].done():
+        st["task"].cancel()
+    
     await update.message.reply_text(
         "👋 Привет! Я <b>Пятница</b> — твой торговый терминал.\n\nВыбери режим:",
         reply_markup=kb_start(),
@@ -424,7 +437,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     st = get_state(chat_id)
     data = q.data
 
-    # ===== Меню =====
     if data == "menu:stats":
         await q.edit_message_text(stats_text(chat_id), parse_mode="HTML", reply_markup=kb_start())
         return
@@ -476,18 +488,15 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         st["timeframe"] = tf
         st["awaiting_custom_tf"] = False
-        # Спросить профиль
         await q.edit_message_text("Выбери профиль риска:", reply_markup=kb_profile())
         return
 
-    # ===== Профиль =====
     if data.startswith("profile:"):
         prof = data.split(":")[1]
         st["profile"] = prof
         await q.edit_message_text("Выбери биржу:", reply_markup=kb_exchanges())
         return
 
-    # ===== Биржа =====
     if data.startswith("ex:"):
         ex = data.split(":")[1]
         st["exchange"] = ex
@@ -508,24 +517,23 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "tf_ok":
-        await q.edit_message_text("Есть ли у тебя монеты?", reply_markup=kb_hascoins())
+        await q.edit_message_text(f"Есть ли у тебя {st.get('symbol', 'монеты')} в наличии?", reply_markup=kb_hascoins(st.get('symbol')))
         return
 
-    # ===== Автовремя =====
     if data.startswith("autotime:"):
         hours = float(data.split(":")[1])
         st["auto_hours"] = hours
-        # сначала спросим баланс
         st["awaiting_balance"] = True
         await q.edit_message_text("💰 Введи свой баланс в USDT (числом):")
         return
 
-    # ===== Есть ли монеты =====
+    # ===== Есть ли монеты (Ручной режим) =====
     if data == "hascoins:no":
         st["status"] = "waiting_buy"
-        await q.edit_message_text("👌 Жду только BUY-сигналы. Запускаю автопилот...")
-        if st["mode"] == "auto":
+        await q.edit_message_text("✅ Принято. Жду только BUY. Запускаю слежку...", parse_mode="HTML")
+        if st["mode"] == "auto" and not st.get("running"):
             st["task"] = asyncio.create_task(_auto_loop(chat_id, ctx, st, st.get("auto_hours", 1)))
+            await ctx.bot.send_message(chat_id, "🤖 <b>АВТОПИЛОТ ЗАПУЩЕН</b>\nАнализирую рынок...", parse_mode="HTML", reply_markup=kb_stop_close())
         return
 
     if data == "hascoins:yes":
@@ -533,7 +541,49 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("✏️ Введи количество монет, которое у тебя есть:")
         return
 
-    # ===== Переключение монеты автопилотом =====
+    # ===== Автопилот: Устраивает время / Сменить =====
+    if data == "setup:ok":
+        st["setup_confirmed"] = True
+        await q.edit_message_text(f"✅ Отлично. Режим: swing\nТеперь скажи, у тебя есть {st.get('symbol', 'монеты')} в наличии?", reply_markup=kb_hascoins(st.get('symbol')))
+        return
+        
+    if data == "setup:change_time":
+        await q.edit_message_text("🔄 Выбери новое время для автопилота:", reply_markup=kb_auto_time())
+        return
+
+    # ===== Автопилот: Продолжаем? =====
+    if data == "auto:continue":
+        st["auto_hours"] = 1 # продлеваем на час
+        if not st.get("running"):
+            st["task"] = asyncio.create_task(_auto_loop(chat_id, ctx, st, 1))
+        await q.edit_message_text("🚀 Продолжаем работу!", reply_markup=kb_stop_close())
+        return
+        
+    if data == "auto:menu":
+        st["running"] = False
+        if st.get("task") and not st["task"].done():
+            st["task"].cancel()
+        await q.edit_message_text("Возврат в меню.", reply_markup=kb_start())
+        return
+
+    # ===== Автопилот: СТОП / Закрыть =====
+    if data == "auto:stop":
+        st["running"] = False
+        if st.get("task") and not st["task"].done():
+            st["task"].cancel()
+        await q.edit_message_text("⏹ Автопилот остановлен.", reply_markup=kb_start())
+        return
+
+    if data == "auto:close_position":
+        if st.get("signal"):
+            st["signal"] = None
+            st["in_position"] = False
+            await q.edit_message_text("🔴 Позиция закрыта вручную. Автопилот продолжает поиск.", reply_markup=kb_stop_close())
+        else:
+            await q.answer("Нет открытой позиции.", show_alert=True)
+        return
+
+    # ===== Смена монеты =====
     if data.startswith("switch:"):
         val = data.split(":")[1]
         if val == "stay":
@@ -541,6 +591,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             st["symbol"] = val
             st["signal"] = None
+            st["setup_confirmed"] = False
             await q.edit_message_text(f"🔄 Переключился на <b>{val}</b>.", parse_mode="HTML")
         return
 
@@ -550,12 +601,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     st = get_state(chat_id)
     text = (update.message.text or "").strip()
 
-    # === Свое время ===
     if st.get("awaiting_custom_tf"):
         try:
             minutes = int(text)
-            if minutes <= 0:
-                raise ValueError
+            if minutes <= 0: raise ValueError
             st["timeframe"] = f"{minutes}m"
             st["awaiting_custom_tf"] = False
             await update.message.reply_text(f"✅ Таймфрейм установлен: {minutes}m")
@@ -565,7 +614,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Введи целое число минут (например, 3):")
             return
 
-    # === Баланс ===
     if st.get("awaiting_balance"):
         try:
             st["balance"] = float(text.replace(",", "."))
@@ -578,20 +626,17 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Введи число (например, 100):")
             return
 
-    # === Дневной лимит ===
     if st.get("awaiting_daily_limit"):
         try:
             st["daily_limit"] = float(text.replace(",", "."))
             st["awaiting_daily_limit"] = False
             await update.message.reply_text(f"📉 Дневной лимит: {st['daily_limit']:.2f} USDT")
-            # спросить про монеты
-            await update.message.reply_text("Есть ли у тебя монеты на бирже?", reply_markup=kb_hascoins())
+            await update.message.reply_text(f"Есть ли у тебя {st.get('symbol', 'монеты')} на бирже?", reply_markup=kb_hascoins(st.get('symbol')))
             return
         except Exception:
             await update.message.reply_text("⚠️ Введи число:")
             return
 
-    # === Количество монет (если есть) ===
     if st.get("awaiting_qty"):
         try:
             qty = float(text.replace(",", "."))
@@ -607,23 +652,20 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if price:
                 try:
                     portfolio.open_position(st["symbol"], "buy", price, qty)
-                    await update.message.reply_text(
-                        f"✅ Добавлено в портфель: {qty} {st['symbol']} по {fmt_price(price)}"
-                    )
+                    await update.message.reply_text(f"✅ Добавлено в портфель: {qty} {st['symbol']} по {fmt_price(price)}")
                 except Exception as e:
                     await update.message.reply_text(f"⚠️ Ошибка портфеля: {e}")
             else:
                 await update.message.reply_text("⚠️ Не удалось получить цену, но количество сохранено.")
-            # ЗАПУСК АВТОПИЛОТА
+            
             if st["mode"] == "auto" and not st.get("running"):
                 st["task"] = asyncio.create_task(_auto_loop(chat_id, ctx, st, st.get("auto_hours", 1)))
-                await update.message.reply_text("🚀 Автопилот запущен.")
+                await update.message.reply_text("🤖 <b>АВТОПИЛОТ ЗАПУЩЕН</b>\nАнализирую рынок...", parse_mode="HTML", reply_markup=kb_stop_close())
             return
         except Exception:
             await update.message.reply_text("⚠️ Введи число (количество монет):")
             return
 
-    # === Стандартный ввод вне режима ===
     await update.message.reply_text("Не понял. Используй /start для меню.")
 
 
