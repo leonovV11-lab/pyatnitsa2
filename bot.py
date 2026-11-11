@@ -446,12 +446,11 @@ async def _auto_loop(chat_id, ctx, st, hours):
     profile = PROFILES[best_profile]
     tf_label = best_mode
     
-    # Анализ рынка (волатильность)
     risk_modifier = 1.0
-    if st["current_vol"] > 100:  # Если потенциал слишком высокий (рынок безумный)
+    if st["current_vol"] > 100:
         risk_modifier = 0.5
         await ctx.bot.send_message(chat_id, "⚠️ <b>Высокая волатильность на рынке!</b>\nРиск урезан в 2 раза, чтобы не слить депо.")
-    elif st["current_vol"] < 5:  # Если потенциал слишком низкий (рынок стоит)
+    elif st["current_vol"] < 5:
         st["live"] = False
         await ctx.bot.send_message(chat_id, "🛑 <b>Рынок стоит на месте (флэт).</b>\nТорговать сегодня не выгодно. Отдыхаем.")
         return
@@ -629,6 +628,58 @@ async def on_button(update, ctx):
         st["auto_pending"] = True
         st["awaiting_balance"] = True
         await q.message.reply_text("Сколько у тебя всего USDT на балансе?")
+        return
+
+    if data.startswith("tf_ok:"):
+        arg = data.split(":")[1]
+        st["awaiting_tf"] = False
+        if arg == "yes":
+            coin_name = st["symbol"].split("/")[0]
+            await q.message.reply_text(
+                "✅ Отлично. Режим: " + st["mode"] + "\nТеперь скажи, у тебя есть " + coin_name + " в наличии?",
+                reply_markup=kb_has_coins()
+            )
+            st["awaiting_has_coins"] = True
+        else:
+            await q.message.reply_text(
+                "Выбери удобный таймфрейм:",
+                reply_markup=kb_tf_select()
+            )
+        return
+
+    if data.startswith("autotf:"):
+        arg = data.split(":")[1]
+        if arg == "1m":
+            st["mode"] = "scalp"
+        elif arg == "15m":
+            st["mode"] = "intraday"
+        elif arg == "4h":
+            st["mode"] = "swing"
+        elif arg == "custom":
+            st["awaiting_custom_tf"] = True
+            await q.message.reply_text("Напиши число минут (например: 5 или 30):")
+            return
+            
+        coin_name = st["symbol"].split("/")[0]
+        await q.message.reply_text(
+            "✅ Установлено: " + st["mode"] + "\nТеперь скажи, у тебя есть " + coin_name + " в наличии?",
+            reply_markup=kb_has_coins()
+        )
+        st["awaiting_has_coins"] = True
+        return
+
+    if data.startswith("hascoins:"):
+        arg = data.split(":")[1]
+        st["awaiting_has_coins"] = False
+        if arg == "yes":
+            st["has_coins"] = True
+            st["awaiting_coin_qty"] = True
+            await q.message.reply_text("Сколько монет у тебя есть?")
+        else:
+            st["has_coins"] = False
+            await q.message.reply_text("✅ Принято. Жду только BUY. Запускаю слежку...")
+            st["live"] = True
+            st["task"] = asyncio.create_task(_auto_loop(chat_id, ctx, st, st["auto_hours"]))
         return
 
     if data == "menu:exchanges":
@@ -809,20 +860,29 @@ async def on_button(update, ctx):
             await q.message.reply_text("Закрыто. PnL: " + str(round(trade["pnl_abs"], 2)) + " USDT")
         return
 
-    if data.startswith("hascoins:"):
-        st["awaiting_has_coins"] = False
-        if data.split(":")[1] == "yes":
-            st["has_coins"] = True
-            st["awaiting_coin_qty"] = True
-            await q.message.reply_text("Сколько монет у тебя есть?")
-        else:
-            st["has_coins"] = False
-            await q.message.reply_text("Принято. Жду только BUY.")
-        return
-
 async def on_text(update, ctx):
     st = get_state(update.effective_chat.id)
     text = update.message.text.strip().replace(",", ".")
+
+    if st.get("awaiting_custom_tf"):
+        text_val = update.message.text.strip().replace(",", ".")
+        try:
+            mins = float(text_val)
+            if mins <= 0:
+                raise ValueError
+        except Exception:
+            await update.message.reply_text("нужно положительное число, например 5 или 30")
+            return
+        st["awaiting_custom_tf"] = False
+        st["custom_tf"] = str(int(mins)) + "m"
+        st["mode"] = "intraday"
+        coin_name = st["symbol"].split("/")[0]
+        await update.message.reply_text(
+            "✅ Установлено: " + st["custom_tf"] + "\nТеперь скажи, у тебя есть " + coin_name + " в наличии?",
+            reply_markup=kb_has_coins()
+        )
+        st["awaiting_has_coins"] = True
+        return
 
     if st.get("awaiting_balance"):
         st["balance"] = float(text)
@@ -847,7 +907,9 @@ async def on_text(update, ctx):
         ticker = exchange.fetch_ticker(st["symbol"])
         portfolio.open_position(st["symbol"], "BUY", float(ticker["last"]), qty)
         st["awaiting_coin_qty"] = False
-        await update.message.reply_text("Добавлено в портфель.")
+        await update.message.reply_text("Добавлено в портфель. Запускаю Автопилот...")
+        st["live"] = True
+        st["task"] = asyncio.create_task(_auto_loop(update.effective_chat.id, ctx, st, st["auto_hours"]))
         return
 
     if st.get("pending_buy"):
