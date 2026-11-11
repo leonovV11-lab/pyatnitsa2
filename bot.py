@@ -453,7 +453,6 @@ async def _auto_loop(chat_id, ctx, st, hours):
     
     profile = PROFILES[best_profile]
     tf_label = best_mode
-    coin_name = best_sym.split("/")[0]
     
     risk_modifier = 1.0
     if st.get("market_mood") == "volatile":
@@ -584,6 +583,21 @@ async def on_button(update, ctx):
     data = q.data
 
     if data == "noop":
+        return
+
+    if data == "menu:stats":
+        await q.message.reply_text(stats_text(), reply_markup=kb_start())
+        return
+
+    if data == "hist:menu":
+        await q.message.reply_text("📁 <b>Папка с историей.</b>\nВыбери категорию:", 
+                                   parse_mode=ParseMode.HTML, reply_markup=kb_history_menu())
+        return
+        
+    if data.startswith("hist:view:"):
+        filter_type = data.split(":")[2]
+        text = history_text(filter_type)
+        await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_history_menu())
         return
 
     if data == "close_pos":
