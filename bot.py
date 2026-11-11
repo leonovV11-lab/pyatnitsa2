@@ -573,10 +573,25 @@ async def on_button(update, ctx):
         return
 
     if data == "auto:start":
-        # ИЗМЕНЕНИЕ: Теперь сначала спрашиваем баланс и бюджет!
+        await q.message.reply_text("🤖 <b>АВТОПИЛОТ</b>\nВыбери время:", parse_mode=ParseMode.HTML, reply_markup=kb_auto_time())
+        return
+
+    if data.startswith("autotime:"):
+        arg = data.split(":")[1]
+        if arg == "custom":
+            st["pending_hours"] = True
+            await q.message.reply_text("Сколько часов?")
+        else:
+            st["auto_hours"] = float(arg)
+            await q.message.reply_text("Принято. Теперь выбери биржу для сканирования:", reply_markup=kb_exchanges_auto())
+        return
+
+    if data.startswith("autoex:"):
+        ex = data.split(":")[1]
+        st["exchange"] = ex
         st["auto_pending"] = True
         st["awaiting_balance"] = True
-        await q.message.reply_text("🤖 <b>АВТОПИЛОТ</b>\n\nСколько у тебя всего USDT на балансе?", parse_mode=ParseMode.HTML)
+        await q.message.reply_text("Сколько у тебя всего USDT на балансе?")
         return
 
     if data == "menu:exchanges":
@@ -772,7 +787,6 @@ async def on_text(update, ctx):
     st = get_state(update.effective_chat.id)
     text = update.message.text.strip().replace(",", ".")
 
-    # ИЗМЕНЕНИЕ: Обработка баланса и бюджета ДО всех остальных проверок
     if st.get("awaiting_balance"):
         st["balance"] = float(text)
         st["awaiting_balance"] = False
@@ -822,9 +836,7 @@ async def on_text(update, ctx):
     if st.get("pending_hours"):
         st["auto_hours"] = float(text)
         st["pending_hours"] = False
-        st["auto_pending"] = True
-        st["awaiting_balance"] = True
-        await update.message.reply_text("Сколько у тебя всего USDT на балансе?")
+        await update.message.reply_text("Принято: " + str(st["auto_hours"]) + " ч.\nТеперь выбери биржу для сканирования:", reply_markup=kb_exchanges_auto())
         return
 
     if st.get("search_mode"):
