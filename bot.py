@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("friday")
 
 STATE = {}
-PAGE_SIZE = 20
+PAGE_SIZE = 50  # Увеличили до 50 монет на страницу (максимум для Телеграма)
 CACHE = {}
 
 def get_state(chat_id):
@@ -150,20 +150,28 @@ def kb_pairs(ex, quote, pairs, page=0):
     start = page * PAGE_SIZE
     chunk = pairs[start:start + PAGE_SIZE]
     rows = []
+    row = []
     for sym in chunk:
         base = sym.split("/")[0]
-        rows.append([InlineKeyboardButton(base, callback_data="pair:" + ex + ":" + quote + ":" + base)])
+        row.append(InlineKeyboardButton(base, callback_data="pair:" + ex + ":" + quote + ":" + base))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+        
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("<", callback_data="page:" + ex + ":" + quote + ":" + str(page - 1)))
+        nav.append(InlineKeyboardButton("<<", callback_data="page:" + ex + ":" + quote + ":" + str(page - 1)))
     nav.append(InlineKeyboardButton(str(page + 1) + "/" + str(total), callback_data="noop"))
     if page < total - 1:
-        nav.append(InlineKeyboardButton(">", callback_data="page:" + ex + ":" + quote + ":" + str(page + 1)))
+        nav.append(InlineKeyboardButton(">>", callback_data="page:" + ex + ":" + quote + ":" + str(page + 1)))
     if len(nav) > 1:
         rows.append(nav)
+        
     rows.append([InlineKeyboardButton("дешевые", callback_data="sort:" + ex + ":" + quote + ":asc")])
     rows.append([InlineKeyboardButton("дорогие", callback_data="sort:" + ex + ":" + quote + ":desc")])
-    rows.append([InlineKeyboardButton("поиск", callback_data="search:" + ex + ":" + quote)])
+    rows.append([InlineKeyboardButton("🔍 Поиск монеты", callback_data="search:" + ex + ":" + quote)])
     rows.append([InlineKeyboardButton("назад", callback_data="back:quotes:" + ex)])
     return InlineKeyboardMarkup(rows)
 
@@ -608,13 +616,13 @@ async def on_button(update, ctx):
         _, ex, quote = data.split(":")
         st["quote"] = quote
         st["page"] = 0
-        await q.message.reply_text("загружаю пары...")
+        await q.message.reply_text("загружаю ВСЕ пары с биржи...")
         try:
             pairs = await asyncio.to_thread(get_cached_pairs, ex, quote)
         except Exception as e:
             await q.message.reply_text("ошибка: " + str(e))
             return
-        await q.message.reply_text("найдено " + str(len(pairs)) + " пар", reply_markup=kb_pairs(ex, quote, pairs, 0))
+        await q.message.reply_text("найдено " + str(len(pairs)) + " пар. Выбери монету (или используй поиск):", reply_markup=kb_pairs(ex, quote, pairs, 0))
         return
 
     if data.startswith("page:"):
@@ -676,7 +684,7 @@ async def on_button(update, ctx):
     if data.startswith("search:"):
         _, ex, quote = data.split(":")
         st["search_mode"] = True
-        await q.message.reply_text("напиши код монеты, например SOL")
+        await q.message.reply_text("напиши код монеты, например SOL или PEPE")
         return
 
     if data.startswith("lmode:"):
