@@ -573,19 +573,10 @@ async def on_button(update, ctx):
         return
 
     if data == "auto:start":
-        await q.message.reply_text("🤖 <b>АВТОПИЛОТ</b>\nВыбери время:", parse_mode=ParseMode.HTML, reply_markup=kb_auto_time())
-        return
-
-    if data.startswith("autotime:"):
-        arg = data.split(":")[1]
-        if arg == "custom":
-            st["pending_hours"] = True
-            await q.message.reply_text("Сколько часов?")
-        else:
-            st["auto_hours"] = float(arg)
-            st["auto_pending"] = True
-            st["awaiting_balance"] = True
-            await q.message.reply_text("Сколько у тебя всего USDT на балансе?")
+        # ИЗМЕНЕНИЕ: Теперь сначала спрашиваем баланс и бюджет!
+        st["auto_pending"] = True
+        st["awaiting_balance"] = True
+        await q.message.reply_text("🤖 <b>АВТОПИЛОТ</b>\n\nСколько у тебя всего USDT на балансе?", parse_mode=ParseMode.HTML)
         return
 
     if data == "menu:exchanges":
@@ -781,6 +772,7 @@ async def on_text(update, ctx):
     st = get_state(update.effective_chat.id)
     text = update.message.text.strip().replace(",", ".")
 
+    # ИЗМЕНЕНИЕ: Обработка баланса и бюджета ДО всех остальных проверок
     if st.get("awaiting_balance"):
         st["balance"] = float(text)
         st["awaiting_balance"] = False
@@ -791,8 +783,6 @@ async def on_text(update, ctx):
     if st.get("awaiting_budget"):
         st["daily_budget"] = float(text)
         st["awaiting_budget"] = False
-        st["budget_spent"] = 0.0
-        st["daily_profit"] = 0.0
         if st.get("auto_pending"):
             st["auto_pending"] = False
             await update.message.reply_text("Бюджет принят. Запускаю Автопилот...")
