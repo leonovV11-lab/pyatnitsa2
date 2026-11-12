@@ -69,6 +69,13 @@ STATE = {
     },
     "pending": {},
     "panic": {"task": None, "active": False},
+    "demo": {
+        "active": False,
+        "symbol": None,
+        "buy_price": 0.0,
+        "amount": 0.0,
+        "action": "BUY",
+    },
     "trailing": {"active": False, "task": None},
 }
 
@@ -208,6 +215,75 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🛑 Остановлено. Что дальше?",
         reply_markup=kb(rows)
+    )
+
+# ---------- ДЕМО-РЕЖИМ ----------
+async def demo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    rows = [
+        [btn("🚀 Найти монету", "demo_scan")],
+        nav_btns("start")[0]
+    ]
+    txt = "🎮 Демо-режим.\nЗдесь ты можешь проверить, как работает стратегия.\nНажми кнопку, чтобы получить сигнал."
+    await update.callback_query.edit_message_text(txt, reply_markup=kb(rows))
+
+async def demo_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.edit_message_text("🔍 Сканирую рынок...")
+    
+    best = await _scan_best()
+    if not best:
+        await update.callback_query.edit_message_text(
+            "Не нашёл подходящих монет. Попробуй позже.",
+            reply_markup=kb(nav_btns("demo"))
+        )
+        return
+        
+    sig = best["signal"]
+    
+    STATE["demo"]["symbol"] = best["symbol"]
+    STATE["demo"]["buy_price"] = sig.price
+    STATE["demo"]["action"] = sig.action
+    
+    text = (
+        "🎮 ДЕМО-СИГНАЛ\n\n"
+        "Монета: " + best["symbol"] + "\n"
+        "Сигнал: " + sig.action + "\n"
+        "Цена: " + fmt_price(sig.price) + "\n"
+        "Уверенность: " + str(int(sig.confidence * 100)) + "%"
+    )
+    
+    if sig.action == "BUY":
+        rows = [
+            [btn("✅ Купил", "demo_buy")],
+            [btn("❌ Пропустил", "demo_skip")],
+            nav_btns("demo")[0]
+        ]
+    else:
+        rows = [
+            [btn("✅ Продал", "demo_sell")],
+            [btn("❌ Пропустил", "demo_skip")],
+            nav_btns("demo")[0]
+        ]
+        
+    await update.callback_query.edit_message_text(text, reply_markup=kb(rows))
+
+async def demo_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.edit_message_text(
+        "Ок, пропустил. Возвращаемся в меню Демо.",
+        reply_markup=kb([[btn("🏠 В меню Демо", "demo")]])
+    )
+
+async def demo_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    STATE["pending"]["demo_amount"] = True
+    await update.callback_query.edit_message_text(
+        "Сколько USDT ты купил по " + STATE["demo"]["symbol"] + "? (введи число)",
+        reply_markup=kb(nav_btns("demo"))
+    )
+
+async def demo_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    STATE["pending"]["demo_amount"] = True
+    await update.callback_query.edit_message_text(
+        "Сколько USDT ты продал по " + STATE["demo"]["symbol"] + "? (введи число)",
+        reply_markup=kb(nav_btns("demo"))
     )
 
 # ---------- АВТОПИЛОТ ----------
@@ -1105,16 +1181,53 @@ async def stats_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     await update.callback_query.edit_message_text(text, reply_markup=kb(nav_btns("start")))
 
-async def demo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.edit_message_text(
-        "Демо-режим (старая функция).", reply_markup=kb(nav_btns("start"))
-    )
-
 # ---------- ТЕКСТОВЫЙ ВВОД ----------
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
     pend = STATE["pending"]
     
+    if "demo_amount" in pend:
+        try:
+            amount = float(txt)
+        except Exception:
+            await update.message.reply_text("Введи число (USDT).", reply_markup=kb(nav_btns("demo")))
+            return
+        pend.pop("demo_amount")
+        
+        STATE["demo"]["amount"] = amount
+        sig_action = STATE["demo"]["action"]
+        symbol = STATE["demo"]["symbol"]
+        buy_price = STATE["demo"]["buy_price"]
+        
+        try:
+            f = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
+            df = f.fetch("1m", 5)
+            curr_price = float(df.iloc[-1]["close"])
+        except Exception:
+            curr_price = buy_price
+            
+        if sig_action == "BUY":
+            pnl_pct = (curr_price - buy_price) / buy_price
+        else:
+            pnl_pct = (buy_price - curr_price) / buy_price
+            
+        pnl_usdt = amount * pnl_pct
+        res_text = "📈 Плюс" if pnl_usdt >= 0 else "📉 Минус"
+        
+        msg = (
+            "🎮 ДЕМО-СДЕЛКА ЗАВЕРШЕНА\n\n"
+            "Монета: " + symbol + "\n"
+            "Вход: " + fmt_price(buy_price) + "\n"
+            "Выход: " + fmt_price(curr_price) + "\n"
+            "Сумма: " + str(amount) + " USDT\n\n"
+            + res_text + ": " + str(round(pnl_usdt, 2)) + " USDT (" + str(round(pnl_pct*100, 2)) + "%)\n\n"
+            "Это был демо-режим. Реальные деньги не потрачены."
+        )
+        
+        rows = [[btn("🏠 В меню Демо", "demo")]]
+        await update.message.reply_text(msg, reply_markup=kb(rows))
+        return
+
     if "wait_custom_amount" in pend:
         sig_data = pend["wait_custom_amount"]
         try:
@@ -1311,6 +1424,22 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if ctx.application.bot_data.get("chat_id") != q.message.chat_id:
         ctx.application.bot_data["chat_id"] = q.message.chat_id
 
+    if data == "demo":
+        await demo(update, ctx)
+        return
+    if data == "demo_scan":
+        await demo_scan(update, ctx)
+        return
+    if data == "demo_skip":
+        await demo_skip(update, ctx)
+        return
+    if data == "demo_buy":
+        await demo_buy(update, ctx)
+        return
+    if data == "demo_sell":
+        await demo_sell(update, ctx)
+        return
+
     if data == "auto_stop_signals":
         STATE["auto"]["active"] = False
         STATE["trailing"]["active"] = False
@@ -1464,9 +1593,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if data == "stats_menu":
         await stats_menu(update, ctx)
-        return
-    if data == "demo":
-        await demo(update, ctx)
         return
     if data == "noop":
         return
