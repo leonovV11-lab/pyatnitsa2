@@ -57,6 +57,8 @@ STATE = {
         "waiting_tf_confirm": False,
         "current_offer": None,
         "best_score": 0,
+        "switch_wait_until": None, # Время, когда можно снова предложить обмен
+        "switch_offer": None, # Сохраненная монета для обмена
     },
     "manual": {
         "exchange": config.EXCHANGE,
@@ -200,6 +202,7 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["symbols"] = []
     STATE["auto"]["current_offer"] = None
     STATE["auto"]["waiting_tf_confirm"] = False
+    STATE["auto"]["switch_wait_until"] = None
     
     rows = [[btn("🏠 В меню", "start")]]
     await update.message.reply_text(
@@ -279,6 +282,7 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         STATE["auto"]["best_score"] = 0
         STATE["auto"]["waiting_tf_confirm"] = False
         STATE["auto"]["current_offer"] = None
+        STATE["auto"]["switch_wait_until"] = None
         STATE["auto"]["task"] = asyncio.create_task(_auto_loop(ctx.application))
 
 async def tf_bad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -434,8 +438,35 @@ async def _auto_loop(app):
                 if STATE["auto"]["waiting_tf_confirm"]:
                     pass
                 else:
+                    # ЛОГИКА ПОВТОРНОГО ПРЕДЛОЖЕНИЯ ЧЕРЕЗ 30 МИНУТ
+                    now = datetime.datetime.utcnow()
+                    if STATE["auto"]["switch_wait_until"] and now >= STATE["auto"]["switch_wait_until"]:
+                        saved_offer = STATE["auto"]["switch_offer"]
+                        if saved_offer:
+                            # Проверяем, актуальна ли еще эта монета
+                            new_best = await _score_pair(saved_offer["symbol"])
+                            if new_best and new_best["score"] > STATE["auto"]["best_score"] * 1.05:
+                                # Проверяем, в плюсе ли мы (или нет сделок)
+                                pos = portfolio.load().get("open")
+                                in_profit = True
+                                if pos:
+                                    f = Friday(symbol=pos["symbol"], exchange_name=STATE["auto"]["exchange"])
+                                    df = f.fetch("1m", 5)
+                                    curr_price = float(df.iloc[-1]["close"])
+                                    pnl = portfolio.current_pnl(curr_price)
+                                    if pnl and pnl["pnl_pct"] <= 0:
+                                        in_profit = False
+                                
+                                if in_profit:
+                                    STATE["auto"]["current_offer"] = saved_offer["symbol"]
+                                    await _offer_better(app, saved_offer)
+                        
+                        # Сбрасываем таймер после проверки
+                        STATE["auto"]["switch_wait_until"] = None
+                        STATE["auto"]["switch_offer"] = None
+
                     # Ищем в фоне, нет ли монеты на 5% лучше
-                    if STATE["auto"]["best_score"] > 0:
+                    if STATE["auto"]["best_score"] > 0 and not STATE["auto"]["switch_wait_until"]:
                         new_best = await _scan_best(exclude=symbols)
                         if new_best and new_best["score"] > STATE["auto"]["best_score"] * 1.05:
                             STATE["auto"]["best_score"] = new_best["score"]
@@ -450,6 +481,10 @@ async def _auto_loop(app):
         await asyncio.sleep(60)
 
 async def _process_symbol(app, symbol):
+    # ЕСЛИ МЫ ЖДЕМ ОТВЕТА НА ПРЕДЫДУЩИЙ СИГНАЛ — НЕ ШЛЕМ НОВЫЙ
+    if "signal" in STATE["pending"]:
+        return
+
     r = await _score_pair(symbol)
     if r is None:
         return
@@ -587,15 +622,23 @@ async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if STATE["auto"]["current_offer"]:
         STATE["auto"]["symbols"] = [STATE["auto"]["current_offer"]]
         STATE["auto"]["current_offer"] = None
+        STATE["auto"]["switch_wait_until"] = None
+        STATE["auto"]["switch_offer"] = None
         await update.callback_query.edit_message_text(
             "Переключился на " + STATE["auto"]["symbols"][0] + ". Ждём сигналов.",
             reply_markup=kb(nav_btns("start"))
         )
 
 async def switch_no(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Отказ от обмена: ставим таймер на 30 минут и сохраняем монету
+    if STATE["auto"]["current_offer"]:
+        STATE["auto"]["switch_offer"] = {"symbol": STATE["auto"]["current_offer"]}
+        STATE["auto"]["switch_wait_until"] = datetime.datetime.utcnow() + datetime.timedelta(minutes=30)
+    
     STATE["auto"]["current_offer"] = None
     await update.callback_query.edit_message_text(
-        "Ок, остаемся на текущей.", reply_markup=kb(nav_btns("start"))
+        "Ок, остаемся на текущей. Вернусь к этому вопросу через 30 минут, если обстановка не изменится.", 
+        reply_markup=kb(nav_btns("start"))
     )
 
 async def tf_ok_15m(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -633,7 +676,9 @@ async def sig_skipped(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def sig_buy_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sig = STATE["pending"].get("signal")
-    if not sig: return
+    if not sig: 
+        await update.callback_query.answer("Сигнал устарел или уже обработан.", show_alert=True)
+        return
     lot = sig["lot"]
     price = sig["price"]
     qty = lot / price if price else 0
@@ -662,7 +707,9 @@ async def sig_buy_custom(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def sig_sell_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sig = STATE["pending"].get("signal")
-    if not sig: return
+    if not sig: 
+        await update.callback_query.answer("Сигнал устарел.", show_alert=True)
+        return
     pos = portfolio.load().get("open")
     if not pos:
         await update.callback_query.edit_message_text("Нет открытой позиции для продажи.", reply_markup=kb(nav_btns("start")))
@@ -1276,6 +1323,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         STATE["auto"]["symbols"] = []
         STATE["auto"]["current_offer"] = None
         STATE["auto"]["waiting_tf_confirm"] = False
+        STATE["auto"]["switch_wait_until"] = None
         await q.edit_message_text(
             "🛑 Автопилот остановлен. Сигналы больше не приходят.",
             reply_markup=kb([[btn("🏠 В меню", "start")]])
@@ -1292,6 +1340,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             STATE["auto"]["symbols"] = []
             STATE["auto"]["current_offer"] = None
             STATE["auto"]["waiting_tf_confirm"] = False
+            STATE["auto"]["switch_wait_until"] = None
         
         await start(update, ctx)
         return
