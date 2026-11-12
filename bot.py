@@ -246,12 +246,21 @@ async def auto_ask_exchange(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     key = update.callback_query.data.replace("auto_ex_set_", "")
     STATE["auto"]["exchange"] = key
+    
+    # Сохраняем chat_id, чтобы фоновый цикл знал, куда писать
+    ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
+    
     await update.callback_query.edit_message_text(
-        "Биржа: " + exchanges.EXCHANGES.get(key, key) + ".\nИщем оптимальный вариант...",
+        "Биржа: " + exchanges.EXCHANGES.get(key, key) + ".\nИщем оптимальный вариант (это займет около минуты)...",
         reply_markup=kb(nav_btns("start"))
     )
-    if STATE["auto"]["task"] is None:
+    
+    # Запускаем цикл в фоне
+    if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
         STATE["auto"]["active"] = True
+        STATE["auto"]["symbols"] = []
+        STATE["auto"]["waiting_tf_confirm"] = False
+        STATE["auto"]["current_offer"] = None
         STATE["auto"]["task"] = asyncio.create_task(_auto_loop(ctx.application))
 
 async def tf_bad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -305,22 +314,28 @@ async def multi_choose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _score_pair(symbol):
     try:
         f = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
-        df = f.fetch(ANALYSIS_TF, ANALYSIS_LIMIT)
-        df = f.enrich(df, ANALYSIS_TF).dropna().reset_index(drop=True)
+        # Берем 300 свечей по 15m (это 3 дня)
+        df = f.fetch("15m", 300)
+        df = f.enrich(df, "15m").dropna().reset_index(drop=True)
         if len(df) < 20:
             return None
         last = df.iloc[-1]
         price = float(last["close"])
+        
+        # Потенциал прибыли: объем за 24ч умножаем на волатильность (ATR)
         vol24 = float(df["volume"].tail(96).sum() * price)
         atr_pct = float(last["atr"]) / price if price else 0
-        sig = f.analyze_filtered(ANALYSIS_TF, tp_mult=3.0)
+        
+        sig = f.analyze_filtered("15m", tp_mult=3.0)
         conf = sig.confidence
+        
         if conf < CONF_MIN_AUTO:
             return None
         if not fee_ok(price, sig.take_profit):
             return None
         if not mtf_confirm(symbol, sig.action):
             return None
+            
         score = vol24 * atr_pct * conf
         return {
             "symbol": symbol,
@@ -330,12 +345,13 @@ async def _score_pair(symbol):
             "atr_pct": atr_pct,
             "vol24": vol24,
         }
-    except Exception:
+    except Exception as e:
         return None
 
 async def _scan_best(exclude=None):
+    # Берем топ-100 пар с биржи, чтобы не забанили за лимиты
     pairs = exchanges.load_all_pairs(
-        STATE["auto"]["exchange"], quote="USDT", max_pairs=200
+        STATE["auto"]["exchange"], quote="USDT", max_pairs=100
     )
     best = None
     for sym in pairs:
@@ -346,10 +362,11 @@ async def _scan_best(exclude=None):
             continue
         if best is None or r["score"] > best["score"]:
             best = r
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.1) # Защита от бана биржи
     return best
 
 async def _auto_loop(app):
+    print("=== СТАРТ ЦИКЛА АВТОПИЛОТА ===")
     while STATE["auto"]["active"]:
         if is_sleeping():
             await asyncio.sleep(60)
@@ -360,11 +377,15 @@ async def _auto_loop(app):
         try:
             symbols = STATE["auto"]["symbols"]
             if not symbols:
+                print("Сканирую рынок...")
                 best = await _scan_best()
                 if best:
+                    print("Найдена лучшая монета:", best["symbol"])
                     STATE["auto"]["current_offer"] = best["symbol"]
                     STATE["auto"]["waiting_tf_confirm"] = True
                     await _offer_found(app, best)
+                else:
+                    print("Ничего не найдено, ждем 1 минуту...")
             else:
                 if STATE["auto"]["waiting_tf_confirm"]:
                     pass
@@ -372,7 +393,7 @@ async def _auto_loop(app):
                     for sym in list(symbols):
                         await _process_symbol(app, sym)
         except Exception as e:
-            print("Ошибка цикла:", e)
+            print("ОШИБКА В ЦИКЛЕ АВТОПИЛОТА:", e)
         await asyncio.sleep(60)
 
 async def _process_symbol(app, symbol):
@@ -1033,7 +1054,7 @@ async def multi_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             bests.append(r)
         if len(bests) >= n * 2:
             break
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.1)
     bests.sort(key=lambda x: x["score"], reverse=True)
     top = bests[:n]
     if not top:
