@@ -55,6 +55,9 @@ STATE = {
         "tf": "15m",
         "mode": "focused",
         "last_switch_offer": None,
+        "exchange": "bybit",
+        "waiting_tf_confirm": False,
+        "current_offer": None,
     },
     "manual": {
         "exchange": config.EXCHANGE,
@@ -67,17 +70,17 @@ STATE = {
     "panic": {"task": None, "active": False},
 }
 
-TF_CHOICES = ["1m", "15m", "4h"]
-
-
 # ---------- ХЕЛПЕРЫ ----------
 def kb(rows):
     return InlineKeyboardMarkup(rows)
 
-
 def btn(text, data):
     return InlineKeyboardButton(text, callback_data=data)
 
+def nav_btns(back_data):
+    return [
+        [btn("⬅️ На шаг назад", back_data), btn("🏠 В меню", "start")]
+    ]
 
 def is_sleeping():
     t = STATE["sleep_until"]
@@ -85,14 +88,12 @@ def is_sleeping():
         return False
     return datetime.datetime.utcnow() < t
 
-
 def sleep_left_min():
     t = STATE["sleep_until"]
     if not t:
         return 0
     sec = (t - datetime.datetime.utcnow()).total_seconds()
     return max(0, int(sec / 60))
-
 
 def register_loss():
     STATE["loss_streak"] += 1
@@ -103,10 +104,8 @@ def register_loss():
         )
         STATE["loss_streak"] = 0
 
-
 def register_win():
     STATE["loss_streak"] = 0
-
 
 def calc_lot(price, sl_price, confidence):
     if STATE["balance"] <= 0:
@@ -125,15 +124,13 @@ def calc_lot(price, sl_price, confidence):
     budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
     return min(lot_usdt, budget)
 
-
 def fee_ok(price, tp):
     move = abs(tp - price) / price if price else 0
     return move >= config.FEE_ROUND * FEE_MIN_TP
 
-
 def mtf_confirm(symbol, direction):
     try:
-        f15 = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
+        f15 = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
         df15 = f15.fetch("15m", 120)
         df15 = f15.enrich(df15, "15m").dropna()
         if len(df15) < 2:
@@ -147,17 +144,11 @@ def mtf_confirm(symbol, direction):
     except Exception:
         return True
 
-
 def session_ok(multi_day):
     if not multi_day:
         return True
     hour = datetime.datetime.utcnow().hour
     return 12 <= hour < 20
-
-
-def long_trade(multi_day):
-    return multi_day
-
 
 # ---------- ГЕОЛОКАЦИЯ ----------
 def city_to_tz(city):
@@ -172,13 +163,11 @@ def city_to_tz(city):
     except Exception:
         return "UTC"
 
-
 def local_now():
     try:
         return datetime.datetime.now(ZoneInfo(STATE["tz"]))
     except Exception:
         return datetime.datetime.utcnow()
-
 
 # ---------- ГЛАВНОЕ МЕНЮ ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -193,115 +182,87 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = "Пятница на связи."
     if is_sleeping():
         txt = txt + "\n😴 Пауза, осталось " + str(sleep_left_min()) + " мин"
+    
     if update.message:
         await update.message.reply_text(txt, reply_markup=kb(rows))
     else:
         await update.callback_query.edit_message_text(txt, reply_markup=kb(rows))
 
-
 # ---------- АВТОПИЛОТ ----------
 async def auto_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["auto"] = "balance"
     await update.callback_query.edit_message_text(
-        "Сколько у тебя сейчас на балансе? (USDT)"
+        "Сколько у тебя сейчас на балансе? (USDT)",
+        reply_markup=kb(nav_btns("start"))
     )
-
 
 async def auto_after_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["auto"] = "budget"
-    await update.message.reply_text(
-        "Понял, баланс " + str(STATE["balance"]) + " USDT.\n"
-        "Сколько готов потратить сегодня? (USDT)"
-    )
-
+    msg = "Понял, баланс " + str(STATE["balance"]) + " USDT.\nСколько готов потратить сегодня? (USDT)"
+    if update.message:
+        await update.message.reply_text(msg, reply_markup=kb(nav_btns("auto_start")))
+    else:
+        await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("auto_start")))
 
 async def auto_after_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["auto"] = "city"
-    await update.message.reply_text(
-        "Понял, работаем с " + str(STATE["daily_budget"]) + " USDT.\n"
-        "В каком ты городе?"
-    )
-
+    msg = "Понял, работаем с " + str(STATE["daily_budget"]) + " USDT.\nВ каком ты городе?"
+    if update.message:
+        await update.message.reply_text(msg, reply_markup=kb(nav_btns("auto_retry_balance")))
+    else:
+        await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("auto_retry_balance")))
 
 async def auto_after_city(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    STATE["pending"]["auto"] = "time"
-    await update.message.reply_text(
-        "Понял, " + STATE["city"] + ".\n"
-        "Сколько у тебя времени? (например '2 часа' или '2 дня')"
-    )
-
-
-async def auto_after_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rows = [
-        [btn("✅ Устраивает", "time_ok")],
-        [btn("❌ Не устраивает", "time_bad")],
-    ]
+    STATE["pending"]["auto"] = "check_time"
     local = local_now().strftime("%H:%M")
-    await update.message.reply_text(
-        "Сейчас в " + STATE["city"] + " " + local + ".\n"
-        "Время работы: " + STATE["pending"].get("auto_hours", "?") + " ч.\n"
-        "Устраивает?",
-        reply_markup=kb(rows),
+    msg = (
+        "Понял, " + STATE["city"] + ".\n"
+        "Сколько сейчас у тебя времени по часам? (например " + local + ")"
     )
+    if update.message:
+        await update.message.reply_text(msg, reply_markup=kb(nav_btns("auto_retry_budget")))
+    else:
+        await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("auto_retry_budget")))
 
+async def auto_after_check_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    STATE["pending"]["auto"] = "work_time"
+    msg = "Подтверждено! Ты находишься в " + STATE["city"] + ".\nСколько ты будешь работать? (например '2 часа' или '2 дня')"
+    if update.message:
+        await update.message.reply_text(msg, reply_markup=kb(nav_btns("auto_retry_city")))
+    else:
+        await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("auto_retry_city")))
 
-async def time_bad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rows = [
-        [btn("⏱ В часах", "time_hours")],
-        [btn("📅 В днях", "time_days")],
-    ]
+async def auto_ask_exchange(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    rows = []
+    for key, name in exchanges.EXCHANGES.items():
+        rows.append([btn(name, "auto_ex_set_" + key)])
+    rows.append(nav_btns("auto_retry_check_time")[0])
+    msg = "Выбери биржу для торговли:"
+    if update.message:
+        await update.message.reply_text(msg, reply_markup=kb(rows))
+    else:
+        await update.callback_query.edit_message_text(msg, reply_markup=kb(rows))
+
+async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    key = update.callback_query.data.replace("auto_ex_set_", "")
+    STATE["auto"]["exchange"] = key
     await update.callback_query.edit_message_text(
-        "Как задать время?", reply_markup=kb(rows)
-    )
-
-
-async def time_hours(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    STATE["pending"]["auto"] = "hours_input"
-    await update.callback_query.edit_message_text(
-        "Впиши часы (например 2 или 5):"
-    )
-
-
-async def time_days(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    STATE["pending"]["auto"] = "days_input"
-    await update.callback_query.edit_message_text(
-        "Впиши дни (например 2 или 3), бот сам пересчитает:"
-    )
-
-
-async def time_ok(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rows = [
-        [btn("✅ Торгуем 15 минут", "tf_ok_15m")],
-        [btn("❌ Не устраивает ТФ", "tf_bad")],
-    ]
-    await update.callback_query.edit_message_text(
-        "Начинаю скан рынка. Проверю монеты и предложу лучшую.\n"
-        "После находки уточню ТФ.",
-        reply_markup=kb(rows),
+        "Биржа: " + exchanges.EXCHANGES.get(key, key) + ".\nИщем оптимальный вариант...",
+        reply_markup=kb(nav_btns("start"))
     )
     if STATE["auto"]["task"] is None:
         STATE["auto"]["active"] = True
         STATE["auto"]["task"] = asyncio.create_task(_auto_loop(ctx.application))
 
-
 async def tf_bad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = [
-        [btn("1m", "auto_tf_1m")],
-        [btn("15m", "auto_tf_15m")],
-        [btn("4h", "auto_tf_4h")],
+        [btn("1m", "auto_tf_1m"), btn("15m", "auto_tf_15m"), btn("4h", "auto_tf_4h")],
         [btn("✏️ Своё время", "auto_tf_custom")],
+        nav_btns("start")[0]
     ]
     await update.callback_query.edit_message_text(
         "Выбери ТФ:", reply_markup=kb(rows)
     )
-
-
-async def tf_ok_15m(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    STATE["auto"]["tf"] = "15m"
-    await update.callback_query.edit_message_text(
-        "Ок, работаем 15m. Ждём сигналов."
-    )
-
 
 async def auto_tf_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = update.callback_query.data
@@ -309,39 +270,41 @@ async def auto_tf_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if tf == "custom":
         STATE["pending"]["auto"] = "tf_custom"
         await update.callback_query.edit_message_text(
-            "Впиши ТФ (например 5m, 30m, 1h):"
+            "Впиши ТФ (например 5m, 30m, 1h):",
+            reply_markup=kb(nav_btns("tf_bad"))
         )
         return
     STATE["auto"]["tf"] = tf
-    await update.callback_query.edit_message_text(
-        "Ок, работаем " + tf + ". Ждём сигналов."
-    )
-
+    STATE["auto"]["waiting_tf_confirm"] = False
+    msg = "Ок, работаем " + tf + ". Ждём сигналов."
+    await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("start")))
+    
+    if STATE["auto"]["current_offer"]:
+        STATE["auto"]["symbols"] = [STATE["auto"]["current_offer"]]
+        STATE["auto"]["current_offer"] = None
+        await _ask_hascoins(update, ctx)
 
 async def hascoins_no(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["allowed"] = "BUY"
     await update.callback_query.edit_message_text(
-        "Понял. Ждём только BUY."
+        "Понял. Ждём только BUY.", reply_markup=kb(nav_btns("start"))
     )
-
 
 async def hascoins_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["allowed"] = "BUYSELL"
     await update.callback_query.edit_message_text(
-        "Понял. Ждём BUY (докупить) или SELL (не потерять)."
+        "Понял. Ждём BUY (докупить) или SELL (не потерять).", reply_markup=kb(nav_btns("start"))
     )
-
 
 async def multi_choose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["auto"] = "multi_count"
     await update.callback_query.edit_message_text(
-        "Сколько монет торгуем? (2–10)"
+        "Сколько монет торгуем? (2–10)", reply_markup=kb(nav_btns("start"))
     )
-
 
 async def _score_pair(symbol):
     try:
-        f = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
+        f = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
         df = f.fetch(ANALYSIS_TF, ANALYSIS_LIMIT)
         df = f.enrich(df, ANALYSIS_TF).dropna().reset_index(drop=True)
         if len(df) < 20:
@@ -370,10 +333,9 @@ async def _score_pair(symbol):
     except Exception:
         return None
 
-
 async def _scan_best(exclude=None):
     pairs = exchanges.load_all_pairs(
-        STATE["manual"]["exchange"], quote="USDT", max_pairs=200
+        STATE["auto"]["exchange"], quote="USDT", max_pairs=200
     )
     best = None
     for sym in pairs:
@@ -386,7 +348,6 @@ async def _scan_best(exclude=None):
             best = r
         await asyncio.sleep(0.05)
     return best
-
 
 async def _auto_loop(app):
     while STATE["auto"]["active"]:
@@ -401,15 +362,18 @@ async def _auto_loop(app):
             if not symbols:
                 best = await _scan_best()
                 if best:
-                    STATE["auto"]["symbols"] = [best["symbol"]]
+                    STATE["auto"]["current_offer"] = best["symbol"]
+                    STATE["auto"]["waiting_tf_confirm"] = True
                     await _offer_found(app, best)
             else:
-                for sym in list(symbols):
-                    await _process_symbol(app, sym)
-        except Exception:
-            pass
+                if STATE["auto"]["waiting_tf_confirm"]:
+                    pass
+                else:
+                    for sym in list(symbols):
+                        await _process_symbol(app, sym)
+        except Exception as e:
+            print("Ошибка цикла:", e)
         await asyncio.sleep(60)
-
 
 async def _process_symbol(app, symbol):
     r = await _score_pair(symbol)
@@ -431,44 +395,109 @@ async def _process_symbol(app, symbol):
         "Сигнал: " + sig.action + "\n"
         "Цена: " + fmt_price(sig.price) + "\n"
         "Уверенность: " + str(int(sig.confidence * 100)) + "%\n"
-        "Лот: " + str(round(lot, 2)) + " USDT\n"
+        "Рекомендуемый лот: " + str(round(lot, 2)) + " USDT\n"
         "Стоп: " + fmt_price(sig.stop_loss) + "\n"
         "Тейк: " + fmt_price(sig.take_profit)
     )
-    rows = [
-        [btn("✅ Взял", "auto_took_" + symbol.replace("/", "_"))],
-        [btn("⏭ Пропустить", "auto_skip")],
-    ]
-    await app.bot.send_message(
-        chat_id=app.bot_data.get("chat_id", 0),
-        text=text,
-        reply_markup=kb(rows),
-    )
-
+    if sig.action == "BUY":
+        rows = [
+            [btn("✅ Купил", "sig_bought_" + symbol.replace("/", "_") + "_" + str(sig.price))],
+            [btn("❌ Пропустил", "sig_skipped")],
+            nav_btns("start")[0]
+        ]
+    else:
+        rows = [
+            [btn("✅ Продал", "sig_sold_" + symbol.replace("/", "_") + "_" + str(sig.price))],
+            [btn("❌ Пропустил", "sig_skipped")],
+            nav_btns("start")[0]
+        ]
+    
+    chat_id = app.bot_data.get("chat_id", 0)
+    if chat_id:
+        await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
 
 async def _offer_found(app, best):
-    rows = [
-        [btn("Нет, монеты нет", "hascoins_no")],
-        [btn("Да, есть", "hascoins_yes")],
-    ]
     text = (
         "Нашёл монету: " + best["symbol"] + "\n"
         "Потенциал: " + str(round(best["atr_pct"] * 100, 2)) + "% ATR\n"
-        "У тебя уже есть эта монета?"
+        "Будем работать по времени: 15 минут. Устраивает?"
     )
-    await app.bot.send_message(
-        chat_id=app.bot_data.get("chat_id", 0),
-        text=text,
-        reply_markup=kb(rows),
+    rows = [
+        [btn("✅ Да, устраивает", "tf_ok_15m")],
+        [btn("❌ Нет, не устраивает", "tf_bad")],
+        nav_btns("start")[0]
+    ]
+    chat_id = app.bot_data.get("chat_id", 0)
+    if chat_id:
+        await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
+
+async def tf_ok_15m(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    STATE["auto"]["tf"] = "15m"
+    STATE["auto"]["waiting_tf_confirm"] = False
+    await update.callback_query.edit_message_text(
+        "Ок, работаем 15m. Ждём сигналов.", reply_markup=kb(nav_btns("start"))
+    )
+    if STATE["auto"]["current_offer"]:
+        STATE["auto"]["symbols"] = [STATE["auto"]["current_offer"]]
+        STATE["auto"]["current_offer"] = None
+        await _ask_hascoins(update, ctx)
+
+async def _ask_hascoins(update, ctx):
+    rows = [
+        [btn("Нет, монеты нет", "hascoins_no")],
+        [btn("Да, есть", "hascoins_yes")],
+        nav_btns("start")[0]
+    ]
+    text = "У тебя уже есть эта монета?"
+    if update.message:
+        await update.message.reply_text(text, reply_markup=kb(rows))
+    else:
+        await update.callback_query.edit_message_text(text, reply_markup=kb(rows))
+
+# ---------- ОБРАБОТКА СИГНАЛОВ (КУПИЛ/ПРОДАЛ/ПРОПУСТИЛ) ----------
+async def sig_skipped(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.edit_message_text(
+        "Ок, пропустил. Ждём следующий сигнал.", reply_markup=kb(nav_btns("start"))
     )
 
+async def sig_bought_ask_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    raw = update.callback_query.data.replace("sig_bought_", "")
+    parts = raw.rsplit("_", 1)
+    symbol = parts[0].replace("_", "/")
+    price = float(parts[1])
+    
+    STATE["pending"]["signal"] = {
+        "action": "BUY",
+        "symbol": symbol,
+        "price": price,
+    }
+    await update.callback_query.edit_message_text(
+        "Сколько USDT ты купил по " + symbol + "?",
+        reply_markup=kb(nav_btns("start"))
+    )
+
+async def sig_sold_ask_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    raw = update.callback_query.data.replace("sig_sold_", "")
+    parts = raw.rsplit("_", 1)
+    symbol = parts[0].replace("_", "/")
+    price = float(parts[1])
+    
+    STATE["pending"]["signal"] = {
+        "action": "SELL",
+        "symbol": symbol,
+        "price": price,
+    }
+    await update.callback_query.edit_message_text(
+        "Сколько USDT ты продал по " + symbol + "?",
+        reply_markup=kb(nav_btns("start"))
+    )
 
 # ---------- ПАНИКА ----------
 async def _panic_loop(app, symbol):
     STATE["panic"]["active"] = True
     while STATE["panic"]["active"]:
         try:
-            f = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
+            f = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
             df = f.fetch("1m", 60)
             df = f.enrich(df, "1m").dropna().reset_index(drop=True)
             if len(df) < 5:
@@ -488,15 +517,16 @@ async def _panic_loop(app, symbol):
                     )
                     if bearish:
                         rows = [[btn("🔴 ПРОДАЛ", "panic_sold")]]
-                        await app.bot.send_message(
-                            chat_id=app.bot_data.get("chat_id", 0),
-                            text="🔴 ЗАКРЫВАЙ! ЗАКРЫВАЙ! ЗАКРЫВАЙ!",
-                            reply_markup=kb(rows),
-                        )
+                        chat_id = app.bot_data.get("chat_id", 0)
+                        if chat_id:
+                            await app.bot.send_message(
+                                chat_id=chat_id,
+                                text="🔴 ЗАКРЫВАЙ! ЗАКРЫВАЙ! ЗАКРЫВАЙ!",
+                                reply_markup=kb(rows),
+                            )
         except Exception:
             pass
         await asyncio.sleep(PANIC_INTERVAL)
-
 
 async def panic_sold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["panic"]["active"] = False
@@ -508,8 +538,7 @@ async def panic_sold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 register_loss()
             else:
                 register_win()
-    await update.callback_query.edit_message_text("Позиция закрыта.")
-
+    await update.callback_query.edit_message_text("Позиция закрыта.", reply_markup=kb(nav_btns("start")))
 
 # ---------- РУЧНОЙ РЕЖИМ ----------
 async def man_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -517,21 +546,20 @@ async def man_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [btn("🏦 " + exchanges.EXCHANGES.get(STATE["manual"]["exchange"], "биржа"), "man_ex")],
         [btn("📈 Пары", "man_pairs")],
         [btn("🔍 Поиск пары", "man_search")],
+        nav_btns("start")[0]
     ]
     await update.callback_query.edit_message_text(
         "Ручной режим. Выбери действие:", reply_markup=kb(rows)
     )
 
-
 async def man_ex(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = []
     for key, name in exchanges.EXCHANGES.items():
         rows.append([btn(name, "man_ex_set_" + key)])
-    rows.append([btn("⬅️ Назад", "man_menu")])
+    rows.append(nav_btns("man_menu")[0])
     await update.callback_query.edit_message_text(
         "Выбери биржу:", reply_markup=kb(rows)
     )
-
 
 async def man_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     key = update.callback_query.data.replace("man_ex_set_", "")
@@ -540,18 +568,17 @@ async def man_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["manual"]["page"] = 0
     await man_menu(update, ctx)
 
-
 async def man_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not STATE["manual"]["pairs"]:
+        await update.callback_query.edit_message_text("Загружаю пары...")
         try:
             STATE["manual"]["pairs"] = exchanges.load_all_pairs(
                 STATE["manual"]["exchange"], quote="USDT", max_pairs=500
             )
         except Exception as e:
-            await update.callback_query.edit_message_text("Ошибка: " + str(e))
+            await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("man_menu")))
             return
     await _render_pairs(update, ctx)
-
 
 async def _render_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pairs = STATE["manual"]["pairs"]
@@ -582,19 +609,16 @@ async def _render_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb(rows),
     )
 
-
 async def man_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     page = int(update.callback_query.data.replace("man_page_", ""))
     STATE["manual"]["page"] = page
     await _render_pairs(update, ctx)
 
-
 async def man_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["manual"] = "search"
     await update.callback_query.edit_message_text(
-        "Впиши тикер (например BTC):"
+        "Впиши тикер (например BTC):", reply_markup=kb(nav_btns("man_menu"))
     )
-
 
 async def man_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     raw = update.callback_query.data.replace("man_pick_", "")
@@ -606,12 +630,11 @@ async def man_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [btn("📊 Сигналы", "man_signals")],
         [btn("⏱ Time Frame", "man_tf")],
         [btn("⚡ Кнопки", "man_quick")],
-        [btn("⬅️ Пары", "man_pairs")],
+        nav_btns("man_pairs")[0]
     ]
     await update.callback_query.edit_message_text(
         "Пара: " + symbol + "\nЧто смотрим?", reply_markup=kb(rows)
     )
-
 
 async def man_signals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     symbol = STATE["manual"]["symbol"]
@@ -622,7 +645,7 @@ async def man_signals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
         sig = f.analyze_filtered(ANALYSIS_TF, tp_mult=3.0)
     except Exception as e:
-        await update.callback_query.edit_message_text("Ошибка: " + str(e))
+        await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("man_pick_back")))
         return
     if sig.confidence < CONF_CHANCE:
         text = (
@@ -630,7 +653,7 @@ async def man_signals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Уверенность низкая: " + str(int(sig.confidence * 100)) + "%\n"
             "Сигнала нет. Ждём."
         )
-        await update.callback_query.edit_message_text(text)
+        await update.callback_query.edit_message_text(text, reply_markup=kb(nav_btns("man_pick_back")))
         return
     tag = "СИГНАЛ" if sig.confidence >= CONF_SIGNAL else "ШАНС"
     text = (
@@ -651,10 +674,11 @@ async def man_signals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 chat_id=update.callback_query.message.chat_id,
                 photo=photo,
                 caption=text,
+                reply_markup=kb(nav_btns("man_pick_back"))
             )
+        await update.callback_query.delete_message()
     except Exception:
-        await update.callback_query.edit_message_text(text)
-
+        await update.callback_query.edit_message_text(text, reply_markup=kb(nav_btns("man_pick_back")))
 
 async def man_tf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     symbol = STATE["manual"]["symbol"]
@@ -664,7 +688,7 @@ async def man_tf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
         sig = f.analyze_filtered(ANALYSIS_TF, tp_mult=3.0)
     except Exception as e:
-        await update.callback_query.edit_message_text("Ошибка: " + str(e))
+        await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("man_pick_back")))
         return
     direction = "флэт"
     if sig.action == "BUY":
@@ -676,8 +700,7 @@ async def man_tf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Направление: " + direction + "\n"
         "ТФ: " + ANALYSIS_TF
     )
-    await update.callback_query.edit_message_text(text)
-
+    await update.callback_query.edit_message_text(text, reply_markup=kb(nav_btns("man_pick_back")))
 
 async def man_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     symbol = STATE["manual"]["symbol"]
@@ -687,7 +710,7 @@ async def man_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
         sig = f.analyze_filtered(ANALYSIS_TF, tp_mult=3.0)
     except Exception as e:
-        await update.callback_query.edit_message_text("Ошибка: " + str(e))
+        await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("man_pick_back")))
         return
     if sig.confidence < CONF_SIGNAL:
         text = (
@@ -695,13 +718,12 @@ async def man_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Уверенность " + str(int(sig.confidence * 100)) + "% < 85%.\n"
             "Сигнала нет."
         )
-        rows = [[btn("⬅️ Назад", "man_pick_back")]]
-        await update.callback_query.edit_message_text(text, reply_markup=kb(rows))
+        await update.callback_query.edit_message_text(text, reply_markup=kb(nav_btns("man_pick_back")))
         return
     rows = [
         [btn("🟢 Сейчас покупать", "man_buy")],
         [btn("🔴 Сейчас продавать", "man_sell")],
-        [btn("⬅️ Назад", "man_pick_back")],
+        nav_btns("man_pick_back")[0]
     ]
     text = (
         "⚡ " + symbol + "\n"
@@ -710,19 +732,17 @@ async def man_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     await update.callback_query.edit_message_text(text, reply_markup=kb(rows))
 
-
 async def man_pick_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     symbol = STATE["manual"]["symbol"]
     rows = [
         [btn("📊 Сигналы", "man_signals")],
         [btn("⏱ Time Frame", "man_tf")],
         [btn("⚡ Кнопки", "man_quick")],
-        [btn("⬅️ Пары", "man_pairs")],
+        nav_btns("man_pairs")[0]
     ]
     await update.callback_query.edit_message_text(
         "Пара: " + str(symbol) + "\nЧто смотрим?", reply_markup=kb(rows)
     )
-
 
 async def man_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     symbol = STATE["manual"]["symbol"]
@@ -734,16 +754,15 @@ async def man_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         portfolio.open_position(symbol, "BUY", sig.price, qty, source="manual")
         await update.callback_query.edit_message_text(
             "Открыл BUY " + symbol + "\nЦена: " + fmt_price(sig.price) +
-            "\nЛот: " + str(round(lot, 2)) + " USDT"
+            "\nЛот: " + str(round(lot, 2)) + " USDT", reply_markup=kb(nav_btns("start"))
         )
     except Exception as e:
-        await update.callback_query.edit_message_text("Ошибка: " + str(e))
-
+        await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("start")))
 
 async def man_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pos = portfolio.load().get("open")
     if not pos:
-        await update.callback_query.edit_message_text("Нет открытой позиции.")
+        await update.callback_query.edit_message_text("Нет открытой позиции.", reply_markup=kb(nav_btns("start")))
         return
     try:
         f = Friday(symbol=pos["symbol"], exchange_name=STATE["manual"]["exchange"])
@@ -751,7 +770,7 @@ async def man_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         price = float(df.iloc[-1]["close"])
         trade = portfolio.close_position(price, pos["qty"])
         if "error" in trade:
-            await update.callback_query.edit_message_text("Ошибка: " + trade["error"])
+            await update.callback_query.edit_message_text("Ошибка: " + trade["error"], reply_markup=kb(nav_btns("start")))
             return
         if trade["pnl_pct"] < 0:
             register_loss()
@@ -759,17 +778,16 @@ async def man_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             register_win()
         await update.callback_query.edit_message_text(
             "Закрыл " + pos["symbol"] + "\n"
-            "PnL: " + str(round(trade["pnl_pct"], 2)) + "%"
+            "PnL: " + str(round(trade["pnl_pct"], 2)) + "%", reply_markup=kb(nav_btns("start"))
         )
     except Exception as e:
-        await update.callback_query.edit_message_text("Ошибка: " + str(e))
-
+        await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("start")))
 
 # ---------- ЗАКРЫТИЕ ВСЕХ ----------
 async def close_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pos = portfolio.load().get("open")
     if not pos:
-        await update.callback_query.edit_message_text("Нет открытых сделок.")
+        await update.callback_query.edit_message_text("Нет открытых сделок.", reply_markup=kb(nav_btns("start")))
         return
     try:
         f = Friday(symbol=pos["symbol"], exchange_name=STATE["manual"]["exchange"])
@@ -777,7 +795,7 @@ async def close_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         price = float(df.iloc[-1]["close"])
         trade = portfolio.close_position(price, pos["qty"])
         if "error" in trade:
-            await update.callback_query.edit_message_text("Ошибка: " + trade["error"])
+            await update.callback_query.edit_message_text("Ошибка: " + trade["error"], reply_markup=kb(nav_btns("start")))
             return
         if trade["pnl_pct"] < 0:
             register_loss()
@@ -785,11 +803,10 @@ async def close_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             register_win()
         await update.callback_query.edit_message_text(
             "Закрыто: " + pos["symbol"] + "\n"
-            "PnL: " + str(round(trade["pnl_pct"], 2)) + "%"
+            "PnL: " + str(round(trade["pnl_pct"], 2)) + "%", reply_markup=kb(nav_btns("start"))
         )
     except Exception as e:
-        await update.callback_query.edit_message_text("Ошибка: " + str(e))
-
+        await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("start")))
 
 # ---------- ИСТОРИЯ ----------
 async def hist_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -797,11 +814,11 @@ async def hist_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [btn("📅 За день", "hist_day")],
         [btn("📆 За неделю", "hist_week")],
         [btn("🗓 За всё время", "hist_all")],
+        nav_btns("start")[0]
     ]
     await update.callback_query.edit_message_text(
         "Период:", reply_markup=kb(rows)
     )
-
 
 async def hist_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     period = update.callback_query.data.replace("hist_", "")
@@ -810,11 +827,11 @@ async def hist_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [btn("📊 Только сигналы", "hist_src_" + period + "_signal")],
         [btn("🤖 Только автопилот", "hist_src_" + period + "_auto")],
         [btn("📋 Всё", "hist_src_" + period + "_all")],
+        nav_btns("hist_menu")[0]
     ]
     await update.callback_query.edit_message_text(
         "Источник:", reply_markup=kb(rows)
     )
-
 
 async def hist_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     raw = update.callback_query.data.replace("hist_src_", "")
@@ -830,9 +847,7 @@ async def hist_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "PnL USDT: " + str(round(s["total_abs"], 2)) + "\n"
         "Profit Factor: " + str(round(s["pf"], 2))
     )
-    rows = [[btn("⬅️ В меню", "start")]]
-    await update.callback_query.edit_message_text(text, reply_markup=kb(rows))
-
+    await update.callback_query.edit_message_text(text, reply_markup=kb(nav_btns("hist_menu")))
 
 async def stats_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = portfolio.stats_filtered("all", "all")
@@ -843,29 +858,73 @@ async def stats_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "PnL USDT: " + str(round(s["total_abs"], 2)) + "\n"
         "Profit Factor: " + str(round(s["pf"], 2))
     )
-    rows = [[btn("⬅️ В меню", "start")]]
-    await update.callback_query.edit_message_text(text, reply_markup=kb(rows))
-
+    await update.callback_query.edit_message_text(text, reply_markup=kb(nav_btns("start")))
 
 async def demo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text(
-        "Демо-режим (старая функция)."
+        "Демо-режим (старая функция).", reply_markup=kb(nav_btns("start"))
     )
-
 
 # ---------- ТЕКСТОВЫЙ ВВОД ----------
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
     pend = STATE["pending"]
+    
+    if "signal" in pend:
+        sig_data = pend["signal"]
+        try:
+            amount = float(txt)
+        except Exception:
+            await update.message.reply_text("Введи число (USDT).", reply_markup=kb(nav_btns("start")))
+            return
+        pend.pop("signal")
+        
+        if sig_data["action"] == "BUY":
+            qty = amount / sig_data["price"] if sig_data["price"] else 0
+            portfolio.open_position(sig_data["symbol"], "BUY", sig_data["price"], qty, source="signal")
+            rows = [
+                [btn("🏠 В меню", "start")]
+            ]
+            await update.message.reply_text(
+                "Записал: купил " + sig_data["symbol"] + " на " + str(amount) + " USDT.\nЖдём сигнал SELL.",
+                reply_markup=kb(rows)
+            )
+        else:
+            pos = portfolio.load().get("open")
+            if not pos:
+                await update.message.reply_text("Нет открытой позиции для продажи.", reply_markup=kb(nav_btns("start")))
+                return
+            qty = amount / sig_data["price"] if sig_data["price"] else 0
+            if qty > pos["qty"]:
+                qty = pos["qty"]
+            trade = portfolio.close_position(sig_data["price"], qty)
+            if "error" in trade:
+                await update.message.reply_text("Ошибка: " + trade["error"], reply_markup=kb(nav_btns("start")))
+                return
+            if trade["pnl_pct"] < 0:
+                register_loss()
+            else:
+                register_win()
+            
+            rows = [
+                [btn("🏠 В меню", "start")]
+            ]
+            msg = (
+                "Записал продажу.\n"
+                "PnL: " + str(round(trade["pnl_pct"], 2)) + "%\n"
+                "Прибыль: " + str(round(trade["pnl_abs"], 2)) + " USDT"
+            )
+            await update.message.reply_text(msg, reply_markup=kb(rows))
+        return
+
     if "auto" in pend:
         kind = pend["auto"]
         if kind == "balance":
             try:
                 STATE["balance"] = float(txt)
             except Exception:
-                await update.message.reply_text("Число нужно.")
+                await update.message.reply_text("Число нужно.", reply_markup=kb(nav_btns("start")))
                 return
-            pend["auto"] = None
             pend.pop("auto")
             await auto_after_balance(update, ctx)
             return
@@ -873,7 +932,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try:
                 STATE["daily_budget"] = float(txt)
             except Exception:
-                await update.message.reply_text("Число нужно.")
+                await update.message.reply_text("Число нужно.", reply_markup=kb(nav_btns("auto_start")))
                 return
             pend.pop("auto")
             await auto_after_budget(update, ctx)
@@ -884,34 +943,16 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pend.pop("auto")
             await auto_after_city(update, ctx)
             return
-        if kind == "time":
+        if kind == "check_time":
+            pend.pop("auto")
+            await auto_after_check_time(update, ctx)
+            return
+        if kind == "work_time":
             hours = _parse_hours(txt)
             pend["auto_hours"] = str(hours)
+            pend["multi_day"] = ("д" in txt.lower() or "day" in txt.lower())
             pend.pop("auto")
-            await auto_after_time(update, ctx)
-            return
-        if kind == "hours_input":
-            try:
-                h = float(txt)
-            except Exception:
-                await update.message.reply_text("Число нужно.")
-                return
-            pend["auto_hours"] = str(h)
-            pend["multi_day"] = False
-            pend.pop("auto")
-            await _confirm_time(update, ctx, h, False)
-            return
-        if kind == "days_input":
-            try:
-                d = float(txt)
-            except Exception:
-                await update.message.reply_text("Число нужно.")
-                return
-            h = d * 24
-            pend["auto_hours"] = str(h)
-            pend["multi_day"] = d >= 2
-            pend.pop("auto")
-            await _confirm_time(update, ctx, h, d >= 2)
+            await auto_ask_exchange(update, ctx)
             return
         if kind == "tf_custom":
             tf = txt.strip()
@@ -919,26 +960,33 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Формат: 5m, 1h, 4h.")
                 return
             STATE["auto"]["tf"] = tf
+            STATE["auto"]["waiting_tf_confirm"] = False
             pend.pop("auto")
-            await update.message.reply_text("Ок, работаем " + tf + ".")
+            await update.message.reply_text("Ок, работаем " + tf + ".", reply_markup=kb(nav_btns("start")))
+            if STATE["auto"]["current_offer"]:
+                STATE["auto"]["symbols"] = [STATE["auto"]["current_offer"]]
+                STATE["auto"]["current_offer"] = None
+                await _ask_hascoins(update, ctx)
             return
         if kind == "multi_count":
             try:
                 n = int(txt)
             except Exception:
-                await update.message.reply_text("Число от 2 до 10.")
+                await update.message.reply_text("Число от 2 до 10.", reply_markup=kb(nav_btns("start")))
                 return
             if n < 2 or n > MAX_MULTI:
-                await update.message.reply_text("Только 2–10.")
+                await update.message.reply_text("Только 2–10.", reply_markup=kb(nav_btns("start")))
                 return
             pend.pop("auto")
             rows = [
                 [btn("✅ Запустить " + str(n) + " монет", "multi_start_" + str(n))],
+                nav_btns("start")[0]
             ]
             await update.message.reply_text(
                 "Ок, " + str(n) + " монет.", reply_markup=kb(rows)
             )
             return
+
     if "manual" in pend:
         kind = pend["manual"]
         if kind == "search":
@@ -950,15 +998,15 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     break
             pend.pop("manual")
             if not found:
-                await update.message.reply_text("Не нашёл: " + ticker)
+                await update.message.reply_text("Не нашёл: " + ticker, reply_markup=kb(nav_btns("man_menu")))
                 return
             idx = STATE["manual"]["pairs"].index(found)
             STATE["manual"]["page"] = idx // 50
             await update.message.reply_text(
-                "Нашёл " + found + ", страница " + str(STATE["manual"]["page"] + 1)
+                "Нашёл " + found + ", страница " + str(STATE["manual"]["page"] + 1),
+                reply_markup=kb(nav_btns("man_menu"))
             )
             return
-
 
 def _parse_hours(txt):
     low = txt.lower()
@@ -970,26 +1018,14 @@ def _parse_hours(txt):
         return val * 24
     return val
 
-
-async def _confirm_time(update, ctx, hours, multi_day):
-    rows = [
-        [btn("✅ Устраивает", "time_ok")],
-        [btn("❌ Не устраивает", "time_bad")],
-    ]
-    msg = "Время: " + str(hours) + " ч."
-    if multi_day:
-        msg = msg + "\n(мульти-день: включу сессионный фильтр 12-20 UTC)"
-    await update.message.reply_text(msg, reply_markup=kb(rows))
-
-
 async def multi_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     n = int(update.callback_query.data.replace("multi_start_", ""))
     await update.callback_query.edit_message_text(
-        "Сканирую топ-" + str(n) + " монет..."
+        "Сканирую топ-" + str(n) + " монет...", reply_markup=kb(nav_btns("start"))
     )
     bests = []
     pairs = exchanges.load_all_pairs(
-        STATE["manual"]["exchange"], quote="USDT", max_pairs=150
+        STATE["auto"]["exchange"], quote="USDT", max_pairs=150
     )
     for sym in pairs:
         r = await _score_pair(sym)
@@ -1001,46 +1037,57 @@ async def multi_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bests.sort(key=lambda x: x["score"], reverse=True)
     top = bests[:n]
     if not top:
-        await update.callback_query.edit_message_text("Ничего не нашёл.")
+        await update.callback_query.edit_message_text("Ничего не нашёл.", reply_markup=kb(nav_btns("start")))
         return
     STATE["auto"]["symbols"] = [t["symbol"] for t in top]
     lines = ["🤖 Взял " + str(len(top)) + " монет:"]
     for t in top:
         lines.append("• " + t["symbol"] + " (" + str(round(t["atr_pct"] * 100, 1)) + "%)")
-    await update.callback_query.edit_message_text("\n".join(lines))
-
+    await update.callback_query.edit_message_text("\n".join(lines), reply_markup=kb(nav_btns("start")))
 
 # ---------- РОУТЕР ----------
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
+    
+    if ctx.application.bot_data.get("chat_id") != q.message.chat_id:
+        ctx.application.bot_data["chat_id"] = q.message.chat_id
+
     if data == "start":
         await start(update, ctx)
         return
     if data == "auto_start":
         await auto_start(update, ctx)
         return
-    if data == "time_ok":
-        await time_ok(update, ctx)
+    if data == "auto_retry_balance":
+        await auto_start(update, ctx)
         return
-    if data == "time_bad":
-        await time_bad(update, ctx)
+    if data == "auto_retry_budget":
+        STATE["pending"]["auto"] = "budget"
+        await q.edit_message_text("Сколько готов потратить сегодня? (USDT)", reply_markup=kb(nav_btns("auto_start")))
         return
-    if data == "time_hours":
-        await time_hours(update, ctx)
+    if data == "auto_retry_city":
+        STATE["pending"]["auto"] = "city"
+        await q.edit_message_text("В каком ты городе?", reply_markup=kb(nav_btns("auto_retry_budget")))
         return
-    if data == "time_days":
-        await time_days(update, ctx)
+    if data == "auto_retry_check_time":
+        STATE["pending"]["auto"] = "check_time"
+        local = local_now().strftime("%H:%M")
+        await q.edit_message_text("Сколько сейчас у тебя времени по часам? (например " + local + ")", reply_markup=kb(nav_btns("auto_retry_city")))
         return
-    if data.startswith("auto_tf_"):
-        await auto_tf_set(update, ctx)
+    
+    if data.startswith("auto_ex_set_"):
+        await auto_ex_set(update, ctx)
         return
     if data == "tf_ok_15m":
         await tf_ok_15m(update, ctx)
         return
     if data == "tf_bad":
         await tf_bad(update, ctx)
+        return
+    if data.startswith("auto_tf_"):
+        await auto_tf_set(update, ctx)
         return
     if data == "hascoins_no":
         await hascoins_no(update, ctx)
@@ -1057,6 +1104,17 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "panic_sold":
         await panic_sold(update, ctx)
         return
+    
+    if data == "sig_skipped":
+        await sig_skipped(update, ctx)
+        return
+    if data.startswith("sig_bought_"):
+        await sig_bought_ask_amount(update, ctx)
+        return
+    if data.startswith("sig_sold_"):
+        await sig_sold_ask_amount(update, ctx)
+        return
+
     if data == "man_menu":
         await man_menu(update, ctx)
         return
@@ -1117,7 +1175,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         return
 
-
 # ---------- MAIN ----------
 def main():
     app = Application.builder().token(config.TELEGRAM_TOKEN).build()
@@ -1126,6 +1183,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling()
 
-
 if __name__ == "__main__":
     main()
+```
