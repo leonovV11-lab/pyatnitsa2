@@ -364,11 +364,12 @@ async def _score_pair(symbol):
         return None
 
 async def _scan_best(exclude=None):
+    # Проверяем 70 самых активных пар
     pairs = exchanges.load_all_pairs(
-        STATE["auto"]["exchange"], quote="USDT", max_pairs=150
+        STATE["auto"]["exchange"], quote="USDT", max_pairs=70
     )
     best = None
-    chunk_size = 5
+    chunk_size = 15  # Проверяем по 15 пар одновременно (быстро)
     
     for i in range(0, len(pairs), chunk_size):
         chunk = pairs[i:i + chunk_size]
@@ -381,7 +382,7 @@ async def _scan_best(exclude=None):
             if best is None or r["score"] > best["score"]:
                 best = r
                 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.1)  # Быстрая пауза
         
     return best
 
@@ -571,7 +572,6 @@ async def sig_buy_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     portfolio.open_position(sig["symbol"], "BUY", price, qty, source="signal")
     
-    # Запускаем трейлинг
     STATE["trailing"]["active"] = True
     if STATE["trailing"]["task"] is None or STATE["trailing"]["task"].done():
         STATE["trailing"]["task"] = asyncio.create_task(_trailing_loop(ctx.application, sig["symbol"], price, "BUY"))
