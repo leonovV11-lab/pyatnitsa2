@@ -316,23 +316,41 @@ async def _score_pair(symbol):
         df = f.enrich(df, "15m").dropna().reset_index(drop=True)
         if len(df) < 20:
             return None
+        
         last = df.iloc[-1]
         price = float(last["close"])
         
+        # Считаем объем за 24 часа (в USDT) и волатильность (ATR)
         vol24 = float(df["volume"].tail(96).sum() * price)
         atr_pct = float(last["atr"]) / price if price else 0
         
-        sig = f.analyze_filtered("15m", tp_mult=3.0)
-        conf = sig.confidence
-        
-        if conf < CONF_MIN_AUTO:
-            return None
-        if not fee_ok(price, sig.take_profit):
-            return None
-        if not mtf_confirm(symbol, sig.action):
+        # Отсекаем мертвые монеты
+        if vol24 < 500000 or atr_pct < 0.01:
             return None
             
-        score = vol24 * atr_pct * conf
+        sig = f.analyze_filtered("15m", tp_mult=3.0)
+        
+        # БАЗОВАЯ УВЕРЕННОСТЬ (от анализа)
+        base_conf = sig.confidence
+        
+        # БОНУС ЗА ВОЛАТИЛЬНОСТЬ И ОБЪЕМ
+        vol_bonus = 0.0
+        if atr_pct > 0.02: vol_bonus = 0.3
+        elif atr_pct > 0.015: vol_bonus = 0.2
+        elif atr_pct > 0.01: vol_bonus = 0.1
+        
+        vol_bonus_amount = 0.0
+        if vol24 > 50000000: vol_bonus_amount = 0.2
+        elif vol24 > 10000000: vol_bonus_amount = 0.1
+        
+        # ИТОГОВАЯ УВЕРЕННОСТЬ (не больше 99%)
+        final_conf = min(base_conf + vol_bonus + vol_bonus_amount, 0.99)
+        
+        # Подменяем уверенность в сигнале
+        sig.confidence = final_conf
+        
+        score = vol24 * atr_pct * final_conf
+        
         return {
             "symbol": symbol,
             "score": score,
@@ -349,7 +367,7 @@ async def _scan_best(exclude=None):
         STATE["auto"]["exchange"], quote="USDT", max_pairs=150
     )
     best = None
-    chunk_size = 5  # По 5 монет одновременно (безопасно для биржи)
+    chunk_size = 5
     
     for i in range(0, len(pairs), chunk_size):
         chunk = pairs[i:i + chunk_size]
@@ -362,7 +380,7 @@ async def _scan_best(exclude=None):
             if best is None or r["score"] > best["score"]:
                 best = r
                 
-        await asyncio.sleep(0.5)  # Пауза 0.5 сек между пачками
+        await asyncio.sleep(0.5)
         
     return best
 
