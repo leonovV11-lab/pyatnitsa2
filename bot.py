@@ -312,43 +312,40 @@ async def multi_choose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _score_pair(symbol):
     try:
         f = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
-        df = f.fetch("15m", 300)
-        df = f.enrich(df, "15m").dropna().reset_index(drop=True)
+        tf = STATE["auto"].get("tf", "15m")
+        
+        df = f.fetch(tf, 300)
+        df = f.enrich(df, tf).dropna().reset_index(drop=True)
         if len(df) < 20:
             return None
         
         last = df.iloc[-1]
         price = float(last["close"])
         
-        # Считаем объем за 24 часа (в USDT) и волатильность (ATR)
         vol24 = float(df["volume"].tail(96).sum() * price)
         atr_pct = float(last["atr"]) / price if price else 0
         
-        # Отсекаем мертвые монеты
         if vol24 < 500000 or atr_pct < 0.01:
             return None
             
-        sig = f.analyze_filtered("15m", tp_mult=3.0)
-        
-        # БАЗОВАЯ УВЕРЕННОСТЬ (от анализа)
+        sig = f.analyze_filtered(tf, tp_mult=3.0)
         base_conf = sig.confidence
         
-        # БОНУС ЗА ВОЛАТИЛЬНОСТЬ И ОБЪЕМ
         vol_bonus = 0.0
-        if atr_pct > 0.02: vol_bonus = 0.3
-        elif atr_pct > 0.015: vol_bonus = 0.2
-        elif atr_pct > 0.01: vol_bonus = 0.1
+        if atr_pct > 0.02: vol_bonus = 0.15
+        elif atr_pct > 0.015: vol_bonus = 0.10
+        elif atr_pct > 0.01: vol_bonus = 0.05
         
         vol_bonus_amount = 0.0
-        if vol24 > 50000000: vol_bonus_amount = 0.2
-        elif vol24 > 10000000: vol_bonus_amount = 0.1
+        if vol24 > 50000000: vol_bonus_amount = 0.10
+        elif vol24 > 10000000: vol_bonus_amount = 0.05
         
-        # ИТОГОВАЯ УВЕРЕННОСТЬ (не больше 99%)
         final_conf = min(base_conf + vol_bonus + vol_bonus_amount, 0.99)
-        
-        # Подменяем уверенность в сигнале
         sig.confidence = final_conf
         
+        if not mtf_confirm(symbol, sig.action):
+            return None
+            
         score = vol24 * atr_pct * final_conf
         
         return {
@@ -425,6 +422,10 @@ async def _process_symbol(app, symbol):
     if r is None:
         return
     sig = r["signal"]
+    
+    if sig.confidence < CONF_MIN_AUTO:
+        return
+        
     allowed = STATE["auto"]["allowed"]
     if sig.action == "BUY":
         pass
@@ -432,6 +433,7 @@ async def _process_symbol(app, symbol):
         pass
     else:
         return
+        
     lot = calc_lot(sig.price, sig.stop_loss, sig.confidence)
     if lot <= 0:
         return
@@ -448,12 +450,14 @@ async def _process_symbol(app, symbol):
         rows = [
             [btn("✅ Купил", "sig_bought_" + symbol.replace("/", "_") + "_" + str(sig.price))],
             [btn("❌ Пропустил", "sig_skipped")],
+            [btn("🛑 ОСТАНОВИТЬ СИГНАЛЫ", "auto_stop_signals")],
             nav_btns("start")[0]
         ]
     else:
         rows = [
             [btn("✅ Продал", "sig_sold_" + symbol.replace("/", "_") + "_" + str(sig.price))],
             [btn("❌ Пропустил", "sig_skipped")],
+            [btn("🛑 ОСТАНОВИТЬ СИГНАЛЫ", "auto_stop_signals")],
             nav_btns("start")[0]
         ]
     
@@ -1000,10 +1004,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             STATE["auto"]["tf"] = tf
             STATE["auto"]["waiting_tf_confirm"] = False
             pend.pop("auto")
-            await update.message.reply_text("Ок, работаем " + tf + ".", reply_markup=kb(nav_btns("start")))
+            
             if STATE["auto"]["current_offer"]:
                 STATE["auto"]["symbols"] = [STATE["auto"]["current_offer"]]
                 STATE["auto"]["current_offer"] = None
+                await update.message.reply_text(
+                    "Ок, работаем по " + tf + ". Начинаю анализ.", 
+                    reply_markup=kb(nav_btns("start"))
+                )
                 await _ask_hascoins(update, ctx)
             return
         if kind == "multi_count":
@@ -1098,7 +1106,30 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if ctx.application.bot_data.get("chat_id") != q.message.chat_id:
         ctx.application.bot_data["chat_id"] = q.message.chat_id
 
+    if data == "auto_stop_signals":
+        STATE["auto"]["active"] = False
+        if STATE["auto"]["task"]:
+            STATE["auto"]["task"].cancel()
+            STATE["auto"]["task"] = None
+        STATE["auto"]["symbols"] = []
+        STATE["auto"]["current_offer"] = None
+        STATE["auto"]["waiting_tf_confirm"] = False
+        await q.edit_message_text(
+            "🛑 Автопилот остановлен. Сигналы больше не приходят.",
+            reply_markup=kb([[btn("🏠 В меню", "start")]])
+        )
+        return
+
     if data == "start":
+        if STATE["auto"]["active"]:
+            STATE["auto"]["active"] = False
+            if STATE["auto"]["task"]:
+                STATE["auto"]["task"].cancel()
+                STATE["auto"]["task"] = None
+            STATE["auto"]["symbols"] = []
+            STATE["auto"]["current_offer"] = None
+            STATE["auto"]["waiting_tf_confirm"] = False
+        
         await start(update, ctx)
         return
     if data == "auto_start":
