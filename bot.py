@@ -247,7 +247,6 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     key = update.callback_query.data.replace("auto_ex_set_", "")
     STATE["auto"]["exchange"] = key
     
-    # Сохраняем chat_id, чтобы фоновый цикл знал, куда писать
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
     
     await update.callback_query.edit_message_text(
@@ -255,7 +254,6 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb(nav_btns("start"))
     )
     
-    # Запускаем цикл в фоне
     if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
         STATE["auto"]["active"] = True
         STATE["auto"]["symbols"] = []
@@ -314,7 +312,6 @@ async def multi_choose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _score_pair(symbol):
     try:
         f = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
-        # Берем 300 свечей по 15m (это 3 дня)
         df = f.fetch("15m", 300)
         df = f.enrich(df, "15m").dropna().reset_index(drop=True)
         if len(df) < 20:
@@ -322,7 +319,6 @@ async def _score_pair(symbol):
         last = df.iloc[-1]
         price = float(last["close"])
         
-        # Потенциал прибыли: объем за 24ч умножаем на волатильность (ATR)
         vol24 = float(df["volume"].tail(96).sum() * price)
         atr_pct = float(last["atr"]) / price if price else 0
         
@@ -345,11 +341,10 @@ async def _score_pair(symbol):
             "atr_pct": atr_pct,
             "vol24": vol24,
         }
-    except Exception as e:
+    except Exception:
         return None
 
 async def _scan_best(exclude=None):
-    # Берем топ-100 пар с биржи, чтобы не забанили за лимиты
     pairs = exchanges.load_all_pairs(
         STATE["auto"]["exchange"], quote="USDT", max_pairs=100
     )
@@ -362,7 +357,7 @@ async def _scan_best(exclude=None):
             continue
         if best is None or r["score"] > best["score"]:
             best = r
-        await asyncio.sleep(0.1) # Защита от бана биржи
+        await asyncio.sleep(0.1)
     return best
 
 async def _auto_loop(app):
@@ -1021,11 +1016,17 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not found:
                 await update.message.reply_text("Не нашёл: " + ticker, reply_markup=kb(nav_btns("man_menu")))
                 return
-            idx = STATE["manual"]["pairs"].index(found)
-            STATE["manual"]["page"] = idx // 50
+            
+            STATE["manual"]["symbol"] = found
+            rows = [
+                [btn("📊 Сигналы", "man_signals")],
+                [btn("⏱ Time Frame", "man_tf")],
+                [btn("⚡ Кнопки", "man_quick")],
+                nav_btns("man_pairs")[0]
+            ]
             await update.message.reply_text(
-                "Нашёл " + found + ", страница " + str(STATE["manual"]["page"] + 1),
-                reply_markup=kb(nav_btns("man_menu"))
+                "Пара: " + found + "\nЧто смотрим?", 
+                reply_markup=kb(rows)
             )
             return
 
