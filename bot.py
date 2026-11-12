@@ -25,7 +25,7 @@ from chart import build_chart
 from geopy.geocoders import Nominatim
 from timezonefinder import TimezoneFinder
 
-# ---------- КОНСТАНТЫ ПРИБЫЛИ ----------
+# ---------- КОНСТАНТЫ ----------
 CONF_SIGNAL = 0.85
 CONF_CHANCE = 0.75
 CONF_MIN_AUTO = 0.65
@@ -108,20 +108,26 @@ def register_win():
     STATE["loss_streak"] = 0
 
 def calc_lot(price, sl_price, confidence):
-    if STATE["balance"] <= 0:
+    if STATE["daily_budget"] > 0:
+        budget = STATE["daily_budget"]
+    else:
+        budget = STATE["balance"]
+    if budget <= 0:
         return 0.0
+    
     if confidence >= 0.85:
         risk_pct = 0.03
     elif confidence >= 0.75:
         risk_pct = 0.02
     else:
         risk_pct = 0.01
-    risk_usdt = STATE["balance"] * risk_pct
+        
+    risk_usdt = budget * risk_pct
     sl_pct = abs(price - sl_price) / price if price else 0
     if sl_pct <= 0:
         return 0.0
+        
     lot_usdt = risk_usdt / sl_pct
-    budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
     return min(lot_usdt, budget)
 
 def fee_ok(price, tp):
@@ -343,9 +349,6 @@ async def _score_pair(symbol):
         final_conf = min(base_conf + vol_bonus + vol_bonus_amount, 0.99)
         sig.confidence = final_conf
         
-        if not mtf_confirm(symbol, sig.action):
-            return None
-            
         score = vol24 * atr_pct * final_conf
         
         return {
@@ -423,8 +426,15 @@ async def _process_symbol(app, symbol):
         return
     sig = r["signal"]
     
+    # 1. Порог уверенности 65% минимум
     if sig.confidence < CONF_MIN_AUTO:
         return
+
+    # 2. БЕЗОПАСНОСТЬ: Проверка старшего таймфрейма
+    current_tf = STATE["auto"].get("tf", "15m")
+    if current_tf in ["1m", "5m"]:
+        if not mtf_confirm(symbol, sig.action):
+            return
         
     allowed = STATE["auto"]["allowed"]
     if sig.action == "BUY":
@@ -437,6 +447,14 @@ async def _process_symbol(app, symbol):
     lot = calc_lot(sig.price, sig.stop_loss, sig.confidence)
     if lot <= 0:
         return
+    
+    STATE["pending"]["signal"] = {
+        "action": sig.action,
+        "symbol": symbol,
+        "price": sig.price,
+        "lot": lot
+    }
+
     text = (
         "🎯 " + symbol + "\n"
         "Сигнал: " + sig.action + "\n"
@@ -446,21 +464,24 @@ async def _process_symbol(app, symbol):
         "Стоп: " + fmt_price(sig.stop_loss) + "\n"
         "Тейк: " + fmt_price(sig.take_profit)
     )
+    
     if sig.action == "BUY":
         rows = [
-            [btn("✅ Купил", "sig_bought_" + symbol.replace("/", "_") + "_" + str(sig.price))],
+            [btn("✅ Купил по сигналу (" + str(round(lot, 2)) + ")", "sig_buy_signal")],
+            [btn("✏️ Купил на свою сумму", "sig_buy_custom")],
             [btn("❌ Пропустил", "sig_skipped")],
             [btn("🛑 ОСТАНОВИТЬ СИГНАЛЫ", "auto_stop_signals")],
             nav_btns("start")[0]
         ]
-    else:
+    else: # SELL
         rows = [
-            [btn("✅ Продал", "sig_sold_" + symbol.replace("/", "_") + "_" + str(sig.price))],
+            [btn("✅ Продал по сигналу (" + str(round(lot, 2)) + ")", "sig_sell_signal")],
+            [btn("✏️ Продал на свою сумму", "sig_sell_custom")],
             [btn("❌ Пропустил", "sig_skipped")],
             [btn("🛑 ОСТАНОВИТЬ СИГНАЛЫ", "auto_stop_signals")],
             nav_btns("start")[0]
         ]
-    
+        
     chat_id = app.bot_data.get("chat_id", 0)
     if chat_id:
         await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
@@ -505,39 +526,71 @@ async def _ask_hascoins(update, ctx):
 
 # ---------- ОБРАБОТКА СИГНАЛОВ (КУПИЛ/ПРОДАЛ/ПРОПУСТИЛ) ----------
 async def sig_skipped(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if "signal" in STATE["pending"]:
+        del STATE["pending"]["signal"]
     await update.callback_query.edit_message_text(
         "Ок, пропустил. Ждём следующий сигнал.", reply_markup=kb(nav_btns("start"))
     )
 
-async def sig_bought_ask_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    raw = update.callback_query.data.replace("sig_bought_", "")
-    parts = raw.rsplit("_", 1)
-    symbol = parts[0].replace("_", "/")
-    price = float(parts[1])
+async def sig_buy_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    sig = STATE["pending"].get("signal")
+    if not sig: return
+    lot = sig["lot"]
+    price = sig["price"]
+    qty = lot / price if price else 0
     
-    STATE["pending"]["signal"] = {
-        "action": "BUY",
-        "symbol": symbol,
-        "price": price,
-    }
+    portfolio.open_position(sig["symbol"], "BUY", price, qty, source="signal")
+    
+    del STATE["pending"]["signal"]
+    rows = [[btn("🏠 В меню", "start")]]
     await update.callback_query.edit_message_text(
-        "Сколько USDT ты купил по " + symbol + "?",
+        "Записал: купил по сигналу на " + str(round(lot, 2)) + " USDT.\nЖдём сигнал SELL.",
+        reply_markup=kb(rows)
+    )
+
+async def sig_buy_custom(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    sig = STATE["pending"].get("signal")
+    if not sig: return
+    STATE["pending"]["wait_custom_amount"] = {"action": "BUY", "symbol": sig["symbol"], "price": sig["price"]}
+    await update.callback_query.edit_message_text(
+        "Введи сумму в USDT, на которую купил " + sig["symbol"] + ":",
         reply_markup=kb(nav_btns("start"))
     )
 
-async def sig_sold_ask_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    raw = update.callback_query.data.replace("sig_sold_", "")
-    parts = raw.rsplit("_", 1)
-    symbol = parts[0].replace("_", "/")
-    price = float(parts[1])
+async def sig_sell_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    sig = STATE["pending"].get("signal")
+    if not sig: return
+    pos = portfolio.load().get("open")
+    if not pos:
+        await update.callback_query.edit_message_text("Нет открытой позиции для продажи.", reply_markup=kb(nav_btns("start")))
+        return
     
-    STATE["pending"]["signal"] = {
-        "action": "SELL",
-        "symbol": symbol,
-        "price": price,
-    }
+    qty = pos["qty"]
+    trade = portfolio.close_position(sig["price"], qty)
+    
+    del STATE["pending"]["signal"]
+    if "error" in trade:
+        await update.callback_query.edit_message_text("Ошибка: " + trade["error"], reply_markup=kb(nav_btns("start")))
+        return
+        
+    if trade["pnl_pct"] < 0:
+        register_loss()
+    else:
+        register_win()
+        
+    rows = [[btn("🏠 В меню", "start")]]
+    msg = (
+        "Записал продажу (всё).\n"
+        "Твоя прибыль: " + str(round(trade["pnl_pct"], 2)) + "% (" + str(round(trade["pnl_abs"], 2)) + " USDT)"
+    )
+    await update.callback_query.edit_message_text(msg, reply_markup=kb(rows))
+
+async def sig_sell_custom(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    sig = STATE["pending"].get("signal")
+    if not sig: return
+    STATE["pending"]["wait_custom_amount"] = {"action": "SELL", "symbol": sig["symbol"], "price": sig["price"]}
     await update.callback_query.edit_message_text(
-        "Сколько USDT ты продал по " + symbol + "?",
+        "Введи сумму в USDT, на которую продал " + sig["symbol"] + ":",
         reply_markup=kb(nav_btns("start"))
     )
 
@@ -912,21 +965,19 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
     pend = STATE["pending"]
     
-    if "signal" in pend:
-        sig_data = pend["signal"]
+    if "wait_custom_amount" in pend:
+        sig_data = pend["wait_custom_amount"]
         try:
             amount = float(txt)
         except Exception:
             await update.message.reply_text("Введи число (USDT).", reply_markup=kb(nav_btns("start")))
             return
-        pend.pop("signal")
+        pend.pop("wait_custom_amount")
         
         if sig_data["action"] == "BUY":
             qty = amount / sig_data["price"] if sig_data["price"] else 0
             portfolio.open_position(sig_data["symbol"], "BUY", sig_data["price"], qty, source="signal")
-            rows = [
-                [btn("🏠 В меню", "start")]
-            ]
+            rows = [[btn("🏠 В меню", "start")]]
             await update.message.reply_text(
                 "Записал: купил " + sig_data["symbol"] + " на " + str(amount) + " USDT.\nЖдём сигнал SELL.",
                 reply_markup=kb(rows)
@@ -948,13 +999,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else:
                 register_win()
             
-            rows = [
-                [btn("🏠 В меню", "start")]
-            ]
+            rows = [[btn("🏠 В меню", "start")]]
             msg = (
                 "Записал продажу.\n"
-                "PnL: " + str(round(trade["pnl_pct"], 2)) + "%\n"
-                "Прибыль: " + str(round(trade["pnl_abs"], 2)) + " USDT"
+                "Твоя прибыль: " + str(round(trade["pnl_pct"], 2)) + "% (" + str(round(trade["pnl_abs"], 2)) + " USDT)"
             )
             await update.message.reply_text(msg, reply_markup=kb(rows))
         return
@@ -1183,11 +1231,17 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "sig_skipped":
         await sig_skipped(update, ctx)
         return
-    if data.startswith("sig_bought_"):
-        await sig_bought_ask_amount(update, ctx)
+    if data == "sig_buy_signal":
+        await sig_buy_signal(update, ctx)
         return
-    if data.startswith("sig_sold_"):
-        await sig_sold_ask_amount(update, ctx)
+    if data == "sig_buy_custom":
+        await sig_buy_custom(update, ctx)
+        return
+    if data == "sig_sell_signal":
+        await sig_sell_signal(update, ctx)
+        return
+    if data == "sig_sell_custom":
+        await sig_sell_custom(update, ctx)
         return
 
     if data == "man_menu":
@@ -1255,7 +1309,7 @@ def main():
     app = Application.builder().token(config.TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.CONTACT, on_text))
     app.run_polling()
 
 if __name__ == "__main__":
