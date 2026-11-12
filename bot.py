@@ -425,10 +425,7 @@ async def _score_pair(symbol, relaxed=False):
         vol24 = float(df["volume"].tail(96).sum() * price)
         atr_pct = float(last["atr"]) / price if price else 0
         
-        min_vol = 100000 if relaxed else 1000000
-        min_atr = 0.003 if relaxed else 0.01
-            
-        if vol24 < min_vol or atr_pct < min_atr:
+        if vol24 < 100000 or atr_pct < 0.005:
             return None
             
         sig = f.analyze_filtered(tf, tp_mult=3.0)
@@ -459,26 +456,29 @@ async def _scan_best(exclude=None):
         ex_class = getattr(ex, "ccxt")
         exchange = ex_class({"enableRateLimit": True})
         
-        # 1. БЫСТРЫЙ СБОР ТИКЕРОВ (Занимает 1-2 сек)
+        # ЭТАП 1: Быстрый опрос всех тикеров
         tickers = exchange.fetch_tickers()
         
-        candidates = []
+        valid_pairs = []
         for sym, t in tickers.items():
             if not sym.endswith("/USDT"): continue
             if exclude and sym in exclude: continue
+            
             vol = t.get("quoteVolume", 0) or 0
-            if vol > 2000000: 
-                candidates.append({"symbol": sym, "vol": vol})
+            change = abs(t.get("percentage", 0) or 0)
+            
+            # ЭТАП 2: Отсеиваем мертвые (объем < 500к) и флэт (ход < 1%)
+            if vol > 500000 and change > 1.0:
+                valid_pairs.append({"symbol": sym, "vol": vol, "change": change})
                 
-        if not candidates:
+        if not valid_pairs:
             return None
             
-        # 2. БЕРЕМ ТОП-10
-        candidates.sort(key=lambda x: x["vol"], reverse=True)
-        top10 = candidates[:10]
+        valid_pairs.sort(key=lambda x: x["vol"] * x["change"], reverse=True)
+        top10 = valid_pairs[:10]
         
-        # 3. АНАЛИЗ ВСЕХ 10 ОДНОВРЕМЕННО
-        tasks = [_score_pair(c["symbol"], relaxed=False) for c in top10]
+        # ЭТАП 3: Тяжелый анализ (свечи) только для Топ-10
+        tasks = [_score_pair(c["symbol"]) for c in top10]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         best = None
@@ -516,7 +516,6 @@ async def _auto_loop(app):
                 if STATE["auto"]["waiting_tf_confirm"]:
                     pass
                 else:
-                    # ЛОГИКА ПОВТОРНОГО ПРЕДЛОЖЕНИЯ ЧЕРЕЗ 30 МИНУТ
                     now = datetime.datetime.utcnow()
                     if STATE["auto"]["switch_wait_until"] and now >= STATE["auto"]["switch_wait_until"]:
                         saved_offer = STATE["auto"]["switch_offer"]
@@ -540,7 +539,6 @@ async def _auto_loop(app):
                         STATE["auto"]["switch_wait_until"] = None
                         STATE["auto"]["switch_offer"] = None
 
-                    # Ищем в фоне, нет ли монеты на 5% лучше
                     if STATE["auto"]["best_score"] > 0 and not STATE["auto"]["switch_wait_until"]:
                         new_best = await _scan_best(exclude=symbols)
                         if new_best and new_best["score"] > STATE["auto"]["best_score"] * 1.05:
@@ -548,7 +546,6 @@ async def _auto_loop(app):
                             STATE["auto"]["current_offer"] = new_best["symbol"]
                             await _offer_better(app, new_best)
                     
-                    # Проверяем сигналы по текущей
                     for sym in list(symbols):
                         await _process_symbol(app, sym)
         except Exception as e:
