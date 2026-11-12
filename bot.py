@@ -250,7 +250,7 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
     
     await update.callback_query.edit_message_text(
-        "Биржа: " + exchanges.EXCHANGES.get(key, key) + ".\nСканирую весь рынок параллельно, это займет около 30 секунд...",
+        "Биржа: " + exchanges.EXCHANGES.get(key, key) + ".\nЗапускаю поиск...",
         reply_markup=kb(nav_btns("start"))
     )
     
@@ -345,17 +345,14 @@ async def _score_pair(symbol):
         return None
 
 async def _scan_best(exclude=None):
-    # Загружаем ВСЕ пары на бирже
     pairs = exchanges.load_all_pairs(
-        STATE["auto"]["exchange"], quote="USDT", max_pairs=500
+        STATE["auto"]["exchange"], quote="USDT", max_pairs=150
     )
-    
     best = None
-    chunk_size = 40 # Проверяем по 40 монет ОДНОВРЕМЕННО (параллельно)
+    chunk_size = 5  # По 5 монет одновременно (безопасно для биржи)
     
     for i in range(0, len(pairs), chunk_size):
         chunk = pairs[i:i + chunk_size]
-        
         tasks = [_score_pair(sym) for sym in chunk if not (exclude and sym in exclude)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
@@ -365,12 +362,13 @@ async def _scan_best(exclude=None):
             if best is None or r["score"] > best["score"]:
                 best = r
                 
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.5)  # Пауза 0.5 сек между пачками
         
     return best
 
 async def _auto_loop(app):
     print("=== СТАРТ ЦИКЛА АВТОПИЛОТА ===")
+    chat_id = app.bot_data.get("chat_id", 0)
     while STATE["auto"]["active"]:
         if is_sleeping():
             await asyncio.sleep(60)
@@ -381,15 +379,18 @@ async def _auto_loop(app):
         try:
             symbols = STATE["auto"]["symbols"]
             if not symbols:
-                print("Сканирую рынок...")
+                if chat_id:
+                    await app.bot.send_message(chat_id=chat_id, text="🔍 Сканирую рынок, ищу лучшую монету...")
+                
                 best = await _scan_best()
+                
                 if best:
-                    print("Найдена лучшая монета:", best["symbol"])
                     STATE["auto"]["current_offer"] = best["symbol"]
                     STATE["auto"]["waiting_tf_confirm"] = True
                     await _offer_found(app, best)
                 else:
-                    print("Ничего не найдено, ждем 1 минуту...")
+                    if chat_id:
+                        await app.bot.send_message(chat_id=chat_id, text="⚠️ Не нашёл подходящих монет. Жду 1 минуту.")
             else:
                 if STATE["auto"]["waiting_tf_confirm"]:
                     pass
@@ -397,7 +398,8 @@ async def _auto_loop(app):
                     for sym in list(symbols):
                         await _process_symbol(app, sym)
         except Exception as e:
-            print("ОШИБКА В ЦИКЛЕ АВТОПИЛОТА:", e)
+            if chat_id:
+                await app.bot.send_message(chat_id=chat_id, text="❌ Ошибка в цикле: " + str(e))
         await asyncio.sleep(60)
 
 async def _process_symbol(app, symbol):
