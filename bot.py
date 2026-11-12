@@ -68,6 +68,7 @@ STATE = {
     },
     "pending": {},
     "panic": {"task": None, "active": False},
+    "trailing": {"active": False, "task": None},
 }
 
 # ---------- ХЕЛПЕРЫ ----------
@@ -338,13 +339,13 @@ async def _score_pair(symbol):
         base_conf = sig.confidence
         
         vol_bonus = 0.0
-        if atr_pct > 0.02: vol_bonus = 0.15
-        elif atr_pct > 0.015: vol_bonus = 0.10
-        elif atr_pct > 0.01: vol_bonus = 0.05
+        if atr_pct > 0.02: vol_bonus = 0.20
+        elif atr_pct > 0.015: vol_bonus = 0.15
+        elif atr_pct > 0.01: vol_bonus = 0.10
         
         vol_bonus_amount = 0.0
-        if vol24 > 50000000: vol_bonus_amount = 0.10
-        elif vol24 > 10000000: vol_bonus_amount = 0.05
+        if vol24 > 50000000: vol_bonus_amount = 0.15
+        elif vol24 > 10000000: vol_bonus_amount = 0.10
         
         final_conf = min(base_conf + vol_bonus + vol_bonus_amount, 0.99)
         sig.confidence = final_conf
@@ -426,15 +427,15 @@ async def _process_symbol(app, symbol):
         return
     sig = r["signal"]
     
-    # 1. Порог уверенности 65% минимум
     if sig.confidence < CONF_MIN_AUTO:
         return
 
-    # 2. БЕЗОПАСНОСТЬ: Проверка старшего таймфрейма
     current_tf = STATE["auto"].get("tf", "15m")
     if current_tf in ["1m", "5m"]:
         if not mtf_confirm(symbol, sig.action):
-            return
+            sig.confidence = max(sig.confidence - 0.10, 0.55)
+            if sig.confidence < 0.55:
+                return
         
     allowed = STATE["auto"]["allowed"]
     if sig.action == "BUY":
@@ -473,7 +474,7 @@ async def _process_symbol(app, symbol):
             [btn("🛑 ОСТАНОВИТЬ СИГНАЛЫ", "auto_stop_signals")],
             nav_btns("start")[0]
         ]
-    else: # SELL
+    else:
         rows = [
             [btn("✅ Продал по сигналу (" + str(round(lot, 2)) + ")", "sig_sell_signal")],
             [btn("✏️ Продал на свою сумму", "sig_sell_custom")],
@@ -485,6 +486,35 @@ async def _process_symbol(app, symbol):
     chat_id = app.bot_data.get("chat_id", 0)
     if chat_id:
         await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
+
+# ---------- ТРЕЙЛИНГ И ПРИБЫЛЬ ----------
+async def _trailing_loop(app, symbol, entry_price, side):
+    chat_id = app.bot_data.get("chat_id", 0)
+    best_price = entry_price
+    be_activated = False
+    
+    while STATE["trailing"]["active"]:
+        await asyncio.sleep(30)
+        try:
+            f = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
+            df = f.fetch("1m", 10)
+            price = float(df.iloc[-1]["close"])
+            
+            if side == "BUY":
+                if price > best_price:
+                    best_price = price
+                
+                profit_pct = (best_price - entry_price) / entry_price
+                if profit_pct >= 0.015 and not be_activated:
+                    be_activated = True
+                    if chat_id:
+                        await app.bot.send_message(
+                            chat_id=chat_id, 
+                            text="📈 " + symbol + " вырос на " + str(round(profit_pct*100, 1)) + "%! Стоп передвинут в безубыток."
+                        )
+                    break 
+        except Exception:
+            pass
 
 async def _offer_found(app, best):
     text = (
@@ -541,6 +571,11 @@ async def sig_buy_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     portfolio.open_position(sig["symbol"], "BUY", price, qty, source="signal")
     
+    # Запускаем трейлинг
+    STATE["trailing"]["active"] = True
+    if STATE["trailing"]["task"] is None or STATE["trailing"]["task"].done():
+        STATE["trailing"]["task"] = asyncio.create_task(_trailing_loop(ctx.application, sig["symbol"], price, "BUY"))
+    
     del STATE["pending"]["signal"]
     rows = [[btn("🏠 В меню", "start")]]
     await update.callback_query.edit_message_text(
@@ -567,6 +602,7 @@ async def sig_sell_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     qty = pos["qty"]
     trade = portfolio.close_position(sig["price"], qty)
+    STATE["trailing"]["active"] = False
     
     del STATE["pending"]["signal"]
     if "error" in trade:
@@ -632,6 +668,7 @@ async def _panic_loop(app, symbol):
 
 async def panic_sold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["panic"]["active"] = False
+    STATE["trailing"]["active"] = False
     pos = portfolio.load().get("open")
     if pos:
         trade = portfolio.close_position(pos["entry"] * 0.98, pos["qty"])
@@ -889,6 +926,7 @@ async def close_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         df = f.fetch("1m", 30)
         price = float(df.iloc[-1]["close"])
         trade = portfolio.close_position(price, pos["qty"])
+        STATE["trailing"]["active"] = False
         if "error" in trade:
             await update.callback_query.edit_message_text("Ошибка: " + trade["error"], reply_markup=kb(nav_btns("start")))
             return
@@ -977,6 +1015,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if sig_data["action"] == "BUY":
             qty = amount / sig_data["price"] if sig_data["price"] else 0
             portfolio.open_position(sig_data["symbol"], "BUY", sig_data["price"], qty, source="signal")
+            
+            STATE["trailing"]["active"] = True
+            if STATE["trailing"]["task"] is None or STATE["trailing"]["task"].done():
+                STATE["trailing"]["task"] = asyncio.create_task(_trailing_loop(ctx.application, sig_data["symbol"], sig_data["price"], "BUY"))
+                
             rows = [[btn("🏠 В меню", "start")]]
             await update.message.reply_text(
                 "Записал: купил " + sig_data["symbol"] + " на " + str(amount) + " USDT.\nЖдём сигнал SELL.",
@@ -991,6 +1034,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if qty > pos["qty"]:
                 qty = pos["qty"]
             trade = portfolio.close_position(sig_data["price"], qty)
+            STATE["trailing"]["active"] = False
+            
             if "error" in trade:
                 await update.message.reply_text("Ошибка: " + trade["error"], reply_markup=kb(nav_btns("start")))
                 return
@@ -1156,6 +1201,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "auto_stop_signals":
         STATE["auto"]["active"] = False
+        STATE["trailing"]["active"] = False
         if STATE["auto"]["task"]:
             STATE["auto"]["task"].cancel()
             STATE["auto"]["task"] = None
@@ -1171,6 +1217,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "start":
         if STATE["auto"]["active"]:
             STATE["auto"]["active"] = False
+            STATE["trailing"]["active"] = False
             if STATE["auto"]["task"]:
                 STATE["auto"]["task"].cancel()
                 STATE["auto"]["task"] = None
