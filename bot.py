@@ -250,7 +250,7 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
     
     await update.callback_query.edit_message_text(
-        "Биржа: " + exchanges.EXCHANGES.get(key, key) + ".\nИщем оптимальный вариант (это займет около минуты)...",
+        "Биржа: " + exchanges.EXCHANGES.get(key, key) + ".\nСканирую весь рынок параллельно, это займет около 30 секунд...",
         reply_markup=kb(nav_btns("start"))
     )
     
@@ -345,19 +345,28 @@ async def _score_pair(symbol):
         return None
 
 async def _scan_best(exclude=None):
+    # Загружаем ВСЕ пары на бирже
     pairs = exchanges.load_all_pairs(
-        STATE["auto"]["exchange"], quote="USDT", max_pairs=100
+        STATE["auto"]["exchange"], quote="USDT", max_pairs=500
     )
+    
     best = None
-    for sym in pairs:
-        if exclude and sym in exclude:
-            continue
-        r = await _score_pair(sym)
-        if r is None:
-            continue
-        if best is None or r["score"] > best["score"]:
-            best = r
-        await asyncio.sleep(0.1)
+    chunk_size = 40 # Проверяем по 40 монет ОДНОВРЕМЕННО (параллельно)
+    
+    for i in range(0, len(pairs), chunk_size):
+        chunk = pairs[i:i + chunk_size]
+        
+        tasks = [_score_pair(sym) for sym in chunk if not (exclude and sym in exclude)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for r in results:
+            if isinstance(r, Exception) or r is None:
+                continue
+            if best is None or r["score"] > best["score"]:
+                best = r
+                
+        await asyncio.sleep(0.2)
+        
     return best
 
 async def _auto_loop(app):
@@ -728,14 +737,7 @@ async def man_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("man_pick_back")))
         return
-    if sig.confidence < CONF_SIGNAL:
-        text = (
-            "⚡ " + symbol + "\n"
-            "Уверенность " + str(int(sig.confidence * 100)) + "% < 85%.\n"
-            "Сигнала нет."
-        )
-        await update.callback_query.edit_message_text(text, reply_markup=kb(nav_btns("man_pick_back")))
-        return
+    
     rows = [
         [btn("🟢 Сейчас покупать", "man_buy")],
         [btn("🔴 Сейчас продавать", "man_sell")],
@@ -743,7 +745,7 @@ async def man_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ]
     text = (
         "⚡ " + symbol + "\n"
-        "Сигнал: " + sig.action + "\n"
+        "Куда пойдёт: " + sig.action + "\n"
         "Уверенность: " + str(int(sig.confidence * 100)) + "%"
     )
     await update.callback_query.edit_message_text(text, reply_markup=kb(rows))
