@@ -53,11 +53,10 @@ STATE = {
         "symbols": [],
         "allowed": "BUY",
         "tf": "15m",
-        "mode": "focused",
-        "last_switch_offer": None,
         "exchange": "bybit",
         "waiting_tf_confirm": False,
         "current_offer": None,
+        "best_score": 0,
     },
     "manual": {
         "exchange": config.EXCHANGE,
@@ -130,10 +129,6 @@ def calc_lot(price, sl_price, confidence):
         
     lot_usdt = risk_usdt / sl_pct
     return min(lot_usdt, budget)
-
-def fee_ok(price, tp):
-    move = abs(tp - price) / price if price else 0
-    return move >= config.FEE_ROUND * FEE_MIN_TP
 
 def mtf_confirm(symbol, direction):
     try:
@@ -281,6 +276,7 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
         STATE["auto"]["active"] = True
         STATE["auto"]["symbols"] = []
+        STATE["auto"]["best_score"] = 0
         STATE["auto"]["waiting_tf_confirm"] = False
         STATE["auto"]["current_offer"] = None
         STATE["auto"]["task"] = asyncio.create_task(_auto_loop(ctx.application))
@@ -400,7 +396,6 @@ async def _scan_best(exclude=None):
         
     # Второй проход (если не нашли — расслабляем)
     if best is None:
-        print("Строгий поиск пуст. Включаю режим 'хоть что-то'.")
         for i in range(0, len(pairs), chunk_size):
             chunk = pairs[i:i + chunk_size]
             tasks = [_score_pair(sym, relaxed=True) for sym in chunk if not (exclude and sym in exclude)]
@@ -416,7 +411,7 @@ async def _scan_best(exclude=None):
     return best
 
 async def _auto_loop(app):
-    print("=== СТАРТ ЦИКЛА АВТОПИЛОТА ===")
+    print("=== СТАРТ НЕВИДИМОГО ЦИКЛА АВТОПИЛОТА ===")
     chat_id = app.bot_data.get("chat_id", 0)
     while STATE["auto"]["active"]:
         if is_sleeping():
@@ -428,27 +423,30 @@ async def _auto_loop(app):
         try:
             symbols = STATE["auto"]["symbols"]
             if not symbols:
-                if chat_id:
-                    await app.bot.send_message(chat_id=chat_id, text="🔍 Сканирую рынок, ищу лучшую монету...")
-                
+                # Бот ищет молча
                 best = await _scan_best()
-                
                 if best:
                     STATE["auto"]["current_offer"] = best["symbol"]
+                    STATE["auto"]["best_score"] = best["score"]
                     STATE["auto"]["waiting_tf_confirm"] = True
                     await _offer_found(app, best)
-                else:
-                    if chat_id:
-                        await app.bot.send_message(chat_id=chat_id, text="⚠️ Не нашёл подходящих монет. Жду 1 минуту.")
             else:
                 if STATE["auto"]["waiting_tf_confirm"]:
                     pass
                 else:
+                    # Ищем в фоне, нет ли монеты на 5% лучше
+                    if STATE["auto"]["best_score"] > 0:
+                        new_best = await _scan_best(exclude=symbols)
+                        if new_best and new_best["score"] > STATE["auto"]["best_score"] * 1.05:
+                            STATE["auto"]["best_score"] = new_best["score"]
+                            STATE["auto"]["current_offer"] = new_best["symbol"]
+                            await _offer_better(app, new_best)
+                    
+                    # Проверяем сигналы по текущей
                     for sym in list(symbols):
                         await _process_symbol(app, sym)
         except Exception as e:
-            if chat_id:
-                await app.bot.send_message(chat_id=chat_id, text="❌ Ошибка в цикле: " + str(e))
+            print("Ошибка в цикле:", e)
         await asyncio.sleep(60)
 
 async def _process_symbol(app, symbol):
@@ -512,7 +510,7 @@ async def _process_symbol(app, symbol):
             [btn("🛑 ОСТАНОВИТЬ СИГНАЛЫ", "auto_stop_signals")],
             nav_btns("start")[0]
         ]
-    else: # SELL
+    else:
         rows = [
             [btn("✅ Продал по сигналу (" + str(round(lot, 2)) + ")", "sig_sell_signal")],
             [btn("✏️ Продал на свою сумму", "sig_sell_custom")],
@@ -568,6 +566,37 @@ async def _offer_found(app, best):
     chat_id = app.bot_data.get("chat_id", 0)
     if chat_id:
         await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
+
+async def _offer_better(app, best):
+    text = (
+        "🔥 В фоне нашёл монету лучше на 5%!\n"
+        "Монета: " + best["symbol"] + "\n"
+        "Потенциал: " + str(round(best["atr_pct"] * 100, 2)) + "% ATR\n"
+        "Переключаемся на неё?"
+    )
+    rows = [
+        [btn("✅ Да, переключаемся", "switch_yes")],
+        [btn("❌ Нет, остаёмся", "switch_no")],
+        nav_btns("start")[0]
+    ]
+    chat_id = app.bot_data.get("chat_id", 0)
+    if chat_id:
+        await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
+
+async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if STATE["auto"]["current_offer"]:
+        STATE["auto"]["symbols"] = [STATE["auto"]["current_offer"]]
+        STATE["auto"]["current_offer"] = None
+        await update.callback_query.edit_message_text(
+            "Переключился на " + STATE["auto"]["symbols"][0] + ". Ждём сигналов.",
+            reply_markup=kb(nav_btns("start"))
+        )
+
+async def switch_no(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    STATE["auto"]["current_offer"] = None
+    await update.callback_query.edit_message_text(
+        "Ок, остаемся на текущей.", reply_markup=kb(nav_btns("start"))
+    )
 
 async def tf_ok_15m(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["tf"] = "15m"
@@ -1294,6 +1323,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if data == "tf_bad":
         await tf_bad(update, ctx)
+        return
+    if data == "switch_yes":
+        await switch_yes(update, ctx)
+        return
+    if data == "switch_no":
+        await switch_no(update, ctx)
         return
     if data.startswith("auto_tf_"):
         await auto_tf_set(update, ctx)
