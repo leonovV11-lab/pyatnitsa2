@@ -333,7 +333,7 @@ async def multi_choose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Сколько монет торгуем? (2–10)", reply_markup=kb(nav_btns("start"))
     )
 
-async def _score_pair(symbol):
+async def _score_pair(symbol, relaxed=False):
     try:
         f = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
         tf = STATE["auto"].get("tf", "15m")
@@ -349,25 +349,22 @@ async def _score_pair(symbol):
         vol24 = float(df["volume"].tail(96).sum() * price)
         atr_pct = float(last["atr"]) / price if price else 0
         
-        if vol24 < 500000 or atr_pct < 0.01:
+        min_vol = 100000 if relaxed else 1000000
+        min_atr = 0.003 if relaxed else 0.01
+            
+        if vol24 < min_vol or atr_pct < min_atr:
             return None
             
         sig = f.analyze_filtered(tf, tp_mult=3.0)
         base_conf = sig.confidence
         
-        vol_bonus = 0.0
-        if atr_pct > 0.02: vol_bonus = 0.20
-        elif atr_pct > 0.015: vol_bonus = 0.15
-        elif atr_pct > 0.01: vol_bonus = 0.10
+        if atr_pct > 0.025: base_conf = max(base_conf, 0.90)
+        elif atr_pct > 0.02: base_conf = max(base_conf, 0.80)
+        elif atr_pct > 0.015: base_conf = max(base_conf, 0.70)
+        elif atr_pct > 0.01: base_conf = max(base_conf, 0.65)
         
-        vol_bonus_amount = 0.0
-        if vol24 > 50000000: vol_bonus_amount = 0.15
-        elif vol24 > 10000000: vol_bonus_amount = 0.10
-        
-        final_conf = min(base_conf + vol_bonus + vol_bonus_amount, 0.99)
-        sig.confidence = final_conf
-        
-        score = vol24 * atr_pct * final_conf
+        sig.confidence = base_conf
+        score = vol24 * atr_pct
         
         return {
             "symbol": symbol,
@@ -381,16 +378,17 @@ async def _score_pair(symbol):
         return None
 
 async def _scan_best(exclude=None):
-    # Быстрый скан: всего 50 пар, по 30 одновременно
     pairs = exchanges.load_all_pairs(
         STATE["auto"]["exchange"], quote="USDT", max_pairs=50
     )
+    
     best = None
     chunk_size = 30
     
+    # Первый проход (строгий)
     for i in range(0, len(pairs), chunk_size):
         chunk = pairs[i:i + chunk_size]
-        tasks = [_score_pair(sym) for sym in chunk if not (exclude and sym in exclude)]
+        tasks = [_score_pair(sym, relaxed=False) for sym in chunk if not (exclude and sym in exclude)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         for r in results:
@@ -398,9 +396,23 @@ async def _scan_best(exclude=None):
                 continue
             if best is None or r["score"] > best["score"]:
                 best = r
-                
         await asyncio.sleep(0.05)
         
+    # Второй проход (если не нашли — расслабляем)
+    if best is None:
+        print("Строгий поиск пуст. Включаю режим 'хоть что-то'.")
+        for i in range(0, len(pairs), chunk_size):
+            chunk = pairs[i:i + chunk_size]
+            tasks = [_score_pair(sym, relaxed=True) for sym in chunk if not (exclude and sym in exclude)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for r in results:
+                if isinstance(r, Exception) or r is None:
+                    continue
+                if best is None or r["score"] > best["score"]:
+                    best = r
+            await asyncio.sleep(0.05)
+            
     return best
 
 async def _auto_loop(app):
@@ -445,7 +457,7 @@ async def _process_symbol(app, symbol):
         return
     sig = r["signal"]
     
-    if sig.confidence < CONF_MIN_AUTO:
+    if sig.confidence < 0.55:
         return
 
     current_tf = STATE["auto"].get("tf", "15m")
@@ -467,6 +479,13 @@ async def _process_symbol(app, symbol):
     if lot <= 0:
         return
     
+    total_fee_pct = 0.002 
+    move_to_tp_pct = abs(sig.take_profit - sig.price) / sig.price
+    net_profit_pct = (move_to_tp_pct - total_fee_pct) * 100
+    
+    if net_profit_pct < 0.2:
+        return
+
     STATE["pending"]["signal"] = {
         "action": sig.action,
         "symbol": symbol,
@@ -481,7 +500,8 @@ async def _process_symbol(app, symbol):
         "Уверенность: " + str(int(sig.confidence * 100)) + "%\n"
         "Рекомендуемый лот: " + str(round(lot, 2)) + " USDT\n"
         "Стоп: " + fmt_price(sig.stop_loss) + "\n"
-        "Тейк: " + fmt_price(sig.take_profit)
+        "Тейк: " + fmt_price(sig.take_profit) + "\n"
+        "Чистая прибыль (с учетом комиссии): ~" + str(round(net_profit_pct, 2)) + "%"
     )
     
     if sig.action == "BUY":
@@ -492,7 +512,7 @@ async def _process_symbol(app, symbol):
             [btn("🛑 ОСТАНОВИТЬ СИГНАЛЫ", "auto_stop_signals")],
             nav_btns("start")[0]
         ]
-    else:
+    else: # SELL
         rows = [
             [btn("✅ Продал по сигналу (" + str(round(lot, 2)) + ")", "sig_sell_signal")],
             [btn("✏️ Продал на свою сумму", "sig_sell_custom")],
@@ -553,14 +573,11 @@ async def tf_ok_15m(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["tf"] = "15m"
     STATE["auto"]["waiting_tf_confirm"] = False
     
-    # 1. Отвечаем, что начали ждать (отдельным сообщением)
     chat_id = update.callback_query.message.chat_id
     await ctx.bot.send_message(chat_id=chat_id, text="Ок, работаем 15m. Ждём сигналов.")
     
-    # 2. Удаляем старое сообщение с кнопками
     await update.callback_query.delete_message()
     
-    # 3. Спрашиваем про наличие монеты
     if STATE["auto"]["current_offer"]:
         STATE["auto"]["symbols"] = [STATE["auto"]["current_offer"]]
         STATE["auto"]["current_offer"] = None
@@ -574,7 +591,6 @@ async def _ask_hascoins(update, ctx):
     ]
     text = "У тебя уже есть эта монета?"
     
-    # Отправляем новым сообщением, так как старое мы удалили
     chat_id = update.callback_query.message.chat_id
     await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
 
