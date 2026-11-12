@@ -504,7 +504,7 @@ async def _process_symbol(app, symbol):
     
     if sig.action == "BUY":
         rows = [
-            [btn("✅ Купил по сигналу (" + str(round(lot, 2)) + ")", "sig_buy_signal")],
+            [btn("✅ Купил по сигналу", "sig_buy_signal")],
             [btn("✏️ Купил на свою сумму", "sig_buy_custom")],
             [btn("❌ Пропустил", "sig_skipped")],
             [btn("🛑 ОСТАНОВИТЬ СИГНАЛЫ", "auto_stop_signals")],
@@ -512,7 +512,7 @@ async def _process_symbol(app, symbol):
         ]
     else:
         rows = [
-            [btn("✅ Продал по сигналу (" + str(round(lot, 2)) + ")", "sig_sell_signal")],
+            [btn("✅ Продал по сигналу", "sig_sell_signal")],
             [btn("✏️ Продал на свою сумму", "sig_sell_custom")],
             [btn("❌ Пропустил", "sig_skipped")],
             [btn("🛑 ОСТАНОВИТЬ СИГНАЛЫ", "auto_stop_signals")],
