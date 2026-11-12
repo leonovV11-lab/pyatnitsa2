@@ -333,13 +333,12 @@ async def multi_choose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Сколько монет торгуем? (2–10)", reply_markup=kb(nav_btns("start"))
     )
 
-# ---------- БЫСТРЫЙ ПОИСК МОНЕТЫ ----------
 async def _score_pair(symbol, relaxed=False):
     try:
         f = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
         tf = STATE["auto"].get("tf", "15m")
         
-        df = f.fetch(tf, 300)
+        df = f.fetch(tf, 100)
         df = f.enrich(df, tf).dropna().reset_index(drop=True)
         if len(df) < 20:
             return None
@@ -387,27 +386,28 @@ async def _scan_best(exclude=None):
         # 1. БЫСТРЫЙ СБОР ТИКЕРОВ (Занимает 1-2 сек)
         tickers = exchange.fetch_tickers()
         
-        # Фильтруем USDT и собираем объем
         candidates = []
         for sym, t in tickers.items():
             if not sym.endswith("/USDT"): continue
             if exclude and sym in exclude: continue
             vol = t.get("quoteVolume", 0) or 0
-            if vol > 1000000: # Отсекаем мусор
+            if vol > 2000000: 
                 candidates.append({"symbol": sym, "vol": vol})
                 
         if not candidates:
             return None
             
-        # 2. БЕРЕМ ТОП-5 ПО ОБЪЕМУ
+        # 2. БЕРЕМ ТОП-10
         candidates.sort(key=lambda x: x["vol"], reverse=True)
-        top5 = candidates[:5]
+        top10 = candidates[:10]
         
-        # 3. ГЛУБОКИЙ АНАЛИЗ ТОЛЬКО ДЛЯ ТОП-5 (Занимает 5-10 сек)
+        # 3. АНАЛИЗ ВСЕХ 10 ОДНОВРЕМЕННО
+        tasks = [_score_pair(c["symbol"], relaxed=False) for c in top10]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
         best = None
-        for c in top5:
-            r = await _score_pair(c["symbol"], relaxed=False)
-            if r is None:
+        for r in results:
+            if isinstance(r, Exception) or r is None:
                 continue
             if best is None or r["score"] > best["score"]:
                 best = r
