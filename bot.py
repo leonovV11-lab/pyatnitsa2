@@ -195,6 +195,23 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.callback_query.edit_message_text(txt, reply_markup=kb(rows))
 
+# ---------- КОМАНДА STOP ----------
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    STATE["auto"]["active"] = False
+    STATE["trailing"]["active"] = False
+    if STATE["auto"]["task"]:
+        STATE["auto"]["task"].cancel()
+        STATE["auto"]["task"] = None
+    STATE["auto"]["symbols"] = []
+    STATE["auto"]["current_offer"] = None
+    STATE["auto"]["waiting_tf_confirm"] = False
+    
+    rows = [[btn("🏠 В меню", "start")]]
+    await update.message.reply_text(
+        "🛑 Остановлено. Что дальше?",
+        reply_markup=kb(rows)
+    )
+
 # ---------- АВТОПИЛОТ ----------
 async def auto_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["auto"] = "balance"
@@ -364,12 +381,12 @@ async def _score_pair(symbol):
         return None
 
 async def _scan_best(exclude=None):
-    # Проверяем 70 самых активных пар
+    # Быстрый скан: всего 50 пар, по 30 одновременно
     pairs = exchanges.load_all_pairs(
-        STATE["auto"]["exchange"], quote="USDT", max_pairs=70
+        STATE["auto"]["exchange"], quote="USDT", max_pairs=50
     )
     best = None
-    chunk_size = 15  # Проверяем по 15 пар одновременно (быстро)
+    chunk_size = 30
     
     for i in range(0, len(pairs), chunk_size):
         chunk = pairs[i:i + chunk_size]
@@ -382,7 +399,7 @@ async def _scan_best(exclude=None):
             if best is None or r["score"] > best["score"]:
                 best = r
                 
-        await asyncio.sleep(0.1)  # Быстрая пауза
+        await asyncio.sleep(0.05)
         
     return best
 
@@ -535,9 +552,15 @@ async def _offer_found(app, best):
 async def tf_ok_15m(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["tf"] = "15m"
     STATE["auto"]["waiting_tf_confirm"] = False
-    await update.callback_query.edit_message_text(
-        "Ок, работаем 15m. Ждём сигналов.", reply_markup=kb(nav_btns("start"))
-    )
+    
+    # 1. Отвечаем, что начали ждать (отдельным сообщением)
+    chat_id = update.callback_query.message.chat_id
+    await ctx.bot.send_message(chat_id=chat_id, text="Ок, работаем 15m. Ждём сигналов.")
+    
+    # 2. Удаляем старое сообщение с кнопками
+    await update.callback_query.delete_message()
+    
+    # 3. Спрашиваем про наличие монеты
     if STATE["auto"]["current_offer"]:
         STATE["auto"]["symbols"] = [STATE["auto"]["current_offer"]]
         STATE["auto"]["current_offer"] = None
@@ -550,10 +573,10 @@ async def _ask_hascoins(update, ctx):
         nav_btns("start")[0]
     ]
     text = "У тебя уже есть эта монета?"
-    if update.message:
-        await update.message.reply_text(text, reply_markup=kb(rows))
-    else:
-        await update.callback_query.edit_message_text(text, reply_markup=kb(rows))
+    
+    # Отправляем новым сообщением, так как старое мы удалили
+    chat_id = update.callback_query.message.chat_id
+    await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
 
 # ---------- ОБРАБОТКА СИГНАЛОВ (КУПИЛ/ПРОДАЛ/ПРОПУСТИЛ) ----------
 async def sig_skipped(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1355,6 +1378,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(config.TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.CONTACT, on_text))
     app.run_polling()
