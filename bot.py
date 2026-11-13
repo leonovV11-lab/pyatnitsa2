@@ -59,7 +59,6 @@ STATE = {
         "best_score": 0,
         "switch_wait_until": None, 
         "switch_offer": None, 
-        "cached_pairs": [], 
     },
     "manual": {
         "exchange": config.EXCHANGE,
@@ -238,7 +237,15 @@ async def demo_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
         
-    sig = best["signal"]
+    r = await _score_pair(best["symbol"])
+    if not r:
+        await update.callback_query.edit_message_text(
+            "Не удалось проанализировать монету. Попробуй позже.",
+            reply_markup=kb(nav_btns("demo"))
+        )
+        return
+        
+    sig = r["signal"]
     
     STATE["demo"]["symbol"] = best["symbol"]
     STATE["demo"]["buy_price"] = sig.price
@@ -349,11 +356,9 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
     
     await update.callback_query.edit_message_text(
-        "Биржа: " + exchanges.EXCHANGES.get(key, key) + ".\nЗагружаю данные рынка (один раз)...",
+        "Биржа: " + exchanges.EXCHANGES.get(key, key) + ".\nЗапускаю поиск...",
         reply_markup=kb(nav_btns("start"))
     )
-    
-    await _preload_pairs()
     
     if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
         STATE["auto"]["active"] = True
@@ -412,11 +417,6 @@ async def multi_choose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Сколько монет торгуем? (2–10)", reply_markup=kb(nav_btns("start"))
     )
 
-async def _preload_pairs():
-    # Мы больше не используем кэш 150 пар для поиска, так как это тормозит.
-    # Поиск идет по тикерам.
-    pass
-
 async def _score_pair(symbol, relaxed=False):
     try:
         f = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
@@ -464,7 +464,6 @@ async def _scan_best(exclude=None):
         ex_class = getattr(ex, "ccxt")
         exchange = ex_class({"enableRateLimit": True})
         
-        # 1. Запрашиваем тикеры (быстро, это просто цены)
         tickers = exchange.fetch_tickers()
         
         candidates = []
@@ -475,7 +474,6 @@ async def _scan_best(exclude=None):
             vol = t.get("quoteVolume", 0) or 0
             change = abs(t.get("percentage", 0) or 0)
             
-            # Отсеиваем мертвые (объем < 2 млн) и флэт (ход < 2%)
             if vol > 2000000 and change > 2.0:
                 candidates.append({
                     "symbol": sym, 
@@ -487,15 +485,12 @@ async def _scan_best(exclude=None):
         if not candidates:
             return None
             
-        # 2. Сортируем по денежному потенциалу и берем ЛУЧШУЮ (Топ-1)
         candidates.sort(key=lambda x: x["vol"] * x["change"], reverse=True)
         best = candidates[0]
         
-        # 3. Возвращаем результат (без запроса свечей, чтобы не висло)
         return {
             "symbol": best["symbol"],
             "score": best["vol"] * best["change"],
-            "signal": None, # Сигнал сформируем позже по свечам
             "price": best["price"],
             "atr_pct": best["change"] / 100.0,
             "vol24": best["vol"],
@@ -505,7 +500,7 @@ async def _scan_best(exclude=None):
         return None
 
 async def _auto_loop(app):
-    print("=== СТАРТ НЕВИДИМОГО ЦИКЛА АВТОПИЛОТА ===")
+    print("=== СТАРТ ЦИКЛА АВТОПИЛОТА ===")
     chat_id = app.bot_data.get("chat_id", 0)
     while STATE["auto"]["active"]:
         if is_sleeping():
@@ -527,7 +522,6 @@ async def _auto_loop(app):
                 if STATE["auto"]["waiting_tf_confirm"]:
                     pass
                 else:
-                    # Проверяем текущую монету по свечам
                     await _process_symbol(app, symbols[0])
         except Exception as e:
             print("Ошибка в цикле:", e)
@@ -537,7 +531,6 @@ async def _process_symbol(app, symbol):
     if "signal" in STATE["pending"]:
         return
 
-    # Здесь мы уже запрашиваем свечи (бот подумает 2-3 секунды, это нормально)
     r = await _score_pair(symbol)
     if r is None:
         return
