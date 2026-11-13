@@ -76,8 +76,7 @@ def sleep_left_min():
     t = STATE["sleep_until"]
     if not t:
         return 0
-    sec = (t - datetime.datetime.utcnow()).total_seconds()
-    return max(0, int(sec / 60))
+    return max(0, int((t - datetime.datetime.utcnow()).total_seconds() / 60))
 
 def register_loss():
     STATE["loss_streak"] += 1
@@ -92,12 +91,7 @@ def calc_lot(price, sl_price, confidence):
     budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
     if budget <= 0:
         return 0.0
-    if confidence >= 0.85:
-        risk_pct = 0.03
-    elif confidence >= 0.75:
-        risk_pct = 0.02
-    else:
-        risk_pct = 0.01
+    risk_pct = 0.03 if confidence >= 0.85 else (0.02 if confidence >= 0.75 else 0.01)
     sl_pct = abs(price - sl_price) / price if price else 0
     if sl_pct <= 0:
         return 0.0
@@ -121,8 +115,7 @@ def mtf_confirm(symbol, direction):
 def session_ok(multi_day):
     if not multi_day:
         return True
-    hour = datetime.datetime.utcnow().hour
-    return 12 <= hour < 20
+    return 12 <= datetime.datetime.utcnow().hour < 20
 
 def city_to_tz(city):
     try:
@@ -302,8 +295,7 @@ async def hascoins_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def multi_choose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["auto"] = "multi_count"
     await update.callback_query.edit_message_text("Сколько монет? (2–10)", reply_markup=kb(nav_btns("start")))
-
-async def _score_pair(symbol, relaxed=False):
+    async def _score_pair(symbol, relaxed=False):
     try:
         f = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
         tf = STATE["auto"].get("tf", "15m")
@@ -445,6 +437,7 @@ async def _offer_found(app, best):
     text = ("Нашёл: " + best["symbol"] + "\nПотенциал: " + str(round(best["atr_pct"] * 100, 2)) +
             "% ATR\n15 минут. Ок?")
     rows = [[btn("✅ Да", "tf_ok_15m")], [btn("❌ Нет", "tf_bad")], nav_btns("start")[0]]
+    chat_id = app.bot_data.get("chat_id", 0)
     if chat_id:
         await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
 
@@ -452,6 +445,7 @@ async def _offer_better(app, best):
     text = ("🔥 Лучше на 5%: " + best["symbol"] + "\nПотенциал: " +
             str(round(best["atr_pct"] * 100, 2)) + "% ATR")
     rows = [[btn("✅ Да", "switch_yes")], [btn("❌ Нет", "switch_no")], nav_btns("start")[0]]
+    chat_id = app.bot_data.get("chat_id", 0)
     if chat_id:
         await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
 
@@ -547,9 +541,7 @@ async def sig_sell_custom(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     STATE["pending"]["wait_custom_amount"] = {"action": "SELL", "symbol": sig["symbol"], "price": sig["price"]}
     await update.callback_query.edit_message_text("Сумма продажи (USDT):", reply_markup=kb(nav_btns("start")))
-
-# ---------- ПАНИКА ----------
-async def _panic_loop(app, symbol):
+    async def _panic_loop(app, symbol):
     STATE["panic"]["active"] = True
     while STATE["panic"]["active"]:
         try:
@@ -591,7 +583,6 @@ async def panic_sold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 register_win()
     await update.callback_query.edit_message_text("Закрыто.", reply_markup=kb(nav_btns("start")))
 
-# ---------- РУЧНОЙ РЕЖИМ ----------
 async def man_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = [
         [btn("🏦 " + exchanges.EXCHANGES.get(STATE["manual"]["exchange"], "биржа"), "man_ex")],
@@ -817,7 +808,6 @@ async def close_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.edit_message_text("Ошибка: " + str(e),
             reply_markup=kb(nav_btns("start")))
 
-# ---------- ИСТОРИЯ ----------
 async def hist_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = [
         [btn("📅 За день", "hist_day")],
@@ -860,7 +850,6 @@ async def stats_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "\nPF: " + str(round(s["pf"], 2)))
     await update.callback_query.edit_message_text(text, reply_markup=kb(nav_btns("start")))
 
-# ---------- ТЕКСТ ----------
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
     pend = STATE["pending"]
@@ -1062,7 +1051,6 @@ async def multi_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("\n".join(lines),
         reply_markup=kb(nav_btns("start")))
 
-# ---------- РОУТЕР ----------
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1236,13 +1224,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         return
 
-# ---------- MAIN ----------
 def main():
     app = Application.builder().token(config.TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.CONTACT, on_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling()
 
 if __name__ == "__main__":
