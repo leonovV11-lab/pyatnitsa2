@@ -464,37 +464,39 @@ async def _scan_best(exclude=None):
         ex_class = getattr(ex, "ccxt")
         exchange = ex_class({"enableRateLimit": True})
         
-        tickers = exchange.fetch_tickers()
+        # 1. Мгновенно получаем список всех пар на бирже
+        markets = exchange.load_markets()
         
-        candidates = []
-        for sym, t in tickers.items():
-            if not sym.endswith("/USDT"): continue
-            if exclude and sym in exclude: continue
-            
-            vol = t.get("quoteVolume", 0) or 0
-            change = abs(t.get("percentage", 0) or 0)
-            
-            if vol > 2000000 and change > 2.0:
-                candidates.append({
-                    "symbol": sym, 
-                    "vol": vol, 
-                    "change": change,
-                    "price": t.get("last", 0)
-                })
+        valid_symbols = []
+        for sym, m in markets.items():
+            if m.get("active") and m.get("spot") and m.get("quote") == "USDT":
+                if exclude and sym in exclude: continue
+                valid_symbols.append(sym)
                 
-        if not candidates:
+        if not valid_symbols:
             return None
             
-        candidates.sort(key=lambda x: x["vol"] * x["change"], reverse=True)
-        best = candidates[0]
+        # 2. Берем ТОП-40 пар для анализа (чтобы уложиться в 10-15 секунд)
+        symbols_to_scan = valid_symbols[:40]
         
-        return {
-            "symbol": best["symbol"],
-            "score": best["vol"] * best["change"],
-            "price": best["price"],
-            "atr_pct": best["change"] / 100.0,
-            "vol24": best["vol"],
-        }
+        # 3. Анализируем пачками по 10 (чтобы не забанили)
+        best = None
+        chunk_size = 10
+        
+        for i in range(0, len(symbols_to_scan), chunk_size):
+            chunk = symbols_to_scan[i:i + chunk_size]
+            tasks = [_score_pair(sym) for sym in chunk]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for r in results:
+                if isinstance(r, Exception) or r is None:
+                    continue
+                if best is None or r["score"] > best["score"]:
+                    best = r
+                    
+            await asyncio.sleep(0.2)
+            
+        return best
     except Exception as e:
         print("Ошибка сканирования:", e)
         return None
