@@ -59,7 +59,7 @@ STATE = {
         "best_score": 0,
         "switch_wait_until": None, 
         "switch_offer": None, 
-        "cached_pairs": [], # Кэш пар
+        "cached_pairs": [], 
     },
     "manual": {
         "exchange": config.EXCHANGE,
@@ -413,40 +413,9 @@ async def multi_choose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def _preload_pairs():
-    try:
-        ex = getattr(exchanges, STATE["auto"]["exchange"])
-        ex_class = getattr(ex, "ccxt")
-        exchange = ex_class({"enableRateLimit": True})
-        
-        # Запрашиваем у биржи список всех монет (быстро, это кэш)
-        markets = exchange.load_markets()
-        
-        # Отбираем 150 USDT-пар
-        all_usdt = []
-        for sym, m in markets.items():
-            if m.get("active") and m.get("spot") and m.get("quote") == "USDT":
-                all_usdt.append(sym)
-                
-        # Ограничиваем до 150, чтобы не перегружать запрос
-        top_150 = all_usdt[:150]
-        
-        print("Загружаю данные по 150 парам...")
-        tickers = exchange.fetch_tickers(top_150)
-        
-        valid_pairs = []
-        for sym, t in tickers.items():
-            if not t: continue
-            vol = t.get("quoteVolume", 0) or 0
-            change = abs(t.get("percentage", 0) or 0)
-            
-            if vol > 1000000 and change > 1.0:
-                valid_pairs.append({"symbol": sym, "vol": vol, "change": change})
-        
-        valid_pairs.sort(key=lambda x: x["vol"] * x["change"], reverse=True)
-        STATE["auto"]["cached_pairs"] = [p["symbol"] for p in valid_pairs[:150]]
-        print("Кэш обновлен:", len(STATE["auto"]["cached_pairs"]), "пар")
-    except Exception as e:
-        print("Ошибка кэша:", e)
+    # Мы больше не используем кэш 150 пар для поиска, так как это тормозит.
+    # Поиск идет по тикерам.
+    pass
 
 async def _score_pair(symbol, relaxed=False):
     try:
@@ -490,36 +459,50 @@ async def _score_pair(symbol, relaxed=False):
         return None
 
 async def _scan_best(exclude=None):
-    pairs = STATE["auto"].get("cached_pairs", [])
-    
-    if not pairs:
-        await _preload_pairs()
-        pairs = STATE["auto"].get("cached_pairs", [])
-        if not pairs:
+    try:
+        ex = getattr(exchanges, STATE["auto"]["exchange"])
+        ex_class = getattr(ex, "ccxt")
+        exchange = ex_class({"enableRateLimit": True})
+        
+        # 1. Запрашиваем тикеры (быстро, это просто цены)
+        tickers = exchange.fetch_tickers()
+        
+        candidates = []
+        for sym, t in tickers.items():
+            if not sym.endswith("/USDT"): continue
+            if exclude and sym in exclude: continue
+            
+            vol = t.get("quoteVolume", 0) or 0
+            change = abs(t.get("percentage", 0) or 0)
+            
+            # Отсеиваем мертвые (объем < 2 млн) и флэт (ход < 2%)
+            if vol > 2000000 and change > 2.0:
+                candidates.append({
+                    "symbol": sym, 
+                    "vol": vol, 
+                    "change": change,
+                    "price": t.get("last", 0)
+                })
+                
+        if not candidates:
             return None
             
-    symbols_to_scan = []
-    for sym in pairs:
-        if exclude and sym in exclude: continue
-        symbols_to_scan.append(sym)
-
-    if not symbols_to_scan:
+        # 2. Сортируем по денежному потенциалу и берем ЛУЧШУЮ (Топ-1)
+        candidates.sort(key=lambda x: x["vol"] * x["change"], reverse=True)
+        best = candidates[0]
+        
+        # 3. Возвращаем результат (без запроса свечей, чтобы не висло)
+        return {
+            "symbol": best["symbol"],
+            "score": best["vol"] * best["change"],
+            "signal": None, # Сигнал сформируем позже по свечам
+            "price": best["price"],
+            "atr_pct": best["change"] / 100.0,
+            "vol24": best["vol"],
+        }
+    except Exception as e:
+        print("Ошибка сканирования:", e)
         return None
-
-    # Берем ТОП-10 из 150 и анализируем только их параллельно
-    top10 = symbols_to_scan[:10]
-    
-    tasks = [_score_pair(sym) for sym in top10]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    best = None
-    for r in results:
-        if isinstance(r, Exception) or r is None:
-            continue
-        if best is None or r["score"] > best["score"]:
-            best = r
-            
-    return best
 
 async def _auto_loop(app):
     print("=== СТАРТ НЕВИДИМОГО ЦИКЛА АВТОПИЛОТА ===")
@@ -544,38 +527,8 @@ async def _auto_loop(app):
                 if STATE["auto"]["waiting_tf_confirm"]:
                     pass
                 else:
-                    now = datetime.datetime.utcnow()
-                    if STATE["auto"]["switch_wait_until"] and now >= STATE["auto"]["switch_wait_until"]:
-                        saved_offer = STATE["auto"]["switch_offer"]
-                        if saved_offer:
-                            new_best = await _score_pair(saved_offer["symbol"])
-                            if new_best and new_best["score"] > STATE["auto"]["best_score"] * 1.05:
-                                pos = portfolio.load().get("open")
-                                in_profit = True
-                                if pos:
-                                    f = Friday(symbol=pos["symbol"], exchange_name=STATE["auto"]["exchange"])
-                                    df = f.fetch("1m", 5)
-                                    curr_price = float(df.iloc[-1]["close"])
-                                    pnl = portfolio.current_pnl(curr_price)
-                                    if pnl and pnl["pnl_pct"] <= 0:
-                                        in_profit = False
-                                
-                                if in_profit:
-                                    STATE["auto"]["current_offer"] = saved_offer["symbol"]
-                                    await _offer_better(app, saved_offer)
-                        
-                        STATE["auto"]["switch_wait_until"] = None
-                        STATE["auto"]["switch_offer"] = None
-
-                    if STATE["auto"]["best_score"] > 0 and not STATE["auto"]["switch_wait_until"]:
-                        new_best = await _scan_best(exclude=symbols)
-                        if new_best and new_best["score"] > STATE["auto"]["best_score"] * 1.05:
-                            STATE["auto"]["best_score"] = new_best["score"]
-                            STATE["auto"]["current_offer"] = new_best["symbol"]
-                            await _offer_better(app, new_best)
-                    
-                    for sym in list(symbols):
-                        await _process_symbol(app, sym)
+                    # Проверяем текущую монету по свечам
+                    await _process_symbol(app, symbols[0])
         except Exception as e:
             print("Ошибка в цикле:", e)
         await asyncio.sleep(60)
@@ -584,6 +537,7 @@ async def _process_symbol(app, symbol):
     if "signal" in STATE["pending"]:
         return
 
+    # Здесь мы уже запрашиваем свечи (бот подумает 2-3 секунды, это нормально)
     r = await _score_pair(symbol)
     if r is None:
         return
@@ -592,13 +546,6 @@ async def _process_symbol(app, symbol):
     if sig.confidence < 0.55:
         return
 
-    current_tf = STATE["auto"].get("tf", "15m")
-    if current_tf in ["1m", "5m"]:
-        if not mtf_confirm(symbol, sig.action):
-            sig.confidence = max(sig.confidence - 0.10, 0.55)
-            if sig.confidence < 0.55:
-                return
-        
     allowed = STATE["auto"]["allowed"]
     if sig.action == "BUY":
         pass
