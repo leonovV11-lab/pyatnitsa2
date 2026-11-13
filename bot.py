@@ -353,7 +353,6 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb(nav_btns("start"))
     )
     
-    # Загружаем кэш (один раз)
     await _preload_pairs()
     
     if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
@@ -429,14 +428,10 @@ async def _preload_pairs():
             vol = t.get("quoteVolume", 0) or 0
             change = abs(t.get("percentage", 0) or 0)
             
-            # 1. Отсеиваем мертвые (объем < 1 млн) и флэт (ход < 1%)
             if vol > 1000000 and change > 1.0:
                 valid_pairs.append({"symbol": sym, "vol": vol, "change": change})
         
-        # 2. Сортируем по денежному потенциалу (Объем * Волатильность)
         valid_pairs.sort(key=lambda x: x["vol"] * x["change"], reverse=True)
-        
-        # 3. Сохраняем ТОП-150 в кэш
         STATE["auto"]["cached_pairs"] = [p["symbol"] for p in valid_pairs[:150]]
         print("Кэш обновлен:", len(STATE["auto"]["cached_pairs"]), "пар")
     except Exception as e:
@@ -500,10 +495,10 @@ async def _scan_best(exclude=None):
     if not symbols_to_scan:
         return None
 
-    # Берем ТОП-10 из 150 и анализируем только их
-    top10 = symbols_to_scan[:10]
+    # Берем всего ТОП-3 для анализа
+    top3 = symbols_to_scan[:3]
     
-    tasks = [_score_pair(sym) for sym in top10]
+    tasks = [_score_pair(sym) for sym in top3]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
     best = None
@@ -572,7 +567,7 @@ async def _auto_loop(app):
                         await _process_symbol(app, sym)
         except Exception as e:
             print("Ошибка в цикле:", e)
-        await asyncio.sleep(60)
+        await asyncio.sleep(15) # Пауза 15 секунд вместо 60
 
 async def _process_symbol(app, symbol):
     if "signal" in STATE["pending"]:
