@@ -418,13 +418,24 @@ async def _preload_pairs():
         ex_class = getattr(ex, "ccxt")
         exchange = ex_class({"enableRateLimit": True})
         
-        print("Запрашиваю все тикеры с биржи...")
-        tickers = exchange.fetch_tickers()
+        # Запрашиваем у биржи список всех монет (быстро, это кэш)
+        markets = exchange.load_markets()
+        
+        # Отбираем 150 USDT-пар
+        all_usdt = []
+        for sym, m in markets.items():
+            if m.get("active") and m.get("spot") and m.get("quote") == "USDT":
+                all_usdt.append(sym)
+                
+        # Ограничиваем до 150, чтобы не перегружать запрос
+        top_150 = all_usdt[:150]
+        
+        print("Загружаю данные по 150 парам...")
+        tickers = exchange.fetch_tickers(top_150)
         
         valid_pairs = []
         for sym, t in tickers.items():
-            if not sym.endswith("/USDT"): continue
-            
+            if not t: continue
             vol = t.get("quoteVolume", 0) or 0
             change = abs(t.get("percentage", 0) or 0)
             
@@ -495,10 +506,10 @@ async def _scan_best(exclude=None):
     if not symbols_to_scan:
         return None
 
-    # Берем всего ТОП-3 для анализа
-    top3 = symbols_to_scan[:3]
+    # Берем ТОП-10 из 150 и анализируем только их параллельно
+    top10 = symbols_to_scan[:10]
     
-    tasks = [_score_pair(sym) for sym in top3]
+    tasks = [_score_pair(sym) for sym in top10]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
     best = None
@@ -567,7 +578,7 @@ async def _auto_loop(app):
                         await _process_symbol(app, sym)
         except Exception as e:
             print("Ошибка в цикле:", e)
-        await asyncio.sleep(15) # Пауза 15 секунд вместо 60
+        await asyncio.sleep(60)
 
 async def _process_symbol(app, symbol):
     if "signal" in STATE["pending"]:
