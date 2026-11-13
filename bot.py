@@ -9,12 +9,8 @@ from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters,
 )
 
 import config
@@ -39,7 +35,7 @@ ANALYSIS_TF = "15m"
 ANALYSIS_LIMIT = 384
 FEE_MIN_TP = 3.0
 
-# ---------- ГЛОБАЛЬНОЕ СОСТОЯНИЕ ----------
+# ---------- СОСТОЯНИЕ ----------
 STATE = {
     "balance": 0.0,
     "daily_budget": 0.0,
@@ -48,34 +44,15 @@ STATE = {
     "loss_streak": 0,
     "sleep_until": None,
     "auto": {
-        "active": False,
-        "task": None,
-        "symbols": [],
-        "allowed": "BUY",
-        "tf": "15m",
-        "exchange": "bybit",
-        "waiting_tf_confirm": False,
-        "current_offer": None,
-        "best_score": 0,
-        "switch_wait_until": None, 
-        "switch_offer": None, 
+        "active": False, "task": None, "symbols": [], "allowed": "BUY",
+        "tf": "15m", "exchange": "bybit", "waiting_tf_confirm": False,
+        "current_offer": None, "best_score": 0,
+        "switch_wait_until": None, "switch_offer": None,
     },
-    "manual": {
-        "exchange": config.EXCHANGE,
-        "pairs": [],
-        "page": 0,
-        "symbol": None,
-        "tf": "15m",
-    },
+    "manual": {"exchange": config.EXCHANGE, "pairs": [], "page": 0, "symbol": None, "tf": "15m"},
     "pending": {},
     "panic": {"task": None, "active": False},
-    "demo": {
-        "active": False,
-        "symbol": None,
-        "buy_price": 0.0,
-        "amount": 0.0,
-        "action": "BUY",
-    },
+    "demo": {"active": False, "symbol": None, "buy_price": 0.0, "amount": 0.0, "action": "BUY"},
     "trailing": {"active": False, "task": None},
 }
 
@@ -87,9 +64,7 @@ def btn(text, data):
     return InlineKeyboardButton(text, callback_data=data)
 
 def nav_btns(back_data):
-    return [
-        [btn("⬅️ На шаг назад", back_data), btn("🏠 В меню", "start")]
-    ]
+    return [[btn("⬅️ На шаг назад", back_data), btn("🏠 В меню", "start")]]
 
 def is_sleeping():
     t = STATE["sleep_until"]
@@ -107,43 +82,31 @@ def sleep_left_min():
 def register_loss():
     STATE["loss_streak"] += 1
     if STATE["loss_streak"] >= LOSS_LIMIT:
-        STATE["sleep_until"] = (
-            datetime.datetime.utcnow()
-            + datetime.timedelta(minutes=SLEEP_MIN)
-        )
+        STATE["sleep_until"] = datetime.datetime.utcnow() + datetime.timedelta(minutes=SLEEP_MIN)
         STATE["loss_streak"] = 0
 
 def register_win():
     STATE["loss_streak"] = 0
 
 def calc_lot(price, sl_price, confidence):
-    if STATE["daily_budget"] > 0:
-        budget = STATE["daily_budget"]
-    else:
-        budget = STATE["balance"]
+    budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
     if budget <= 0:
         return 0.0
-    
     if confidence >= 0.85:
         risk_pct = 0.03
     elif confidence >= 0.75:
         risk_pct = 0.02
     else:
         risk_pct = 0.01
-        
-    risk_usdt = budget * risk_pct
     sl_pct = abs(price - sl_price) / price if price else 0
     if sl_pct <= 0:
         return 0.0
-        
-    lot_usdt = risk_usdt / sl_pct
-    return min(lot_usdt, budget)
+    return min((budget * risk_pct) / sl_pct, budget)
 
 def mtf_confirm(symbol, direction):
     try:
         f15 = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
-        df15 = f15.fetch("15m", 120)
-        df15 = f15.enrich(df15, "15m").dropna()
+        df15 = f15.enrich(f15.fetch("15m", 120), "15m").dropna()
         if len(df15) < 2:
             return True
         last = df15.iloc[-1]
@@ -161,7 +124,6 @@ def session_ok(multi_day):
     hour = datetime.datetime.utcnow().hour
     return 12 <= hour < 20
 
-# ---------- ГЕОЛОКАЦИЯ ----------
 def city_to_tz(city):
     try:
         geo = Nominatim(user_agent="friday_bot")
@@ -169,8 +131,7 @@ def city_to_tz(city):
         if not loc:
             return "UTC"
         tf = TimezoneFinder()
-        tz_name = tf.timezone_at(lat=loc.latitude, lng=loc.longitude)
-        return tz_name or "UTC"
+        return tf.timezone_at(lat=loc.latitude, lng=loc.longitude) or "UTC"
     except Exception:
         return "UTC"
 
@@ -192,14 +153,12 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ]
     txt = "Пятница на связи."
     if is_sleeping():
-        txt = txt + "\n😴 Пауза, осталось " + str(sleep_left_min()) + " мин"
-    
+        txt += "\n😴 Пауза, осталось " + str(sleep_left_min()) + " мин"
     if update.message:
         await update.message.reply_text(txt, reply_markup=kb(rows))
     else:
         await update.callback_query.edit_message_text(txt, reply_markup=kb(rows))
 
-# ---------- КОМАНДА STOP ----------
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["active"] = False
     STATE["trailing"]["active"] = False
@@ -210,101 +169,53 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["current_offer"] = None
     STATE["auto"]["waiting_tf_confirm"] = False
     STATE["auto"]["switch_wait_until"] = None
-    
-    rows = [[btn("🏠 В меню", "start")]]
-    await update.message.reply_text(
-        "🛑 Остановлено. Что дальше?",
-        reply_markup=kb(rows)
-    )
+    await update.message.reply_text("🛑 Остановлено.", reply_markup=kb([[btn("🏠 В меню", "start")]]))
 
-# ---------- ДЕМО-РЕЖИМ ----------
+# ---------- ДЕМО ----------
 async def demo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rows = [
-        [btn("🚀 Найти монету", "demo_scan")],
-        nav_btns("start")[0]
-    ]
-    txt = "🎮 Демо-режим.\nЗдесь ты можешь проверить, как работает стратегия.\nНажми кнопку, чтобы получить сигнал."
-    await update.callback_query.edit_message_text(txt, reply_markup=kb(rows))
+    rows = [[btn("🚀 Найти монету", "demo_scan")], nav_btns("start")[0]]
+    await update.callback_query.edit_message_text("🎮 Демо-режим.\nНажми кнопку.", reply_markup=kb(rows))
 
 async def demo_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.edit_message_text("🔍 Сканирую рынок...")
-    
+    await update.callback_query.edit_message_text("🔍 Сканирую...")
     best = await _scan_best()
     if not best:
-        await update.callback_query.edit_message_text(
-            "Не нашёл подходящих монет. Попробуй позже.",
-            reply_markup=kb(nav_btns("demo"))
-        )
+        await update.callback_query.edit_message_text("Не нашёл.", reply_markup=kb(nav_btns("demo")))
         return
-        
     r = await _score_pair(best["symbol"])
     if not r:
-        await update.callback_query.edit_message_text(
-            "Не удалось проанализировать монету. Попробуй позже.",
-            reply_markup=kb(nav_btns("demo"))
-        )
+        await update.callback_query.edit_message_text("Ошибка анализа.", reply_markup=kb(nav_btns("demo")))
         return
-        
     sig = r["signal"]
-    
     STATE["demo"]["symbol"] = best["symbol"]
     STATE["demo"]["buy_price"] = sig.price
     STATE["demo"]["action"] = sig.action
-    
-    text = (
-        "🎮 ДЕМО-СИГНАЛ\n\n"
-        "Монета: " + best["symbol"] + "\n"
-        "Сигнал: " + sig.action + "\n"
-        "Цена: " + fmt_price(sig.price) + "\n"
-        "Уверенность: " + str(int(sig.confidence * 100)) + "%"
-    )
-    
+    text = ("🎮 ДЕМО\n\n" + best["symbol"] + "\nСигнал: " + sig.action + "\nЦена: " + fmt_price(sig.price) + "\nУверенность: " + str(int(sig.confidence * 100)) + "%")
     if sig.action == "BUY":
-        rows = [
-            [btn("✅ Купил", "demo_buy")],
-            [btn("❌ Пропустил", "demo_skip")],
-            nav_btns("demo")[0]
-        ]
+        rows = [[btn("✅ Купил", "demo_buy")], [btn("❌ Пропустил", "demo_skip")], nav_btns("demo")[0]]
     else:
-        rows = [
-            [btn("✅ Продал", "demo_sell")],
-            [btn("❌ Пропустил", "demo_skip")],
-            nav_btns("demo")[0]
-        ]
-        
+        rows = [[btn("✅ Продал", "demo_sell")], [btn("❌ Пропустил", "demo_skip")], nav_btns("demo")[0]]
     await update.callback_query.edit_message_text(text, reply_markup=kb(rows))
 
 async def demo_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.edit_message_text(
-        "Ок, пропустил. Возвращаемся в меню Демо.",
-        reply_markup=kb([[btn("🏠 В меню Демо", "demo")]])
-    )
+    await update.callback_query.edit_message_text("Ок.", reply_markup=kb([[btn("🏠 В меню Демо", "demo")]]))
 
 async def demo_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["demo_amount"] = True
-    await update.callback_query.edit_message_text(
-        "Сколько USDT ты купил по " + STATE["demo"]["symbol"] + "? (введи число)",
-        reply_markup=kb(nav_btns("demo"))
-    )
+    await update.callback_query.edit_message_text("Сколько купил?", reply_markup=kb(nav_btns("demo")))
 
 async def demo_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["demo_amount"] = True
-    await update.callback_query.edit_message_text(
-        "Сколько USDT ты продал по " + STATE["demo"]["symbol"] + "? (введи число)",
-        reply_markup=kb(nav_btns("demo"))
-    )
+    await update.callback_query.edit_message_text("Сколько продал?", reply_markup=kb(nav_btns("demo")))
 
 # ---------- АВТОПИЛОТ ----------
 async def auto_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["auto"] = "balance"
-    await update.callback_query.edit_message_text(
-        "Сколько у тебя сейчас на балансе? (USDT)",
-        reply_markup=kb(nav_btns("start"))
-    )
+    await update.callback_query.edit_message_text("Баланс (USDT)?", reply_markup=kb(nav_btns("start")))
 
 async def auto_after_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["auto"] = "budget"
-    msg = "Понял, баланс " + str(STATE["balance"]) + " USDT.\nСколько готов потратить сегодня? (USDT)"
+    msg = "Баланс " + str(STATE["balance"]) + ".\nБюджет на день?"
     if update.message:
         await update.message.reply_text(msg, reply_markup=kb(nav_btns("auto_start")))
     else:
@@ -312,7 +223,7 @@ async def auto_after_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def auto_after_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["auto"] = "city"
-    msg = "Понял, работаем с " + str(STATE["daily_budget"]) + " USDT.\nВ каком ты городе?"
+    msg = "Бюджет " + str(STATE["daily_budget"]) + ".\nГород?"
     if update.message:
         await update.message.reply_text(msg, reply_markup=kb(nav_btns("auto_retry_balance")))
     else:
@@ -321,10 +232,7 @@ async def auto_after_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def auto_after_city(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["auto"] = "check_time"
     local = local_now().strftime("%H:%M")
-    msg = (
-        "Понял, " + STATE["city"] + ".\n"
-        "Сколько сейчас у тебя времени по часам? (например " + local + ")"
-    )
+    msg = "Город: " + STATE["city"] + ".\nВремя сейчас? (например " + local + ")"
     if update.message:
         await update.message.reply_text(msg, reply_markup=kb(nav_btns("auto_retry_budget")))
     else:
@@ -332,7 +240,7 @@ async def auto_after_city(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def auto_after_check_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["auto"] = "work_time"
-    msg = "Подтверждено! Ты находишься в " + STATE["city"] + ".\nСколько ты будешь работать? (например '2 часа' или '2 дня')"
+    msg = "Ок.\nСколько работаем? (например '2 часа')"
     if update.message:
         await update.message.reply_text(msg, reply_markup=kb(nav_btns("auto_retry_city")))
     else:
@@ -343,7 +251,7 @@ async def auto_ask_exchange(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for key, name in exchanges.EXCHANGES.items():
         rows.append([btn(name, "auto_ex_set_" + key)])
     rows.append(nav_btns("auto_retry_check_time")[0])
-    msg = "Выбери биржу для торговли:"
+    msg = "Выбери биржу:"
     if update.message:
         await update.message.reply_text(msg, reply_markup=kb(rows))
     else:
@@ -352,14 +260,8 @@ async def auto_ask_exchange(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     key = update.callback_query.data.replace("auto_ex_set_", "")
     STATE["auto"]["exchange"] = key
-    
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
-    
-    await update.callback_query.edit_message_text(
-        "Биржа: " + exchanges.EXCHANGES.get(key, key) + ".\nЗапускаю поиск...",
-        reply_markup=kb(nav_btns("start"))
-    )
-    
+    await update.callback_query.edit_message_text("Биржа: " + exchanges.EXCHANGES.get(key, key) + ".\nПоиск...", reply_markup=kb(nav_btns("start")))
     if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
         STATE["auto"]["active"] = True
         STATE["auto"]["symbols"] = []
@@ -370,30 +272,20 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         STATE["auto"]["task"] = asyncio.create_task(_auto_loop(ctx.application))
 
 async def tf_bad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rows = [
-        [btn("1m", "auto_tf_1m"), btn("15m", "auto_tf_15m"), btn("4h", "auto_tf_4h")],
-        [btn("✏️ Своё время", "auto_tf_custom")],
-        nav_btns("start")[0]
-    ]
-    await update.callback_query.edit_message_text(
-        "Выбери ТФ:", reply_markup=kb(rows)
-    )
+    rows = [[btn("1m", "auto_tf_1m"), btn("15m", "auto_tf_15m"), btn("4h", "auto_tf_4h")],
+            [btn("✏️ Своё время", "auto_tf_custom")], nav_btns("start")[0]]
+    await update.callback_query.edit_message_text("Выбери ТФ:", reply_markup=kb(rows))
 
 async def auto_tf_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = update.callback_query.data
     tf = data.replace("auto_tf_", "")
     if tf == "custom":
         STATE["pending"]["auto"] = "tf_custom"
-        await update.callback_query.edit_message_text(
-            "Впиши ТФ (например 5m, 30m, 1h):",
-            reply_markup=kb(nav_btns("tf_bad"))
-        )
+        await update.callback_query.edit_message_text("Впиши ТФ:", reply_markup=kb(nav_btns("tf_bad")))
         return
     STATE["auto"]["tf"] = tf
     STATE["auto"]["waiting_tf_confirm"] = False
-    msg = "Ок, работаем " + tf + ". Ждём сигналов."
-    await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("start")))
-    
+    await update.callback_query.edit_message_text("Ок, " + tf + ".", reply_markup=kb(nav_btns("start")))
     if STATE["auto"]["current_offer"]:
         STATE["auto"]["symbols"] = [STATE["auto"]["current_offer"]]
         STATE["auto"]["current_offer"] = None
@@ -401,108 +293,72 @@ async def auto_tf_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def hascoins_no(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["allowed"] = "BUY"
-    await update.callback_query.edit_message_text(
-        "Понял. Ждём только BUY.", reply_markup=kb(nav_btns("start"))
-    )
+    await update.callback_query.edit_message_text("Ждём только BUY.", reply_markup=kb(nav_btns("start")))
 
 async def hascoins_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["allowed"] = "BUYSELL"
-    await update.callback_query.edit_message_text(
-        "Понял. Ждём BUY (докупить) или SELL (не потерять).", reply_markup=kb(nav_btns("start"))
-    )
+    await update.callback_query.edit_message_text("Ждём BUY или SELL.", reply_markup=kb(nav_btns("start")))
 
 async def multi_choose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["auto"] = "multi_count"
-    await update.callback_query.edit_message_text(
-        "Сколько монет торгуем? (2–10)", reply_markup=kb(nav_btns("start"))
-    )
+    await update.callback_query.edit_message_text("Сколько монет? (2–10)", reply_markup=kb(nav_btns("start")))
 
 async def _score_pair(symbol, relaxed=False):
     try:
         f = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
         tf = STATE["auto"].get("tf", "15m")
-        
-        df = f.fetch(tf, 100)
-        df = f.enrich(df, tf).dropna().reset_index(drop=True)
+        df = f.enrich(f.fetch(tf, 100), tf).dropna().reset_index(drop=True)
         if len(df) < 20:
             return None
-        
         last = df.iloc[-1]
         price = float(last["close"])
-        
         vol24 = float(df["volume"].tail(96).sum() * price)
         atr_pct = float(last["atr"]) / price if price else 0
-        
         if vol24 < 100000 or atr_pct < 0.005:
             return None
-            
         sig = f.analyze_filtered(tf, tp_mult=3.0)
         base_conf = sig.confidence
-        
-        if atr_pct > 0.025: base_conf = max(base_conf, 0.90)
-        elif atr_pct > 0.02: base_conf = max(base_conf, 0.80)
-        elif atr_pct > 0.015: base_conf = max(base_conf, 0.70)
-        elif atr_pct > 0.01: base_conf = max(base_conf, 0.65)
-        
+        if atr_pct > 0.025:
+            base_conf = max(base_conf, 0.90)
+        elif atr_pct > 0.02:
+            base_conf = max(base_conf, 0.80)
+        elif atr_pct > 0.015:
+            base_conf = max(base_conf, 0.70)
+        elif atr_pct > 0.01:
+            base_conf = max(base_conf, 0.65)
         sig.confidence = base_conf
-        score = vol24 * atr_pct
-        
-        return {
-            "symbol": symbol,
-            "score": score,
-            "signal": sig,
-            "price": price,
-            "atr_pct": atr_pct,
-            "vol24": vol24,
-        }
+        return {"symbol": symbol, "score": vol24 * atr_pct, "signal": sig,
+                "price": price, "atr_pct": atr_pct, "vol24": vol24}
     except Exception:
         return None
 
 async def _scan_best(exclude=None):
     try:
         ex = getattr(exchanges, STATE["auto"]["exchange"])
-        ex_class = getattr(ex, "ccxt")
-        exchange = ex_class({"enableRateLimit": True})
-        
-        # 1. Мгновенно получаем список всех пар на бирже
+        exchange = getattr(ex, "ccxt")({"enableRateLimit": True})
         markets = exchange.load_markets()
-        
-        valid_symbols = []
-        for sym, m in markets.items():
-            if m.get("active") and m.get("spot") and m.get("quote") == "USDT":
-                if exclude and sym in exclude: continue
-                valid_symbols.append(sym)
-                
-        if not valid_symbols:
+        valid = [s for s, m in markets.items()
+                 if m.get("active") and m.get("spot") and m.get("quote") == "USDT"
+                 and (not exclude or s not in exclude)]
+        if not valid:
             return None
-            
-        # 2. Берем ТОП-40 пар для анализа (чтобы уложиться в 10-15 секунд)
-        symbols_to_scan = valid_symbols[:40]
-        
-        # 3. Анализируем пачками по 10 (чтобы не забанили)
+        top = valid[:40]
         best = None
-        chunk_size = 10
-        
-        for i in range(0, len(symbols_to_scan), chunk_size):
-            chunk = symbols_to_scan[i:i + chunk_size]
-            tasks = [_score_pair(sym) for sym in chunk]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
+        for i in range(0, len(top), 10):
+            chunk = top[i:i + 10]
+            results = await asyncio.gather(*[_score_pair(s) for s in chunk], return_exceptions=True)
             for r in results:
                 if isinstance(r, Exception) or r is None:
                     continue
                 if best is None or r["score"] > best["score"]:
                     best = r
-                    
             await asyncio.sleep(0.2)
-            
         return best
     except Exception as e:
-        print("Ошибка сканирования:", e)
+        print("Ошибка скана:", e)
         return None
 
 async def _auto_loop(app):
-    print("=== СТАРТ ЦИКЛА АВТОПИЛОТА ===")
     chat_id = app.bot_data.get("chat_id", 0)
     while STATE["auto"]["active"]:
         if is_sleeping():
@@ -520,27 +376,21 @@ async def _auto_loop(app):
                     STATE["auto"]["best_score"] = best["score"]
                     STATE["auto"]["waiting_tf_confirm"] = True
                     await _offer_found(app, best)
-            else:
-                if STATE["auto"]["waiting_tf_confirm"]:
-                    pass
-                else:
-                    await _process_symbol(app, symbols[0])
+            elif not STATE["auto"]["waiting_tf_confirm"]:
+                await _process_symbol(app, symbols[0])
         except Exception as e:
-            print("Ошибка в цикле:", e)
+            print("Ошибка цикла:", e)
         await asyncio.sleep(60)
 
 async def _process_symbol(app, symbol):
     if "signal" in STATE["pending"]:
         return
-
     r = await _score_pair(symbol)
     if r is None:
         return
     sig = r["signal"]
-    
     if sig.confidence < 0.55:
         return
-
     allowed = STATE["auto"]["allowed"]
     if sig.action == "BUY":
         pass
@@ -548,114 +398,60 @@ async def _process_symbol(app, symbol):
         pass
     else:
         return
-        
     lot = calc_lot(sig.price, sig.stop_loss, sig.confidence)
     if lot <= 0:
         return
-    
-    total_fee_pct = 0.002 
-    move_to_tp_pct = abs(sig.take_profit - sig.price) / sig.price
-    net_profit_pct = (move_to_tp_pct - total_fee_pct) * 100
-    
-    if net_profit_pct < 0.2:
+    net = (abs(sig.take_profit - sig.price) / sig.price - 0.002) * 100
+    if net < 0.2:
         return
-
-    STATE["pending"]["signal"] = {
-        "action": sig.action,
-        "symbol": symbol,
-        "price": sig.price,
-        "lot": lot
-    }
-
-    text = (
-        "🎯 " + symbol + "\n"
-        "Сигнал: " + sig.action + "\n"
-        "Цена: " + fmt_price(sig.price) + "\n"
-        "Уверенность: " + str(int(sig.confidence * 100)) + "%\n"
-        "Рекомендуемый лот: " + str(round(lot, 2)) + " USDT\n"
-        "Стоп: " + fmt_price(sig.stop_loss) + "\n"
-        "Тейк: " + fmt_price(sig.take_profit) + "\n"
-        "Чистая прибыль (с учетом комиссии): ~" + str(round(net_profit_pct, 2)) + "%"
-    )
-    
+    STATE["pending"]["signal"] = {"action": sig.action, "symbol": symbol, "price": sig.price, "lot": lot}
+    text = ("🎯 " + symbol + "\nСигнал: " + sig.action + "\nЦена: " + fmt_price(sig.price) +
+            "\nУверенность: " + str(int(sig.confidence * 100)) + "%\nЛот: " + str(round(lot, 2)) +
+            " USDT\nСтоп: " + fmt_price(sig.stop_loss) + "\nТейк: " + fmt_price(sig.take_profit) +
+            "\nЧистая прибыль: ~" + str(round(net, 2)) + "%")
     if sig.action == "BUY":
-        rows = [
-            [btn("✅ Купил по сигналу", "sig_buy_signal")],
-            [btn("✏️ Купил на свою сумму", "sig_buy_custom")],
-            [btn("❌ Пропустил", "sig_skipped")],
-            [btn("🛑 ОСТАНОВИТЬ СИГНАЛЫ", "auto_stop_signals")],
-            nav_btns("start")[0]
-        ]
+        rows = [[btn("✅ Купил", "sig_buy_signal")], [btn("✏️ Своя сумма", "sig_buy_custom")],
+                [btn("❌ Пропустил", "sig_skipped")], [btn("🛑 СТОП", "auto_stop_signals")],
+                nav_btns("start")[0]]
     else:
-        rows = [
-            [btn("✅ Продал по сигналу", "sig_sell_signal")],
-            [btn("✏️ Продал на свою сумму", "sig_sell_custom")],
-            [btn("❌ Пропустил", "sig_skipped")],
-            [btn("🛑 ОСТАНОВИТЬ СИГНАЛЫ", "auto_stop_signals")],
-            nav_btns("start")[0]
-        ]
-        
-    chat_id = app.bot_data.get("chat_id", 0)
+        rows = [[btn("✅ Продал", "sig_sell_signal")], [btn("✏️ Своя сумма", "sig_sell_custom")],
+                [btn("❌ Пропустил", "sig_skipped")], [btn("🛑 СТОП", "auto_stop_signals")],
+                nav_btns("start")[0]]
     if chat_id:
         await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
 
-# ---------- ТРЕЙЛИНГ И ПРИБЫЛЬ ----------
 async def _trailing_loop(app, symbol, entry_price, side):
     chat_id = app.bot_data.get("chat_id", 0)
     best_price = entry_price
-    be_activated = False
-    
+    be = False
     while STATE["trailing"]["active"]:
         await asyncio.sleep(30)
         try:
             f = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
-            df = f.fetch("1m", 10)
-            price = float(df.iloc[-1]["close"])
-            
+            price = float(f.fetch("1m", 10).iloc[-1]["close"])
             if side == "BUY":
-                if price > best_price:
-                    best_price = price
-                
-                profit_pct = (best_price - entry_price) / entry_price
-                if profit_pct >= 0.015 and not be_activated:
-                    be_activated = True
+                best_price = max(best_price, price)
+                p = (best_price - entry_price) / entry_price
+                if p >= 0.015 and not be:
+                    be = True
                     if chat_id:
-                        await app.bot.send_message(
-                            chat_id=chat_id, 
-                            text="📈 " + symbol + " вырос на " + str(round(profit_pct*100, 1)) + "%! Стоп передвинут в безубыток."
-                        )
-                    break 
+                        await app.bot.send_message(chat_id=chat_id,
+                            text="📈 " + symbol + " +" + str(round(p * 100, 1)) + "%! Стоп в безубыток.")
+                    break
         except Exception:
             pass
 
 async def _offer_found(app, best):
-    text = (
-        "Нашёл монету: " + best["symbol"] + "\n"
-        "Потенциал: " + str(round(best["atr_pct"] * 100, 2)) + "% ATR\n"
-        "Будем работать по времени: 15 минут. Устраивает?"
-    )
-    rows = [
-        [btn("✅ Да, устраивает", "tf_ok_15m")],
-        [btn("❌ Нет, не устраивает", "tf_bad")],
-        nav_btns("start")[0]
-    ]
-    chat_id = app.bot_data.get("chat_id", 0)
+    text = ("Нашёл: " + best["symbol"] + "\nПотенциал: " + str(round(best["atr_pct"] * 100, 2)) +
+            "% ATR\n15 минут. Ок?")
+    rows = [[btn("✅ Да", "tf_ok_15m")], [btn("❌ Нет", "tf_bad")], nav_btns("start")[0]]
     if chat_id:
         await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
 
 async def _offer_better(app, best):
-    text = (
-        "🔥 В фоне нашёл монету лучше на 5%!\n"
-        "Монета: " + best["symbol"] + "\n"
-        "Потенциал: " + str(round(best["atr_pct"] * 100, 2)) + "% ATR\n"
-        "Переключаемся на неё?"
-    )
-    rows = [
-        [btn("✅ Да, переключаемся", "switch_yes")],
-        [btn("❌ Нет, остаёмся", "switch_no")],
-        nav_btns("start")[0]
-    ]
-    chat_id = app.bot_data.get("chat_id", 0)
+    text = ("🔥 Лучше на 5%: " + best["symbol"] + "\nПотенциал: " +
+            str(round(best["atr_pct"] * 100, 2)) + "% ATR")
+    rows = [[btn("✅ Да", "switch_yes")], [btn("❌ Нет", "switch_no")], nav_btns("start")[0]]
     if chat_id:
         await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
 
@@ -665,125 +461,92 @@ async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         STATE["auto"]["current_offer"] = None
         STATE["auto"]["switch_wait_until"] = None
         STATE["auto"]["switch_offer"] = None
-        await update.callback_query.edit_message_text(
-            "Переключился на " + STATE["auto"]["symbols"][0] + ". Ждём сигналов.",
-            reply_markup=kb(nav_btns("start"))
-        )
+        await update.callback_query.edit_message_text("Переключился на " + STATE["auto"]["symbols"][0],
+            reply_markup=kb(nav_btns("start")))
 
 async def switch_no(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if STATE["auto"]["current_offer"]:
         STATE["auto"]["switch_offer"] = {"symbol": STATE["auto"]["current_offer"]}
         STATE["auto"]["switch_wait_until"] = datetime.datetime.utcnow() + datetime.timedelta(minutes=30)
-    
     STATE["auto"]["current_offer"] = None
-    await update.callback_query.edit_message_text(
-        "Ок, остаемся на текущей. Вернусь к этому вопросу через 30 минут, если обстановка не изменится.", 
-        reply_markup=kb(nav_btns("start"))
-    )
+    await update.callback_query.edit_message_text("Ок, вернусь через 30 мин.",
+        reply_markup=kb(nav_btns("start")))
 
 async def tf_ok_15m(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["tf"] = "15m"
     STATE["auto"]["waiting_tf_confirm"] = False
-    
     chat_id = update.callback_query.message.chat_id
-    await ctx.bot.send_message(chat_id=chat_id, text="Ок, работаем 15m. Ждём сигналов.")
-    
+    await ctx.bot.send_message(chat_id=chat_id, text="Ок, 15m. Ждём.")
     await update.callback_query.delete_message()
-    
     if STATE["auto"]["current_offer"]:
         STATE["auto"]["symbols"] = [STATE["auto"]["current_offer"]]
         STATE["auto"]["current_offer"] = None
         await _ask_hascoins(update, ctx)
 
 async def _ask_hascoins(update, ctx):
-    rows = [
-        [btn("Нет, монеты нет", "hascoins_no")],
-        [btn("Да, есть", "hascoins_yes")],
-        nav_btns("start")[0]
-    ]
-    text = "У тебя уже есть эта монета?"
-    
+    rows = [[btn("Нет", "hascoins_no")], [btn("Да", "hascoins_yes")], nav_btns("start")[0]]
     chat_id = update.callback_query.message.chat_id
-    await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
+    await ctx.bot.send_message(chat_id=chat_id, text="У тебя есть эта монета?", reply_markup=kb(rows))
 
-# ---------- ОБРАБОТКА СИГНАЛОВ (КУПИЛ/ПРОДАЛ/ПРОПУСТИЛ) ----------
 async def sig_skipped(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if "signal" in STATE["pending"]:
         del STATE["pending"]["signal"]
-    await update.callback_query.edit_message_text(
-        "Ок, пропустил. Ждём следующий сигнал.", reply_markup=kb(nav_btns("start"))
-    )
+    await update.callback_query.edit_message_text("Ок, пропустил.", reply_markup=kb(nav_btns("start")))
 
 async def sig_buy_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sig = STATE["pending"].get("signal")
-    if not sig: 
-        await update.callback_query.answer("Сигнал устарел или уже обработан.", show_alert=True)
+    if not sig:
+        await update.callback_query.answer("Устарел.", show_alert=True)
         return
     lot = sig["lot"]
     price = sig["price"]
     qty = lot / price if price else 0
-    
     portfolio.open_position(sig["symbol"], "BUY", price, qty, source="signal")
-    
     STATE["trailing"]["active"] = True
     if STATE["trailing"]["task"] is None or STATE["trailing"]["task"].done():
-        STATE["trailing"]["task"] = asyncio.create_task(_trailing_loop(ctx.application, sig["symbol"], price, "BUY"))
-    
+        STATE["trailing"]["task"] = asyncio.create_task(
+            _trailing_loop(ctx.application, sig["symbol"], price, "BUY"))
     del STATE["pending"]["signal"]
-    rows = [[btn("🏠 В меню", "start")]]
-    await update.callback_query.edit_message_text(
-        "Записал: купил по сигналу на " + str(round(lot, 2)) + " USDT.\nЖдём сигнал SELL.",
-        reply_markup=kb(rows)
-    )
+    await update.callback_query.edit_message_text("Купил на " + str(round(lot, 2)) + " USDT.",
+        reply_markup=kb([[btn("🏠 В меню", "start")]]))
 
 async def sig_buy_custom(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sig = STATE["pending"].get("signal")
-    if not sig: return
+    if not sig:
+        return
     STATE["pending"]["wait_custom_amount"] = {"action": "BUY", "symbol": sig["symbol"], "price": sig["price"]}
-    await update.callback_query.edit_message_text(
-        "Введи сумму в USDT, на которую купил " + sig["symbol"] + ":",
-        reply_markup=kb(nav_btns("start"))
-    )
+    await update.callback_query.edit_message_text("Сумма покупки (USDT):", reply_markup=kb(nav_btns("start")))
 
 async def sig_sell_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sig = STATE["pending"].get("signal")
-    if not sig: 
-        await update.callback_query.answer("Сигнал устарел.", show_alert=True)
+    if not sig:
+        await update.callback_query.answer("Устарел.", show_alert=True)
         return
     pos = portfolio.load().get("open")
     if not pos:
-        await update.callback_query.edit_message_text("Нет открытой позиции для продажи.", reply_markup=kb(nav_btns("start")))
+        await update.callback_query.edit_message_text("Нет позиции.", reply_markup=kb(nav_btns("start")))
         return
-    
-    qty = pos["qty"]
-    trade = portfolio.close_position(sig["price"], qty)
+    trade = portfolio.close_position(sig["price"], pos["qty"])
     STATE["trailing"]["active"] = False
-    
     del STATE["pending"]["signal"]
     if "error" in trade:
-        await update.callback_query.edit_message_text("Ошибка: " + trade["error"], reply_markup=kb(nav_btns("start")))
+        await update.callback_query.edit_message_text("Ошибка: " + trade["error"],
+            reply_markup=kb(nav_btns("start")))
         return
-        
     if trade["pnl_pct"] < 0:
         register_loss()
     else:
         register_win()
-        
-    rows = [[btn("🏠 В меню", "start")]]
-    msg = (
-        "Записал продажу (всё).\n"
-        "Твоя прибыль: " + str(round(trade["pnl_pct"], 2)) + "% (" + str(round(trade["pnl_abs"], 2)) + " USDT)"
-    )
-    await update.callback_query.edit_message_text(msg, reply_markup=kb(rows))
+    msg = ("Продал.\nPnL: " + str(round(trade["pnl_pct"], 2)) + "% (" +
+           str(round(trade["pnl_abs"], 2)) + " USDT)")
+    await update.callback_query.edit_message_text(msg, reply_markup=kb([[btn("🏠 В меню", "start")]]))
 
 async def sig_sell_custom(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sig = STATE["pending"].get("signal")
-    if not sig: return
+    if not sig:
+        return
     STATE["pending"]["wait_custom_amount"] = {"action": "SELL", "symbol": sig["symbol"], "price": sig["price"]}
-    await update.callback_query.edit_message_text(
-        "Введи сумму в USDT, на которую продал " + sig["symbol"] + ":",
-        reply_markup=kb(nav_btns("start"))
-    )
+    await update.callback_query.edit_message_text("Сумма продажи (USDT):", reply_markup=kb(nav_btns("start")))
 
 # ---------- ПАНИКА ----------
 async def _panic_loop(app, symbol):
@@ -791,8 +554,7 @@ async def _panic_loop(app, symbol):
     while STATE["panic"]["active"]:
         try:
             f = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
-            df = f.fetch("1m", 60)
-            df = f.enrich(df, "1m").dropna().reset_index(drop=True)
+            df = f.enrich(f.fetch("1m", 60), "1m").dropna().reset_index(drop=True)
             if len(df) < 5:
                 await asyncio.sleep(PANIC_INTERVAL)
                 continue
@@ -803,20 +565,15 @@ async def _panic_loop(app, symbol):
                 peak = pnl.get("peak", pnl["entry"])
                 drop = (peak - price) / peak if peak else 0
                 if pnl["side"] == "BUY" and drop >= PANIC_DROP:
-                    bearish = (
-                        last["ema_fast"] < last["ema_slow"]
-                        and last["macd_hist"] < 0
-                        and last["close"] < last["bb_lower"]
-                    )
+                    bearish = (last["ema_fast"] < last["ema_slow"]
+                               and last["macd_hist"] < 0
+                               and last["close"] < last["bb_lower"])
                     if bearish:
-                        rows = [[btn("🔴 ПРОДАЛ", "panic_sold")]]
                         chat_id = app.bot_data.get("chat_id", 0)
                         if chat_id:
-                            await app.bot.send_message(
-                                chat_id=chat_id,
-                                text="🔴 ЗАКРЫВАЙ! ЗАКРЫВАЙ! ЗАКРЫВАЙ!",
-                                reply_markup=kb(rows),
-                            )
+                            await app.bot.send_message(chat_id=chat_id,
+                                text="🔴 ЗАКРЫВАЙ!",
+                                reply_markup=kb([[btn("🔴 ПРОДАЛ", "panic_sold")]]))
         except Exception:
             pass
         await asyncio.sleep(PANIC_INTERVAL)
@@ -832,7 +589,7 @@ async def panic_sold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 register_loss()
             else:
                 register_win()
-    await update.callback_query.edit_message_text("Позиция закрыта.", reply_markup=kb(nav_btns("start")))
+    await update.callback_query.edit_message_text("Закрыто.", reply_markup=kb(nav_btns("start")))
 
 # ---------- РУЧНОЙ РЕЖИМ ----------
 async def man_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -840,37 +597,30 @@ async def man_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [btn("🏦 " + exchanges.EXCHANGES.get(STATE["manual"]["exchange"], "биржа"), "man_ex")],
         [btn("📈 Пары", "man_pairs")],
         [btn("🔍 Поиск пары", "man_search")],
-        nav_btns("start")[0]
+        nav_btns("start")[0],
     ]
-    await update.callback_query.edit_message_text(
-        "Ручной режим. Выбери действие:", reply_markup=kb(rows)
-    )
+    await update.callback_query.edit_message_text("Ручной режим:", reply_markup=kb(rows))
 
 async def man_ex(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rows = []
-    for key, name in exchanges.EXCHANGES.items():
-        rows.append([btn(name, "man_ex_set_" + key)])
+    rows = [[btn(name, "man_ex_set_" + key)] for key, name in exchanges.EXCHANGES.items()]
     rows.append(nav_btns("man_menu")[0])
-    await update.callback_query.edit_message_text(
-        "Выбери биржу:", reply_markup=kb(rows)
-    )
+    await update.callback_query.edit_message_text("Биржа:", reply_markup=kb(rows))
 
 async def man_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    key = update.callback_query.data.replace("man_ex_set_", "")
-    STATE["manual"]["exchange"] = key
+    STATE["manual"]["exchange"] = update.callback_query.data.replace("man_ex_set_", "")
     STATE["manual"]["pairs"] = []
     STATE["manual"]["page"] = 0
     await man_menu(update, ctx)
 
 async def man_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not STATE["manual"]["pairs"]:
-        await update.callback_query.edit_message_text("Загружаю пары...")
+        await update.callback_query.edit_message_text("Загружаю...")
         try:
             STATE["manual"]["pairs"] = exchanges.load_all_pairs(
-                STATE["manual"]["exchange"], quote="USDT", max_pairs=500
-            )
+                STATE["manual"]["exchange"], quote="USDT", max_pairs=500)
         except Exception as e:
-            await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("man_menu")))
+            await update.callback_query.edit_message_text("Ошибка: " + str(e),
+                reply_markup=kb(nav_btns("man_menu")))
             return
     await _render_pairs(update, ctx)
 
@@ -881,9 +631,8 @@ async def _render_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chunk = pairs[start:start + 50]
     rows = []
     row = []
-    for i, sym in enumerate(chunk):
-        short = sym.replace("/USDT", "")
-        row.append(btn(short, "man_pick_" + sym.replace("/", "_")))
+    for sym in chunk:
+        row.append(btn(sym.replace("/USDT", ""), "man_pick_" + sym.replace("/", "_")))
         if len(row) == 3:
             rows.append(row)
             row = []
@@ -897,38 +646,31 @@ async def _render_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         nav.append(btn("➡️", "man_page_" + str(page + 1)))
     rows.append(nav)
     rows.append([btn("🔍 Поиск", "man_search"), btn("⬅️ Меню", "man_menu")])
-    await update.callback_query.edit_message_text(
-        "Пары " + str(start + 1) + "-" + str(min(start + 50, len(pairs))) +
-        " из " + str(len(pairs)),
-        reply_markup=kb(rows),
-    )
+    text = ("Пары " + str(start + 1) + "-" + str(min(start + 50, len(pairs))) +
+            " из " + str(len(pairs)))
+    await update.callback_query.edit_message_text(text, reply_markup=kb(rows))
 
 async def man_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    page = int(update.callback_query.data.replace("man_page_", ""))
-    STATE["manual"]["page"] = page
+    STATE["manual"]["page"] = int(update.callback_query.data.replace("man_page_", ""))
     await _render_pairs(update, ctx)
 
 async def man_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["manual"] = "search"
-    await update.callback_query.edit_message_text(
-        "Впиши тикер (например BTC):", reply_markup=kb(nav_btns("man_menu"))
-    )
+    await update.callback_query.edit_message_text("Впиши тикер:", reply_markup=kb(nav_btns("man_menu")))
 
 async def man_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     raw = update.callback_query.data.replace("man_pick_", "")
     symbol = raw.replace("_", "/")
     if not symbol.endswith("/USDT"):
-        symbol = symbol + "/USDT"
+        symbol += "/USDT"
     STATE["manual"]["symbol"] = symbol
     rows = [
         [btn("📊 Сигналы", "man_signals")],
         [btn("⏱ Time Frame", "man_tf")],
         [btn("⚡ Кнопки", "man_quick")],
-        nav_btns("man_pairs")[0]
+        nav_btns("man_pairs")[0],
     ]
-    await update.callback_query.edit_message_text(
-        "Пара: " + symbol + "\nЧто смотрим?", reply_markup=kb(rows)
-    )
+    await update.callback_query.edit_message_text("Пара: " + symbol, reply_markup=kb(rows))
 
 async def man_signals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     symbol = STATE["manual"]["symbol"]
@@ -939,40 +681,31 @@ async def man_signals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
         sig = f.analyze_filtered(ANALYSIS_TF, tp_mult=3.0)
     except Exception as e:
-        await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("man_pick_back")))
+        await update.callback_query.edit_message_text("Ошибка: " + str(e),
+            reply_markup=kb(nav_btns("man_pick_back")))
         return
     if sig.confidence < CONF_CHANCE:
-        text = (
-            "📊 " + symbol + "\n"
-            "Уверенность низкая: " + str(int(sig.confidence * 100)) + "%\n"
-            "Сигнала нет. Ждём."
-        )
-        await update.callback_query.edit_message_text(text, reply_markup=kb(nav_btns("man_pick_back")))
+        await update.callback_query.edit_message_text(
+            "Уверенность " + str(int(sig.confidence * 100)) + "%. Нет сигнала.",
+            reply_markup=kb(nav_btns("man_pick_back")))
         return
     tag = "СИГНАЛ" if sig.confidence >= CONF_SIGNAL else "ШАНС"
-    text = (
-        "📊 " + symbol + " · " + tag + "\n"
-        "Действие: " + sig.action + "\n"
-        "Цена: " + fmt_price(sig.price) + "\n"
-        "Уверенность: " + str(int(sig.confidence * 100)) + "%\n"
-        "Стоп: " + fmt_price(sig.stop_loss) + "\n"
-        "Тейк: " + fmt_price(sig.take_profit) + "\n"
-        "\nПричины:\n"
-    )
-    for r in sig.reasons[:6]:
-        text = text + " • " + str(r) + "\n"
+    text = ("📊 " + symbol + " · " + tag + "\nДействие: " + sig.action +
+            "\nЦена: " + fmt_price(sig.price) +
+            "\nУверенность: " + str(int(sig.confidence * 100)) + "%" +
+            "\nСтоп: " + fmt_price(sig.stop_loss) +
+            "\nТейк: " + fmt_price(sig.take_profit))
     try:
         path = build_chart(symbol, ANALYSIS_TF, sig)
         with open(path, "rb") as photo:
             await ctx.bot.send_photo(
                 chat_id=update.callback_query.message.chat_id,
-                photo=photo,
-                caption=text,
-                reply_markup=kb(nav_btns("man_pick_back"))
-            )
+                photo=photo, caption=text,
+                reply_markup=kb(nav_btns("man_pick_back")))
         await update.callback_query.delete_message()
     except Exception:
-        await update.callback_query.edit_message_text(text, reply_markup=kb(nav_btns("man_pick_back")))
+        await update.callback_query.edit_message_text(text,
+            reply_markup=kb(nav_btns("man_pick_back")))
 
 async def man_tf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     symbol = STATE["manual"]["symbol"]
@@ -982,19 +715,12 @@ async def man_tf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
         sig = f.analyze_filtered(ANALYSIS_TF, tp_mult=3.0)
     except Exception as e:
-        await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("man_pick_back")))
+        await update.callback_query.edit_message_text("Ошибка: " + str(e),
+            reply_markup=kb(nav_btns("man_pick_back")))
         return
-    direction = "флэт"
-    if sig.action == "BUY":
-        direction = "⬆️ вверх"
-    elif sig.action == "SELL":
-        direction = "⬇️ вниз"
-    text = (
-        "⏱ " + symbol + "\n"
-        "Направление: " + direction + "\n"
-        "ТФ: " + ANALYSIS_TF
-    )
-    await update.callback_query.edit_message_text(text, reply_markup=kb(nav_btns("man_pick_back")))
+    d = "⬆️ вверх" if sig.action == "BUY" else "⬇️ вниз"
+    await update.callback_query.edit_message_text("⏱ " + symbol + "\n" + d,
+        reply_markup=kb(nav_btns("man_pick_back")))
 
 async def man_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     symbol = STATE["manual"]["symbol"]
@@ -1004,32 +730,26 @@ async def man_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
         sig = f.analyze_filtered(ANALYSIS_TF, tp_mult=3.0)
     except Exception as e:
-        await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("man_pick_back")))
+        await update.callback_query.edit_message_text("Ошибка: " + str(e),
+            reply_markup=kb(nav_btns("man_pick_back")))
         return
-    
     rows = [
         [btn("🟢 Сейчас покупать", "man_buy")],
         [btn("🔴 Сейчас продавать", "man_sell")],
-        nav_btns("man_pick_back")[0]
+        nav_btns("man_pick_back")[0],
     ]
-    text = (
-        "⚡ " + symbol + "\n"
-        "Куда пойдёт: " + sig.action + "\n"
-        "Уверенность: " + str(int(sig.confidence * 100)) + "%"
-    )
+    text = "⚡ " + symbol + "\nКуда: " + sig.action + "\n" + str(int(sig.confidence * 100)) + "%"
     await update.callback_query.edit_message_text(text, reply_markup=kb(rows))
 
 async def man_pick_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    symbol = STATE["manual"]["symbol"]
     rows = [
         [btn("📊 Сигналы", "man_signals")],
         [btn("⏱ Time Frame", "man_tf")],
         [btn("⚡ Кнопки", "man_quick")],
-        nav_btns("man_pairs")[0]
+        nav_btns("man_pairs")[0],
     ]
     await update.callback_query.edit_message_text(
-        "Пара: " + str(symbol) + "\nЧто смотрим?", reply_markup=kb(rows)
-    )
+        "Пара: " + str(STATE["manual"]["symbol"]), reply_markup=kb(rows))
 
 async def man_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     symbol = STATE["manual"]["symbol"]
@@ -1040,287 +760,251 @@ async def man_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         qty = lot / sig.price if sig.price else 0
         portfolio.open_position(symbol, "BUY", sig.price, qty, source="manual")
         await update.callback_query.edit_message_text(
-            "Открыл BUY " + symbol + "\nЦена: " + fmt_price(sig.price) +
-            "\nЛот: " + str(round(lot, 2)) + " USDT", reply_markup=kb(nav_btns("start"))
-        )
+            "BUY " + symbol + " на " + str(round(lot, 2)) + " USDT",
+            reply_markup=kb(nav_btns("start")))
     except Exception as e:
-        await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("start")))
+        await update.callback_query.edit_message_text("Ошибка: " + str(e),
+            reply_markup=kb(nav_btns("start")))
 
 async def man_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pos = portfolio.load().get("open")
     if not pos:
-        await update.callback_query.edit_message_text("Нет открытой позиции.", reply_markup=kb(nav_btns("start")))
+        await update.callback_query.edit_message_text("Нет позиции.",
+            reply_markup=kb(nav_btns("start")))
         return
     try:
         f = Friday(symbol=pos["symbol"], exchange_name=STATE["manual"]["exchange"])
-        df = f.fetch("1m", 30)
-        price = float(df.iloc[-1]["close"])
+        price = float(f.fetch("1m", 30).iloc[-1]["close"])
         trade = portfolio.close_position(price, pos["qty"])
         if "error" in trade:
-            await update.callback_query.edit_message_text("Ошибка: " + trade["error"], reply_markup=kb(nav_btns("start")))
+            await update.callback_query.edit_message_text("Ошибка: " + trade["error"],
+                reply_markup=kb(nav_btns("start")))
             return
         if trade["pnl_pct"] < 0:
             register_loss()
         else:
             register_win()
         await update.callback_query.edit_message_text(
-            "Закрыл " + pos["symbol"] + "\n"
-            "PnL: " + str(round(trade["pnl_pct"], 2)) + "%", reply_markup=kb(nav_btns("start"))
-        )
+            "Закрыл " + pos["symbol"] + " PnL: " + str(round(trade["pnl_pct"], 2)) + "%",
+            reply_markup=kb(nav_btns("start")))
     except Exception as e:
-        await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("start")))
+        await update.callback_query.edit_message_text("Ошибка: " + str(e),
+            reply_markup=kb(nav_btns("start")))
 
-# ---------- ЗАКРЫТИЕ ВСЕХ ----------
 async def close_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pos = portfolio.load().get("open")
     if not pos:
-        await update.callback_query.edit_message_text("Нет открытых сделок.", reply_markup=kb(nav_btns("start")))
+        await update.callback_query.edit_message_text("Нет сделок.",
+            reply_markup=kb(nav_btns("start")))
         return
     try:
         f = Friday(symbol=pos["symbol"], exchange_name=STATE["manual"]["exchange"])
-        df = f.fetch("1m", 30)
-        price = float(df.iloc[-1]["close"])
+        price = float(f.fetch("1m", 30).iloc[-1]["close"])
         trade = portfolio.close_position(price, pos["qty"])
         STATE["trailing"]["active"] = False
         if "error" in trade:
-            await update.callback_query.edit_message_text("Ошибка: " + trade["error"], reply_markup=kb(nav_btns("start")))
+            await update.callback_query.edit_message_text("Ошибка: " + trade["error"],
+                reply_markup=kb(nav_btns("start")))
             return
         if trade["pnl_pct"] < 0:
             register_loss()
         else:
             register_win()
         await update.callback_query.edit_message_text(
-            "Закрыто: " + pos["symbol"] + "\n"
-            "PnL: " + str(round(trade["pnl_pct"], 2)) + "%", reply_markup=kb(nav_btns("start"))
-        )
+            "Закрыто: " + pos["symbol"] + " PnL: " + str(round(trade["pnl_pct"], 2)) + "%",
+            reply_markup=kb(nav_btns("start")))
     except Exception as e:
-        await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("start")))
+        await update.callback_query.edit_message_text("Ошибка: " + str(e),
+            reply_markup=kb(nav_btns("start")))
 
 # ---------- ИСТОРИЯ ----------
 async def hist_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = [
         [btn("📅 За день", "hist_day")],
         [btn("📆 За неделю", "hist_week")],
-        [btn("🗓 За всё время", "hist_all")],
-        nav_btns("start")[0]
+        [btn("🗓 За всё", "hist_all")],
+        nav_btns("start")[0],
     ]
-    await update.callback_query.edit_message_text(
-        "Период:", reply_markup=kb(rows)
-    )
+    await update.callback_query.edit_message_text("Период:", reply_markup=kb(rows))
 
 async def hist_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     period = update.callback_query.data.replace("hist_", "")
     rows = [
-        [btn("🎮 Только кнопки", "hist_src_" + period + "_manual")],
-        [btn("📊 Только сигналы", "hist_src_" + period + "_signal")],
-        [btn("🤖 Только автопилот", "hist_src_" + period + "_auto")],
+        [btn("🎮 Кнопки", "hist_src_" + period + "_manual")],
+        [btn("📊 Сигналы", "hist_src_" + period + "_signal")],
+        [btn("🤖 Авто", "hist_src_" + period + "_auto")],
         [btn("📋 Всё", "hist_src_" + period + "_all")],
-        nav_btns("hist_menu")[0]
+        nav_btns("hist_menu")[0],
     ]
-    await update.callback_query.edit_message_text(
-        "Источник:", reply_markup=kb(rows)
-    )
+    await update.callback_query.edit_message_text("Источник:", reply_markup=kb(rows))
 
 async def hist_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     raw = update.callback_query.data.replace("hist_src_", "")
     period, source = raw.split("_")
     s = portfolio.stats_filtered(period, source)
-    text = (
-        "📜 История (" + period + " / " + source + ")\n"
-        "Сделок: " + str(s["total"]) + "\n"
-        "Прибыльных: " + str(s["wins"]) + "\n"
-        "Убыточных: " + str(s["losses"]) + "\n"
-        "Winrate: " + str(round(s["winrate"], 1)) + "%\n"
-        "PnL %: " + str(round(s["total_pnl"], 2)) + "\n"
-        "PnL USDT: " + str(round(s["total_abs"], 2)) + "\n"
-        "Profit Factor: " + str(round(s["pf"], 2))
-    )
+    text = ("📜 " + period + " / " + source +
+            "\nСделок: " + str(s["total"]) +
+            "\nПлюс: " + str(s["wins"]) +
+            "\nМинус: " + str(s["losses"]) +
+            "\nWinrate: " + str(round(s["winrate"], 1)) + "%" +
+            "\nPnL %: " + str(round(s["total_pnl"], 2)) +
+            "\nPnL USDT: " + str(round(s["total_abs"], 2)) +
+            "\nPF: " + str(round(s["pf"], 2)))
     await update.callback_query.edit_message_text(text, reply_markup=kb(nav_btns("hist_menu")))
 
 async def stats_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = portfolio.stats_filtered("all", "all")
-    text = (
-        "📊 Общая статистика\n"
-        "Сделок: " + str(s["total"]) + "\n"
-        "Winrate: " + str(round(s["winrate"], 1)) + "%\n"
-        "PnL USDT: " + str(round(s["total_abs"], 2)) + "\n"
-        "Profit Factor: " + str(round(s["pf"], 2))
-    )
+    text = ("📊 Всего\nСделок: " + str(s["total"]) +
+            "\nWinrate: " + str(round(s["winrate"], 1)) + "%" +
+            "\nPnL USDT: " + str(round(s["total_abs"], 2)) +
+            "\nPF: " + str(round(s["pf"], 2)))
     await update.callback_query.edit_message_text(text, reply_markup=kb(nav_btns("start")))
 
-# ---------- ТЕКСТОВЫЙ ВВОД ----------
+# ---------- ТЕКСТ ----------
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
     pend = STATE["pending"]
-    
+
     if "demo_amount" in pend:
         try:
             amount = float(txt)
         except Exception:
-            await update.message.reply_text("Введи число (USDT).", reply_markup=kb(nav_btns("demo")))
+            await update.message.reply_text("Число.", reply_markup=kb(nav_btns("demo")))
             return
         pend.pop("demo_amount")
-        
         STATE["demo"]["amount"] = amount
-        sig_action = STATE["demo"]["action"]
-        symbol = STATE["demo"]["symbol"]
-        buy_price = STATE["demo"]["buy_price"]
-        
+        sig_a = STATE["demo"]["action"]
+        sym = STATE["demo"]["symbol"]
+        bp = STATE["demo"]["buy_price"]
         try:
-            f = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
-            df = f.fetch("1m", 5)
-            curr_price = float(df.iloc[-1]["close"])
+            f = Friday(symbol=sym, exchange_name=STATE["manual"]["exchange"])
+            cp = float(f.fetch("1m", 5).iloc[-1]["close"])
         except Exception:
-            curr_price = buy_price
-            
-        if sig_action == "BUY":
-            pnl_pct = (curr_price - buy_price) / buy_price
-        else:
-            pnl_pct = (buy_price - curr_price) / buy_price
-            
-        pnl_usdt = amount * pnl_pct
-        res_text = "📈 Плюс" if pnl_usdt >= 0 else "📉 Минус"
-        
-        msg = (
-            "🎮 ДЕМО-СДЕЛКА ЗАВЕРШЕНА\n\n"
-            "Монета: " + symbol + "\n"
-            "Вход: " + fmt_price(buy_price) + "\n"
-            "Выход: " + fmt_price(curr_price) + "\n"
-            "Сумма: " + str(amount) + " USDT\n\n"
-            + res_text + ": " + str(round(pnl_usdt, 2)) + " USDT (" + str(round(pnl_pct*100, 2)) + "%)\n\n"
-            "Это был демо-режим. Реальные деньги не потрачены."
-        )
-        
-        rows = [[btn("🏠 В меню Демо", "demo")]]
-        await update.message.reply_text(msg, reply_markup=kb(rows))
+            cp = bp
+        pnl_pct = (cp - bp) / bp if sig_a == "BUY" else (bp - cp) / bp
+        pnl = amount * pnl_pct
+        res = "📈 Плюс" if pnl >= 0 else "📉 Минус"
+        msg = ("🎮 ДЕМО\n" + sym + "\nВход: " + fmt_price(bp) +
+               "\nВыход: " + fmt_price(cp) + "\nСумма: " + str(amount) + " USDT" +
+               "\n\n" + res + ": " + str(round(pnl, 2)) + " USDT (" +
+               str(round(pnl_pct * 100, 2)) + "%)")
+        await update.message.reply_text(msg, reply_markup=kb([[btn("🏠 В меню Демо", "demo")]]))
         return
 
     if "wait_custom_amount" in pend:
-        sig_data = pend["wait_custom_amount"]
+        sd = pend["wait_custom_amount"]
         try:
             amount = float(txt)
         except Exception:
-            await update.message.reply_text("Введи число (USDT).", reply_markup=kb(nav_btns("start")))
+            await update.message.reply_text("Число.", reply_markup=kb(nav_btns("start")))
             return
         pend.pop("wait_custom_amount")
-        
-        if sig_data["action"] == "BUY":
-            qty = amount / sig_data["price"] if sig_data["price"] else 0
-            portfolio.open_position(sig_data["symbol"], "BUY", sig_data["price"], qty, source="signal")
-            
+        if sd["action"] == "BUY":
+            qty = amount / sd["price"] if sd["price"] else 0
+            portfolio.open_position(sd["symbol"], "BUY", sd["price"], qty, source="signal")
             STATE["trailing"]["active"] = True
             if STATE["trailing"]["task"] is None or STATE["trailing"]["task"].done():
-                STATE["trailing"]["task"] = asyncio.create_task(_trailing_loop(ctx.application, sig_data["symbol"], sig_data["price"], "BUY"))
-                
-            rows = [[btn("🏠 В меню", "start")]]
+                STATE["trailing"]["task"] = asyncio.create_task(
+                    _trailing_loop(ctx.application, sd["symbol"], sd["price"], "BUY"))
             await update.message.reply_text(
-                "Записал: купил " + sig_data["symbol"] + " на " + str(amount) + " USDT.\nЖдём сигнал SELL.",
-                reply_markup=kb(rows)
-            )
+                "Купил " + sd["symbol"] + " на " + str(amount) + " USDT.",
+                reply_markup=kb([[btn("🏠 В меню", "start")]]))
         else:
             pos = portfolio.load().get("open")
             if not pos:
-                await update.message.reply_text("Нет открытой позиции для продажи.", reply_markup=kb(nav_btns("start")))
+                await update.message.reply_text("Нет позиции.",
+                    reply_markup=kb(nav_btns("start")))
                 return
-            qty = amount / sig_data["price"] if sig_data["price"] else 0
-            if qty > pos["qty"]:
-                qty = pos["qty"]
-            trade = portfolio.close_position(sig_data["price"], qty)
+            qty = min(amount / sd["price"] if sd["price"] else 0, pos["qty"])
+            trade = portfolio.close_position(sd["price"], qty)
             STATE["trailing"]["active"] = False
-            
             if "error" in trade:
-                await update.message.reply_text("Ошибка: " + trade["error"], reply_markup=kb(nav_btns("start")))
+                await update.message.reply_text("Ошибка: " + trade["error"],
+                    reply_markup=kb(nav_btns("start")))
                 return
             if trade["pnl_pct"] < 0:
                 register_loss()
             else:
                 register_win()
-            
-            rows = [[btn("🏠 В меню", "start")]]
-            msg = (
-                "Записал продажу.\n"
-                "Твоя прибыль: " + str(round(trade["pnl_pct"], 2)) + "% (" + str(round(trade["pnl_abs"], 2)) + " USDT)"
-            )
-            await update.message.reply_text(msg, reply_markup=kb(rows))
+            await update.message.reply_text(
+                "Продал. PnL: " + str(round(trade["pnl_pct"], 2)) + "% (" +
+                str(round(trade["pnl_abs"], 2)) + " USDT)",
+                reply_markup=kb([[btn("🏠 В меню", "start")]]))
         return
 
     if "auto" in pend:
-        kind = pend["auto"]
-        if kind == "balance":
+        k = pend["auto"]
+        if k == "balance":
             try:
                 STATE["balance"] = float(txt)
             except Exception:
-                await update.message.reply_text("Число нужно.", reply_markup=kb(nav_btns("start")))
+                await update.message.reply_text("Число.", reply_markup=kb(nav_btns("start")))
                 return
             pend.pop("auto")
             await auto_after_balance(update, ctx)
             return
-        if kind == "budget":
+        if k == "budget":
             try:
                 STATE["daily_budget"] = float(txt)
             except Exception:
-                await update.message.reply_text("Число нужно.", reply_markup=kb(nav_btns("auto_start")))
+                await update.message.reply_text("Число.",
+                    reply_markup=kb(nav_btns("auto_start")))
                 return
             pend.pop("auto")
             await auto_after_budget(update, ctx)
             return
-        if kind == "city":
+        if k == "city":
             STATE["city"] = txt
             STATE["tz"] = city_to_tz(txt)
             pend.pop("auto")
             await auto_after_city(update, ctx)
             return
-        if kind == "check_time":
+        if k == "check_time":
             pend.pop("auto")
             await auto_after_check_time(update, ctx)
             return
-        if kind == "work_time":
+        if k == "work_time":
             hours = _parse_hours(txt)
             pend["auto_hours"] = str(hours)
             pend["multi_day"] = ("д" in txt.lower() or "day" in txt.lower())
             pend.pop("auto")
             await auto_ask_exchange(update, ctx)
             return
-        if kind == "tf_custom":
+        if k == "tf_custom":
             tf = txt.strip()
             if not re.match(r"^\d+[mhd]$", tf):
-                await update.message.reply_text("Формат: 5m, 1h, 4h.")
+                await update.message.reply_text("Формат: 5m, 1h.",
+                    reply_markup=kb(nav_btns("tf_bad")))
                 return
             STATE["auto"]["tf"] = tf
             STATE["auto"]["waiting_tf_confirm"] = False
             pend.pop("auto")
-            
+            await update.message.reply_text("Ок, " + tf + ".",
+                reply_markup=kb(nav_btns("start")))
             if STATE["auto"]["current_offer"]:
                 STATE["auto"]["symbols"] = [STATE["auto"]["current_offer"]]
                 STATE["auto"]["current_offer"] = None
-                await update.message.reply_text(
-                    "Ок, работаем по " + tf + ". Начинаю анализ.", 
-                    reply_markup=kb(nav_btns("start"))
-                )
                 await _ask_hascoins(update, ctx)
             return
-        if kind == "multi_count":
+        if k == "multi_count":
             try:
                 n = int(txt)
             except Exception:
-                await update.message.reply_text("Число от 2 до 10.", reply_markup=kb(nav_btns("start")))
+                await update.message.reply_text("2-10.",
+                    reply_markup=kb(nav_btns("start")))
                 return
             if n < 2 or n > MAX_MULTI:
-                await update.message.reply_text("Только 2–10.", reply_markup=kb(nav_btns("start")))
+                await update.message.reply_text("2-10.",
+                    reply_markup=kb(nav_btns("start")))
                 return
             pend.pop("auto")
-            rows = [
-                [btn("✅ Запустить " + str(n) + " монет", "multi_start_" + str(n))],
-                nav_btns("start")[0]
-            ]
-            await update.message.reply_text(
-                "Ок, " + str(n) + " монет.", reply_markup=kb(rows)
-            )
+            rows = [[btn("✅ Запустить " + str(n), "multi_start_" + str(n))],
+                    nav_btns("start")[0]]
+            await update.message.reply_text("Ок, " + str(n), reply_markup=kb(rows))
             return
 
     if "manual" in pend:
-        kind = pend["manual"]
-        if kind == "search":
+        if pend["manual"] == "search":
             ticker = txt.upper()
             found = None
             for sym in STATE["manual"]["pairs"]:
@@ -1329,20 +1013,17 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     break
             pend.pop("manual")
             if not found:
-                await update.message.reply_text("Не нашёл: " + ticker, reply_markup=kb(nav_btns("man_menu")))
+                await update.message.reply_text("Не нашёл.",
+                    reply_markup=kb(nav_btns("man_menu")))
                 return
-            
             STATE["manual"]["symbol"] = found
             rows = [
                 [btn("📊 Сигналы", "man_signals")],
                 [btn("⏱ Time Frame", "man_tf")],
                 [btn("⚡ Кнопки", "man_quick")],
-                nav_btns("man_pairs")[0]
+                nav_btns("man_pairs")[0],
             ]
-            await update.message.reply_text(
-                "Пара: " + found + "\nЧто смотрим?", 
-                reply_markup=kb(rows)
-            )
+            await update.message.reply_text("Пара: " + found, reply_markup=kb(rows))
             return
 
 def _parse_hours(txt):
@@ -1350,20 +1031,17 @@ def _parse_hours(txt):
     m = re.search(r"(\d+(\.\d+)?)", low)
     if not m:
         return 1
-    val = float(m.group(1))
+    v = float(m.group(1))
     if "д" in low or "day" in low:
-        return val * 24
-    return val
+        return v * 24
+    return v
 
 async def multi_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     n = int(update.callback_query.data.replace("multi_start_", ""))
-    await update.callback_query.edit_message_text(
-        "Сканирую топ-" + str(n) + " монет...", reply_markup=kb(nav_btns("start"))
-    )
+    await update.callback_query.edit_message_text("Сканирую " + str(n) + " монет...",
+        reply_markup=kb(nav_btns("start")))
     bests = []
-    pairs = exchanges.load_all_pairs(
-        STATE["auto"]["exchange"], quote="USDT", max_pairs=150
-    )
+    pairs = exchanges.load_all_pairs(STATE["auto"]["exchange"], quote="USDT", max_pairs=150)
     for sym in pairs:
         r = await _score_pair(sym)
         if r:
@@ -1374,20 +1052,21 @@ async def multi_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bests.sort(key=lambda x: x["score"], reverse=True)
     top = bests[:n]
     if not top:
-        await update.callback_query.edit_message_text("Ничего не нашёл.", reply_markup=kb(nav_btns("start")))
+        await update.callback_query.edit_message_text("Ничего.",
+            reply_markup=kb(nav_btns("start")))
         return
     STATE["auto"]["symbols"] = [t["symbol"] for t in top]
-    lines = ["🤖 Взял " + str(len(top)) + " монет:"]
+    lines = ["🤖 Взял " + str(len(top)) + ":"]
     for t in top:
         lines.append("• " + t["symbol"] + " (" + str(round(t["atr_pct"] * 100, 1)) + "%)")
-    await update.callback_query.edit_message_text("\n".join(lines), reply_markup=kb(nav_btns("start")))
+    await update.callback_query.edit_message_text("\n".join(lines),
+        reply_markup=kb(nav_btns("start")))
 
 # ---------- РОУТЕР ----------
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
-    
     if ctx.application.bot_data.get("chat_id") != q.message.chat_id:
         ctx.application.bot_data["chat_id"] = q.message.chat_id
 
@@ -1406,7 +1085,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "demo_sell":
         await demo_sell(update, ctx)
         return
-
     if data == "auto_stop_signals":
         STATE["auto"]["active"] = False
         STATE["trailing"]["active"] = False
@@ -1417,12 +1095,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         STATE["auto"]["current_offer"] = None
         STATE["auto"]["waiting_tf_confirm"] = False
         STATE["auto"]["switch_wait_until"] = None
-        await q.edit_message_text(
-            "🛑 Автопилот остановлен. Сигналы больше не приходят.",
-            reply_markup=kb([[btn("🏠 В меню", "start")]])
-        )
+        await q.edit_message_text("🛑 Стоп.",
+            reply_markup=kb([[btn("🏠 В меню", "start")]]))
         return
-
     if data == "start":
         if STATE["auto"]["active"]:
             STATE["auto"]["active"] = False
@@ -1434,7 +1109,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             STATE["auto"]["current_offer"] = None
             STATE["auto"]["waiting_tf_confirm"] = False
             STATE["auto"]["switch_wait_until"] = None
-        
         await start(update, ctx)
         return
     if data == "auto_start":
@@ -1445,18 +1119,18 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if data == "auto_retry_budget":
         STATE["pending"]["auto"] = "budget"
-        await q.edit_message_text("Сколько готов потратить сегодня? (USDT)", reply_markup=kb(nav_btns("auto_start")))
+        await q.edit_message_text("Бюджет?", reply_markup=kb(nav_btns("auto_start")))
         return
     if data == "auto_retry_city":
         STATE["pending"]["auto"] = "city"
-        await q.edit_message_text("В каком ты городе?", reply_markup=kb(nav_btns("auto_retry_budget")))
+        await q.edit_message_text("Город?", reply_markup=kb(nav_btns("auto_retry_budget")))
         return
     if data == "auto_retry_check_time":
         STATE["pending"]["auto"] = "check_time"
         local = local_now().strftime("%H:%M")
-        await q.edit_message_text("Сколько сейчас у тебя времени по часам? (например " + local + ")", reply_markup=kb(nav_btns("auto_retry_city")))
+        await q.edit_message_text("Время? (например " + local + ")",
+            reply_markup=kb(nav_btns("auto_retry_city")))
         return
-    
     if data.startswith("auto_ex_set_"):
         await auto_ex_set(update, ctx)
         return
@@ -1490,7 +1164,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "panic_sold":
         await panic_sold(update, ctx)
         return
-    
     if data == "sig_skipped":
         await sig_skipped(update, ctx)
         return
@@ -1506,7 +1179,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "sig_sell_custom":
         await sig_sell_custom(update, ctx)
         return
-
     if data == "man_menu":
         await man_menu(update, ctx)
         return
