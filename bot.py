@@ -41,8 +41,8 @@ LOSS_LIMIT = 3
 SLEEP_MIN = 30
 MAX_POSITIONS = 2
 MAX_MULTI = 10
-SCAN_TOP = 200
-SCAN_CONCURRENCY = 30
+SCAN_TOP = 150
+SCAN_CONCURRENCY = 50
 SCAN_INTERVAL = 300
 MARKETS_TTL = 3600
 EMA200_TTL = 300
@@ -288,42 +288,6 @@ def market_regime(atr_pct, price, df_15m):
     return "normal"
 
 # ---------- СТРОГИЕ ПРОВЕРКИ СИГНАЛА ----------
-def mtf_direction(tf):
-    if tf in ("1m", "5m"):
-        return "15m"
-    if tf == "15m":
-        return "4h"
-    return None
-
-def mtf_confirm(symbol, direction, tf):
-    higher = mtf_direction(tf)
-    if not higher:
-        return True
-    try:
-        ex = get_exchange_obj(STATE["auto"]["exchange"])
-        raw = ex.fetch_ohlcv(symbol, higher, limit=120)
-        if not raw or len(raw) < 50:
-            return True
-        import pandas as pd
-        df = pd.DataFrame(raw, columns=["ts", "o", "h", "l", "c", "v"])
-        ef = float(df["c"].ewm(span=20, adjust=False).mean().iloc[-1])
-        es = float(df["c"].ewm(span=50, adjust=False).mean().iloc[-1])
-        if direction == "BUY":
-            return ef > es
-        return ef < es
-    except Exception:
-        return True
-
-def trend_1h_ok(symbol, direction, tf="15m"):
-    if tf in ("1m", "5m"):
-        return True
-    d = get_ema200_1h(STATE["auto"]["exchange"], symbol)
-    if not d:
-        return True
-    if direction == "BUY":
-        return d["close"] > d["ema"]
-    return d["close"] < d["ema"]
-
 def strict_signal_check(symbol, sig, tf, atr_val):
     if "signal" in STATE["pending"]:
         return (False, "pending занят")
@@ -331,10 +295,6 @@ def strict_signal_check(symbol, sig, tf, atr_val):
         return (False, "нет стопа")
     if sig.confidence < CONF_MIN_AUTO:
         return (False, "низкая уверенность")
-    if not mtf_confirm(symbol, sig.action, tf):
-        sig.confidence = max(sig.confidence - 0.10, 0.0)
-        if sig.confidence < CONF_MIN_AUTO:
-            return (False, "mtf штраф")
     tp_dist = abs(sig.take_profit - sig.price) / sig.price if sig.price else 0
     if tp_dist < FEE_MIN_TP:
         return (False, "тейк < 3× комиссии")
@@ -343,16 +303,13 @@ def strict_signal_check(symbol, sig, tf, atr_val):
         return (False, "чистая < 0.2%")
     return (True, "ok")
 
-# ---------- СКАН (3 ФИЛЬТРА) ----------
+# ---------- СКАН (БЫСТРЫЙ) ----------
 async def prefilter_symbols_async(exchange_key, tf="15m"):
     loop = asyncio.get_event_loop()
     task_m = loop.run_in_executor(None, lambda: get_markets(exchange_key))
     task_t = loop.run_in_executor(None, lambda: get_tickers(exchange_key))
-    use_cmc = exchange_key in BIG_EXCHANGES and tf in ("15m", "1h", "4h")
-    task_c = loop.run_in_executor(None, lambda: get_cmc_top(CMC_TOP_N)) if use_cmc else None
     markets = await task_m
     tickers = await task_t
-    cmc = await task_c if task_c else None
     result = []
     for sym, m in markets.items():
         if not (m.get("active") and m.get("spot") and m.get("quote") == "USDT"):
@@ -360,24 +317,17 @@ async def prefilter_symbols_async(exchange_key, tf="15m"):
         t = tickers.get(sym)
         if not t:
             continue
-        base = (m.get("base") or "").upper()
-        if cmc is not None and use_cmc and base not in cmc:
-            continue
         qv = float(t.get("quoteVolume") or 0)
         if qv < VOL_MIN_24H:
             continue
-        bid = float(t.get("bid") or 0)
-        ask = float(t.get("ask") or 0)
-        spread = (ask - bid) / bid if bid > 0 and ask > 0 else 0.0
-        if spread > SPREAD_MAX:
+        price = float(t.get("last") or 0)
+        if price <= 0:
             continue
         change = abs(float(t.get("percentage") or 0))
-        score = qv * (change / 100.0 + 0.001)
-        result.append({"symbol": sym, "score": score, "vol24": qv,
-                       "spread": spread, "change": change,
-                       "price": float(t.get("last") or 0)})
+        result.append({"symbol": sym, "score": qv, "vol24": qv,
+                       "change": change, "price": price, "spread": 0})
     result.sort(key=lambda x: x["score"], reverse=True)
-    return result
+    return result[:SCAN_TOP]
 
 async def fetch_and_score(ex, item, tf, sem):
     async with sem:
@@ -385,15 +335,15 @@ async def fetch_and_score(ex, item, tf, sem):
             symbol = item["symbol"]
             loop = asyncio.get_event_loop()
             raw = await loop.run_in_executor(
-                None, lambda: ex.fetch_ohlcv(symbol, tf, limit=120))
-            if not raw or len(raw) < 60:
+                None, lambda: ex.fetch_ohlcv(symbol, tf, limit=60))
+            if not raw or len(raw) < 20:
                 return None
             import pandas as pd
             df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
             df["ts"] = pd.to_datetime(df["ts"], unit="ms")
             f = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
             df = f.enrich(df, tf).dropna().reset_index(drop=True)
-            if len(df) < 20:
+            if len(df) < 15:
                 return None
             last = df.iloc[-1]
             price = float(last["close"])
@@ -413,58 +363,43 @@ async def fetch_and_score(ex, item, tf, sem):
                     "chance": sig.confidence * 100,
                     "signal": sig, "price": price,
                     "atr_pct": atr_pct, "atr_val": atr_val,
-                    "vol24": vol24, "regime": None, "tf": tf,
+                    "vol24": vol24, "regime": "normal", "tf": tf,
                     "df": df, "f": f}
         except Exception:
             return None
 
-async def fast_scan(tf, need=1, batch_size=100):
+async def fast_scan(tf, need=1):
     ex_key = STATE["auto"]["exchange"]
     candidates = await prefilter_symbols_async(ex_key, tf)
     if not candidates:
         return []
     ex = get_exchange_obj(ex_key)
     sem = asyncio.Semaphore(SCAN_CONCURRENCY)
+    tasks = [fetch_and_score(ex, c, tf, sem) for c in candidates]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
     good = []
-    for i in range(0, len(candidates), batch_size):
-        chunk = candidates[i:i + batch_size]
-        tasks = [fetch_and_score(ex, c, tf, sem) for c in chunk]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in results:
-            if isinstance(r, Exception) or r is None:
-                continue
-            good.append(r)
-        if len(good) >= need:
-            break
+    for r in results:
+        if isinstance(r, Exception) or r is None:
+            continue
+        good.append(r)
     good.sort(key=lambda x: x.get("profit_potential", 0), reverse=True)
     return good
 
 def run_strict_check_and_build_signal(r, tf):
-    sym = r["symbol"]
-    f = r["f"]
-    df = r["df"]
-    atr_val = r["atr_val"]
-    price = r["price"]
     sig = r.get("signal")
     if sig is None:
-        try:
-            sig = f.analyze_filtered(tf, tp_mult=3.0)
-        except Exception:
-            return None
-    regime = market_regime(r["atr_pct"], price, df)
-    if regime in ("dead", "chaos"):
         return None
-    if not trend_1h_ok(sym, sig.action, tf):
+    if not sig.stop_loss or sig.stop_loss <= 0:
         return None
-    min_conf = CONF_SIDEWAYS if regime == "sideways" else CONF_MIN_AUTO
-    if sig.confidence < min_conf:
+    if sig.confidence < CONF_MIN_AUTO:
         return None
-    ok, reason = strict_signal_check(sym, sig, tf, atr_val)
-    if not ok:
+    tp_dist = abs(sig.take_profit - sig.price) / sig.price if sig.price else 0
+    if tp_dist < FEE_MIN_TP:
+        return None
+    net = (tp_dist - 0.004) * 100
+    if net < MIN_NET_PCT:
         return None
     r2 = dict(r)
-    r2["signal"] = sig
-    r2["regime"] = regime
     r2["chance"] = sig.confidence * 100
     return r2
 
@@ -510,7 +445,7 @@ async def send_signal(app, r, reason=""):
         "price": sig.price, "lot": lot_usdt, "qty": qty,
         "sl": sig.stop_loss, "tp": sig.take_profit,
     }
-    text = ("🎯 " + r["symbol"] + " · " + r["regime"] + " · " + r["tf"] +
+    text = ("🎯 " + r["symbol"] + " · " + r["tf"] +
             ("\n" + reason if reason else "") +
             "\n" + sig.action + " @ " + fmt_price(sig.price) +
             "\n🎯 Шанс: " + str(int(sig.confidence * 100)) + "%" +
@@ -540,7 +475,7 @@ async def _first_scan_then_loop(app):
             tf = STATE["auto"]["tf"]
             hours = STATE["auto"].get("work_hours", 24)
             t0 = time.time()
-            candidates = await fast_scan(tf, need=50)
+            candidates = await fast_scan(tf, need=150)
             dt = round(time.time() - t0, 1)
             STATE["auto"]["last_scan_ts"] = time.time()
             STATE["auto"]["first_scan_done"] = True
@@ -549,10 +484,10 @@ async def _first_scan_then_loop(app):
                 r2 = run_strict_check_and_build_signal(r, tf)
                 if r2 is not None:
                     checked.append(r2)
-                if len(checked) >= 5:
+                if len(checked) >= 3:
                     break
             if not checked:
-                STATE["auto"]["last_scan_result"] = "нет сигналов (" + str(dt) + "s), продолжаю"
+                STATE["auto"]["last_scan_result"] = "нет монет (" + str(dt) + "s)"
                 await asyncio.sleep(5)
                 continue
             checked.sort(key=lambda x: x.get("profit_potential", 0), reverse=True)
@@ -560,7 +495,7 @@ async def _first_scan_then_loop(app):
             STATE["auto"]["forecast"] = forecast
             STATE["auto"]["forecast_candidates"] = checked
             STATE["auto"]["forecast_confirmed"] = False
-            text = ("📊 <b>Лучшая монета для заработка</b>\n\n"
+            text = ("📊 <b>Лучшая монета из 150</b>\n\n"
                     "🪙 <b>" + forecast["symbol"] + "</b>\n"
                     "⏱ ТФ: <b>" + forecast["tf"] + "</b>\n"
                     "💰 Примерный потенциал за " + str(hours) + "ч: <b>+" +
@@ -577,7 +512,7 @@ async def _first_scan_then_loop(app):
                 await app.bot.send_message(chat_id=chat_id, text=text,
                     reply_markup=kb(rows), parse_mode="HTML")
             while STATE["auto"]["active"] and not STATE["auto"].get("forecast_confirmed"):
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
             if not STATE["auto"]["active"]:
                 return
         except Exception as e:
@@ -600,7 +535,7 @@ async def scan_loop(app):
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
             t0 = time.time()
-            candidates = await fast_scan(tf, need=50)
+            candidates = await fast_scan(tf, need=150)
             dt = round(time.time() - t0, 1)
             STATE["auto"]["last_scan_ts"] = time.time()
             sent = False
@@ -623,7 +558,7 @@ async def scan_loop(app):
                 sent = True
                 break
             if not sent:
-                STATE["auto"]["last_scan_result"] = "нет сигналов (" + str(dt) + "s), продолжаю"
+                STATE["auto"]["last_scan_result"] = "нет сигналов (" + str(dt) + "s)"
             await asyncio.sleep(5)
         except Exception as e:
             print("scan_loop:", e)
@@ -676,7 +611,7 @@ async def demo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def demo_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("🔍 Сканирую...")
     tf = STATE["auto"]["tf"]
-    candidates = await fast_scan(tf, need=50)
+    candidates = await fast_scan(tf, need=150)
     best = None
     for r in candidates:
         r2 = run_strict_check_and_build_signal(r, tf)
@@ -693,8 +628,7 @@ async def demo_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["demo"]["action"] = sig.action
     text = ("🎮 ДЕМО\n" + best["symbol"] + "\n" + sig.action +
             " @ " + fmt_price(sig.price) +
-            "\nШанс: " + str(int(sig.confidence * 100)) + "%" +
-            "\nРежим: " + best["regime"])
+            "\nШанс: " + str(int(sig.confidence * 100)) + "%")
     if sig.action == "BUY":
         rows = [[btn("✅ Купил", "demo_buy")], [btn("❌ Пропустил", "demo_skip")], nav_btns("demo")[0]]
     else:
@@ -783,8 +717,6 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, lambda: get_markets(key))
     loop.run_in_executor(None, lambda: get_tickers(key))
-    if key in BIG_EXCHANGES:
-        loop.run_in_executor(None, lambda: get_cmc_top(CMC_TOP_N))
     if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
         STATE["auto"]["active"] = True
         STATE["auto"]["symbols"] = []
