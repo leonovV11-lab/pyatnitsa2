@@ -49,6 +49,7 @@ STATE = {
         "work_hours": 24, "symbols": [], "seen_signals": set(),
         "current_offer": None, "current_chance": 0,
         "bg_scan_done": False, "bg_candidates": [],
+        "have_coin": None, "coin_qty": 0.0, # <--- НОВОЕ
     },
     "manual": {"exchange": config.EXCHANGE, "pairs": [], "page": 0, "symbol": None},
     "pending": {},
@@ -170,15 +171,29 @@ async def bg_scan_market():
 
 async def send_signal(app, r, reason=""):
     sig = r["signal"]
+    
+    # Если у нас НЕТ монеты, но пришел сигнал SELL — игнорируем
+    if STATE["auto"]["have_coin"] == False and sig.action == "SELL":
+        return
+    # Если у нас ЕСТЬ монета, но пришел сигнал BUY — тоже можно докупать, но по твоей логике "только SELL чтобы продать" — можно ограничить. 
+    # Оставим возможность докупать (BUY), если он не запретил. Но если он сказал "только SELL" — тогда блочим BUY.
+    # По твоему тексту: если есть монета, он ждет Sell чтобы продать, либо Buy чтобы докупить.
+    
     budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
     if budget <= 0: return
     risk_pct = 0.03 if sig.confidence >= 0.85 else (0.02 if sig.confidence >= 0.75 else 0.01)
     sl_diff = abs(sig.price - sig.stop_loss)
     if sl_diff <= 0: return
     
-    max_loss = budget * risk_pct
-    qty = min((budget * risk_pct) / sl_diff, (budget * 0.2) / sig.price)
-    lot = qty * sig.price
+    # Если это SELL и у нас есть монеты, продаем то, что есть (или часть)
+    if sig.action == "SELL" and STATE["auto"]["coin_qty"] > 0:
+        qty = STATE["auto"]["coin_qty"]
+        lot = qty * sig.price
+    else:
+        max_loss = budget * risk_pct
+        qty = min((budget * risk_pct) / sl_diff, (budget * 0.2) / sig.price)
+        lot = qty * sig.price
+        
     if lot <= 0: return
     
     net_pct = (abs(sig.take_profit - sig.price) / sig.price - 0.004) * 100
@@ -190,7 +205,7 @@ async def send_signal(app, r, reason=""):
             "\n" + sig.action + " @ " + fmt_price(sig.price) +
             "\n🎯 Шанс: " + str(int(sig.confidence * 100)) + "%" +
             "\n💵 Лот: " + str(round(lot, 2)) + " USDT" +
-            "\n🛡 Риск: " + str(round(max_loss, 2)) + " USDT (" + str(round(risk_pct * 100, 1)) + "%)" +
+            "\n🛡 Риск: " + str(round(budget * risk_pct, 2)) + " USDT (" + str(round(risk_pct * 100, 1)) + "%)" +
             "\nСтоп " + fmt_price(sig.stop_loss) + "\nТейк " + fmt_price(sig.take_profit) +
             "\n💰 Чистая ~" + str(round(net_pct, 2)) + "% (~$" + str(round(net_usdt, 2)) + ")")
     
@@ -214,7 +229,6 @@ async def _first_scan_then_loop(app):
         STATE["auto"]["current_chance"] = best["chance"]
         hours = STATE["auto"].get("work_hours", 24)
         
-        # Ожидаемая прибыль за сессию
         est_pct = best["signal"].confidence * 100 * (hours / 1.5) * 0.35
         est_usdt = STATE["daily_budget"] * (est_pct / 100.0)
         
@@ -277,17 +291,28 @@ async def forecast_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["current_offer"] = best["symbol"]
     STATE["auto"]["current_chance"] = best["chance"]
     
-    await update.callback_query.edit_message_text("✅ Взял " + best["symbol"] + ".\nЖду сигнала...", reply_markup=kb(nav_btns("start")))
-    
-    key = best["symbol"] + ":" + best["signal"].action
-    STATE["auto"]["seen_signals"].add(key)
-    await send_signal(ctx.application, best, "стартовая")
-    
-    if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
-        STATE["auto"]["task"] = asyncio.create_task(scan_loop(ctx.application))
+    rows = [[btn("Нет", "hascoins_no")], [btn("Да", "hascoins_yes")]]
+    await update.callback_query.edit_message_text("Есть у тебя " + best["symbol"] + "?", reply_markup=kb(rows))
 
 async def forecast_rescan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("🔄 Пересканирую...", reply_markup=kb(nav_btns("start")))
+
+async def hascoins_no(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    STATE["auto"]["have_coin"] = False
+    STATE["auto"]["coin_qty"] = 0.0
+    await update.callback_query.edit_message_text("Ок. Ждем только BUY.", reply_markup=kb(nav_btns("start")))
+    
+    checked = STATE["auto"].get("bg_candidates", [])
+    best = checked[0]
+    key = best["symbol"] + ":" + best["signal"].action
+    STATE["auto"]["seen_signals"].add(key)
+    await send_signal(ctx.application, best, "стартовая")
+    if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
+        STATE["auto"]["task"] = asyncio.create_task(scan_loop(ctx.application))
+
+async def hascoins_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    STATE["pending"]["wait_qty"] = True
+    await update.callback_query.edit_message_text("Сколько монет у тебя есть?", reply_markup=kb(nav_btns("start")))
 
 async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     candidates = STATE["auto"].get("bg_candidates", [])
@@ -332,6 +357,8 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def auto_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["bg_scan_done"] = False
     STATE["auto"]["bg_candidates"] = []
+    STATE["auto"]["have_coin"] = None
+    STATE["auto"]["coin_qty"] = 0.0
     asyncio.create_task(bg_scan_market())
     STATE["pending"]["auto"] = "balance"
     await update.callback_query.edit_message_text("Баланс (USDT)?", reply_markup=kb(nav_btns("start")))
@@ -389,8 +416,6 @@ async def auto_tf_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["tf"] = tf
     await update.callback_query.edit_message_text("Ок, " + tf_label(tf) + ".", reply_markup=kb(nav_btns("start")))
 
-async def hascoins_no(update: Update, ctx: ContextTypes.DEFAULT_TYPE): await update.callback_query.edit_message_text("Ок.", reply_markup=kb(nav_btns("start")))
-async def hascoins_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE): await update.callback_query.edit_message_text("Ок.", reply_markup=kb(nav_btns("start")))
 async def tf_ok_15m(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["tf"] = "15m"
     await update.callback_query.edit_message_text("Ок, 15m.", reply_markup=kb(nav_btns("start")))
@@ -439,7 +464,6 @@ async def _trailing_loop(app, symbol):
             pos2 = portfolio.find_open(symbol)
             if not pos2: break
             
-            # Live PnL: если профит больше 0.5% и еще не отправляли
             pnl_now = portfolio.current_pnl(price, symbol)
             if pnl_now and pnl_now["pnl_pct"] >= 0.5 and not live_pnl_sent and chat_id:
                 live_pnl_sent = True
@@ -709,6 +733,25 @@ async def stats_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
     pend = STATE["pending"]
+
+    if "wait_qty" in pend:
+        try: qty = float(txt)
+        except Exception: await update.message.reply_text("Число.", reply_markup=kb(nav_btns("start"))); return
+        pend.pop("wait_qty")
+        STATE["auto"]["have_coin"] = True
+        STATE["auto"]["coin_qty"] = qty
+        await update.message.reply_text("Ок, у тебя " + str(qty) + " монет.\nЖдем сигнала SELL (для продажи) или BUY (докупить).", reply_markup=kb(nav_btns("start")))
+        
+        checked = STATE["auto"].get("bg_candidates", [])
+        best = checked[0]
+        # Если у нас есть монеты, мы ждем только SELL? Или и то и то. Отправим первый сигнал, если он SELL или если это BUY, но мы можем докупить.
+        # По твоей логике "Он говорит хорошо ждём сигнала в Sell или by Sell чтобы продать и не уйти в минус ну либо бай чтобы докупить" - значит ждем оба.
+        key = best["symbol"] + ":" + best["signal"].action
+        STATE["auto"]["seen_signals"].add(key)
+        await send_signal(ctx.application, best, "стартовая")
+        if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
+            STATE["auto"]["task"] = asyncio.create_task(scan_loop(ctx.application))
+        return
 
     if "demo_amount" in pend:
         try: amount = float(txt)
