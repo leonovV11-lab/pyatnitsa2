@@ -7,7 +7,6 @@ import re
 import time
 from zoneinfo import ZoneInfo
 import aiohttp
-import random
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -179,36 +178,19 @@ async def bg_scan_market():
         pre_candidates.sort(key=lambda x: x["potential"], reverse=True)
         top_40 = pre_candidates[:40]
         
-        # Параллельный запрос (20 за раз)
+        # Параллельный запрос свечей и расчет уверенности БЕЗ тяжелых циклов
         sem = asyncio.Semaphore(20)
         async def strict_check(c):
             async with sem:
                 try:
                     f = Friday(symbol=c["symbol"], exchange_name="binance")
-                    df = await loop.run_in_executor(None, lambda: f.fetch("5m", 120))
+                    df = await loop.run_in_executor(None, lambda: f.fetch("5m", 60))
                     df = f.enrich(df, "5m").dropna()
-                    if len(df) < 50: return None
+                    if len(df) < 20: return None
                     
-                    wins = 0
-                    for _ in range(100):
-                        start = random.randint(0, len(df) - 20)
-                        window = df.iloc[start:start+20]
-                        sig = f.analyze_filtered("5m", tp_mult=3.0)
-                        
-                        tp_hit = False
-                        sl_hit = False
-                        for i in range(1, 10):
-                            if start + i >= len(df): break
-                            future_price = float(window.iloc[i]["close"])
-                            if sig.action == "BUY":
-                                if future_price >= sig.take_profit: tp_hit = True; break
-                                if future_price <= sig.stop_loss: sl_hit = True; break
-                            else:
-                                if future_price <= sig.take_profit: tp_hit = True; break
-                                if future_price >= sig.stop_loss: sl_hit = True; break
-                        if tp_hit: wins += 1
+                    sig = f.analyze_filtered("5m", tp_mult=3.0)
+                    confidence = sig.confidence * 100 # Берем уверенность из Friday (0-100%)
                     
-                    confidence = wins
                     return {"symbol": c["symbol"], "confidence": confidence,
                             "potential": c["potential"], "vol24": c["vol24"], "price": sig.price,
                             "signal": sig, "tf": "5m", "regime": "normal"}
@@ -268,7 +250,7 @@ async def send_signal(app, r, reason=""):
 async def _first_scan_then_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
     while not STATE["auto"]["bg_scan_done"] and STATE["auto"]["active"]:
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
         
     candidates = STATE["auto"].get("bg_candidates", [])
     
@@ -283,11 +265,14 @@ async def _first_scan_then_loop(app):
         STATE["auto"]["current_chance"] = best["confidence"]
         hours = STATE["auto"].get("work_hours", 24)
         
+        est_pct = best["confidence"] * (hours / 1.5) * 0.35
+        est_usdt = STATE["daily_budget"] * (est_pct / 100.0)
+        
         text = ("📊 <b>Лучшая монета</b>\n\n"
                 "🪙 <b>" + best["symbol"] + "</b>\n"
                 "🎯 Уверенность: <b>" + str(int(best["confidence"])) + "%</b>\n"
-                "💰 Потенциал: <b>" + str(round(best["potential"], 1)) + "</b>\n"
-                "📈 ТФ: <b>5 минут</b>")
+                "📈 Прогноз за " + str(hours) + "ч: <b>+" + str(round(est_pct, 1)) + "%</b> (~$" + str(round(est_usdt, 2)) + ")\n"
+                "💰 Объем: <b>" + str(round(best["vol24"]/1000000, 1)) + "M</b>")
         
         rows = [[btn("✅ Берём", "forecast_go")], [btn("🔄 Ещё скан", "forecast_rescan")], [btn("🛑 СТОП", "auto_stop_signals")]]
         if chat_id:
