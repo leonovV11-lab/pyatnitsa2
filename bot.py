@@ -25,8 +25,8 @@ from timezonefinder import TimezoneFinder
 
 # ---------- КОНСТАНТЫ ----------
 CONF_SIGNAL = 0.85
-CONF_MIN_STRICT = 0.65 
-CONF_MIN_RELAXED = 0.55 
+CONF_MIN_STRICT = 0.65   # строгий порог
+CONF_MIN_RELAXED = 0.55  # минимальный порог после строгих проверок
 FEE_MIN_TP = 0.006
 MIN_NET_PCT = 0.2
 VOL_MIN_24H = 1000000.0
@@ -131,42 +131,35 @@ def local_now():
 
 # ---------- СТРОГИЕ ПРОВЕРКИ ----------
 def strict_signal_check(app, sig, symbol):
-    # 1. Уверенность < 55%
+    # Абсолютный минимум: даже если всё идеально, ниже 55% не берем
     if sig.confidence < CONF_MIN_RELAXED:
         return False, "conf < 55%"
         
-    # 7. Наложение сигналов
     if "signal" in STATE["pending"]:
         return False, "pending занят"
         
-    # 8. Сон после убытков
     if is_sleeping():
         return False, "sleep"
         
-    # 2. Старший ТФ (штраф 10%)
-    # Примечание: сигнал уже посчитан в фоновом скане, тут мы доверяем ему, 
-    # но если confidence < 65%, то это мог быть штраф. Если < 55% - уже отсекли.
-    # Для строгого соответствия: если conf < 65%, то он прошел только за счет штрафа.
-    
-    # 4. Комиссия
+    # Проверки, которые дают право на снижение до 55%
     tp_dist = abs(sig.take_profit - sig.price) / sig.price if sig.price else 0
+    net = (tp_dist - 0.004) * 100
+    
     if tp_dist < FEE_MIN_TP:
         return False, "tp < 3x fee"
-        
-    # 5. Чистая прибыль < 0.2%
-    net = (tp_dist - 0.004) * 100
     if net < MIN_NET_PCT:
         return False, "net < 0.2%"
-        
-    # 6. Направление
+    if not sig.stop_loss or sig.stop_loss <= 0:
+        return False, "no stop"
     if STATE["auto"]["have_coin"] == False and sig.action == "SELL":
         return False, "sell not allowed"
         
-    # 11. ATR-стоп
-    if not sig.stop_loss or sig.stop_loss <= 0:
-        return False, "no stop"
+    # 55-65% пропускаем ТОЛЬКО если всё выше прошло успешно.
+    # Если < 65%, но > 55% - мы уже проверили всё, что нужно. ОК.
+    if sig.confidence < CONF_MIN_STRICT:
+        # Проверка на volume делает check_volume до вызова этой функции
+        pass # оставляем
         
-    # 12. Лот
     qty = calc_qty(sig.price, sig.stop_loss, sig.confidence)
     if qty <= 0:
         return False, "qty <= 0"
@@ -177,8 +170,6 @@ async def check_volume(symbol):
     try:
         ex = get_exchange_obj("binance")
         loop = asyncio.get_event_loop()
-        # 3. Объем < 100k
-        # Считаем по 96 свечам 15m (24 часа)
         raw = await loop.run_in_executor(None, lambda: ex.fetch_ohlcv(symbol, "15m", limit=96))
         if not raw: return False
         vol = sum(float(r[5]) * float(r[4]) for r in raw)
@@ -231,14 +222,12 @@ async def bg_scan_market():
 async def send_signal(app, r, reason=""):
     sig = r["signal"]
     
-    # Проверка объема
     if not await check_volume(r["symbol"]):
         return
         
-    # Все остальные проверки
     ok, msg = strict_signal_check(app, sig, r["symbol"])
     if not ok:
-        return # Молча отбрасываем
+        return
 
     budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
     risk_pct = 0.03 if sig.confidence >= 0.85 else (0.02 if sig.confidence >= 0.75 else 0.01)
@@ -281,6 +270,7 @@ async def _first_scan_then_loop(app):
     candidates = STATE["auto"].get("bg_candidates", [])
     if candidates:
         best = None
+        # Ищем только тех, у кого >= 55% (чтобы вообще показывать в прогнозе)
         for c in candidates:
             if c["chance"] >= CONF_MIN_RELAXED * 100:
                 best = c
