@@ -25,7 +25,6 @@ from timezonefinder import TimezoneFinder
 
 # ---------- КОНСТАНТЫ ----------
 CONF_SIGNAL = 0.85
-CONF_MIN_STRICT = 0.65   # 65% уверенности
 CONF_MIN_RELAXED = 0.55  
 FEE_MIN_TP = 0.006
 MIN_NET_PCT = 0.2
@@ -130,8 +129,8 @@ def local_now():
     except Exception: return datetime.datetime.utcnow()
 
 # ---------- СТРОГИЕ ПРОВЕРКИ ----------
-def strict_signal_check(app, sig, symbol):
-    if sig.confidence < CONF_MIN_RELAXED: return False, "conf < 55%"
+def strict_signal_check(app, sig, symbol, dynamic_conf):
+    if sig.confidence < dynamic_conf: return False, "conf < dynamic"
     if "signal" in STATE["pending"]: return False, "pending"
     if is_sleeping(): return False, "sleep"
         
@@ -191,8 +190,9 @@ async def bg_scan_market():
                     
                     sig = f.analyze_filtered(tf, tp_mult=3.0)
                     confidence = sig.confidence * 100
+                    atr_pct = float(df["atr"].iloc[-1]) / sig.price if sig.price else 0
                     
-                    return {"symbol": c["symbol"], "confidence": confidence,
+                    return {"symbol": c["symbol"], "confidence": confidence, "atr_pct": atr_pct,
                             "potential": c["potential"], "vol24": c["vol24"], "price": sig.price,
                             "signal": sig, "tf": tf, "regime": "normal"}
                 except Exception: return None
@@ -208,11 +208,11 @@ async def bg_scan_market():
         print("BG Scan error:", e)
         STATE["auto"]["bg_scan_done"] = True
 
-async def send_signal(app, r, reason=""):
+async def send_signal(app, r, reason="", dynamic_conf=55.0):
     sig = r["signal"]
     
     if not await check_volume(r["symbol"]): return
-    ok, msg = strict_signal_check(app, sig, r["symbol"])
+    ok, msg = strict_signal_check(app, sig, r["symbol"], dynamic_conf)
     if not ok: return
 
     budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
@@ -250,34 +250,45 @@ async def send_signal(app, r, reason=""):
 
 async def _first_scan_then_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
+    start_time = time.time()
     
     while STATE["auto"]["active"]:
-        # СКАНИРУЕМ 1 РАЗ
+        if time.time() - start_time > 600:
+            if chat_id:
+                await app.bot.send_message(chat_id=chat_id, text="⏱ 10 минут прошло. Не нашел точек входа с покрытием комиссии. Останавливаюсь.", reply_markup=kb([[btn("🏠 В меню", "start")]]))
+                STATE["auto"]["active"] = False
+            return
+
         await bg_scan_market()
         
         candidates = STATE["auto"].get("bg_candidates", [])
-        best = None
+        if not candidates:
+            await asyncio.sleep(15)
+            continue
+            
+        # АДАПТИВНЫЙ ПОРОГ
+        # Считаем сколько монет имеют хорошую волатильность (ATR > 1%)
+        vol_count = sum(1 for c in candidates if c["atr_pct"] > 0.01)
         
-        # 1. Ищем >= 65%
+        if vol_count >= 15:
+            # Рынок хороший, можно рискнуть (порог 55%)
+            dynamic_conf = 55.0
+            market_state = "стабильный"
+        elif vol_count < 5:
+            # Рынок слабый, закручиваем гайки (порог 75%)
+            dynamic_conf = 75.0
+            market_state = "слабый"
+        else:
+            # Средний (порог 65%)
+            dynamic_conf = 65.0
+            market_state = "средний"
+            
+        best = None
         for c in candidates:
-            if c["confidence"] >= 65.0:
+            if c["confidence"] >= dynamic_conf:
                 best = c
                 break
                 
-        # 2. Если не нашли, ищем >= 60%
-        if not best:
-            for c in candidates:
-                if c["confidence"] >= 60.0:
-                    best = c
-                    break
-                    
-        # 3. Если не нашли, ищем >= 55%
-        if not best:
-            for c in candidates:
-                if c["confidence"] >= 55.0:
-                    best = c
-                    break
-                    
         if best:
             STATE["auto"]["current_offer"] = best["symbol"]
             STATE["auto"]["current_chance"] = best["confidence"]
@@ -287,25 +298,18 @@ async def _first_scan_then_loop(app):
             est_usdt = STATE["daily_budget"] * (est_pct / 100.0)
             
             text = ("📊 <b>Лучшая монета</b>\n\n"
+                    "Рынок: <b>" + market_state + "</b> (порог " + str(int(dynamic_conf)) + "%)\n\n"
                     "🪙 <b>" + best["symbol"] + "</b>\n"
                     "⏱ ТФ: <b>" + tf_label(best["tf"]) + "</b>\n"
                     "🎯 Уверенность: <b>" + str(int(best["confidence"])) + "%</b>\n"
-                    "📈 Прогноз за " + str(hours) + "ч: <b>+" + str(round(est_pct, 1)) + "%</b> (~$" + str(round(est_usdt, 2)) + ")\n"
-                    "💰 Объем: <b>" + str(round(best["vol24"]/1000000, 1)) + "M</b>")
+                    "📈 Прогноз: <b>+" + str(round(est_pct, 1)) + "%</b> (~$" + str(round(est_usdt, 2)) + ")")
             
             rows = [[btn("✅ Берём", "forecast_go")], [btn("🔄 Ещё скан", "forecast_rescan")], [btn("🛑 СТОП", "auto_stop_signals")]]
             if chat_id:
                 await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
             return
             
-        # Если ни 65, ни 60, ни 55 не нашли — пишем про неудачный день
-        if chat_id:
-            await app.bot.send_message(chat_id=chat_id, text="Сегодня неудачный день. Максимум что есть — ниже 55%. Не торгую.", reply_markup=kb([[btn("🏠 В меню", "start")]]))
-            STATE["auto"]["active"] = False
-            return
-        
         await asyncio.sleep(15)
-        if not STATE["auto"]["active"]: return
 
 async def scan_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
@@ -317,20 +321,26 @@ async def scan_loop(app):
             
             current_sym = STATE["auto"]["current_offer"]
             candidates = STATE["auto"].get("bg_candidates", [])
+            
+            # Считаем динамический порог для сигналов
+            vol_count = sum(1 for c in candidates if c["atr_pct"] > 0.01)
+            if vol_count >= 15: dynamic_conf = 55.0
+            elif vol_count < 5: dynamic_conf = 75.0
+            else: dynamic_conf = 65.0
+            
             current_data = next((c for c in candidates if c["symbol"] == current_sym), None)
             
             if current_data:
-                if current_data["confidence"] >= CONF_MIN_RELAXED * 100:
+                if current_data["confidence"] >= dynamic_conf:
                     key = current_data["symbol"] + ":" + current_data["signal"].action
                     if key not in STATE["auto"]["seen_signals"]:
                         STATE["auto"]["seen_signals"].add(key)
-                        await send_signal(app, current_data, "по текущей")
+                        await send_signal(app, current_data, "по текущей", dynamic_conf)
                         continue
             
             if not STATE["auto"]["symbols"]:
                 for c in candidates:
-                    # Ищем лучше текущей, но не ниже 65
-                    if c["symbol"] != current_sym and c["confidence"] >= 65.0:
+                    if c["symbol"] != current_sym and c["confidence"] >= dynamic_conf:
                         text = ("🔥 <b>Есть лучше!</b>\n\n"
                                 "Сейчас: " + current_sym + " (" + str(int(STATE["auto"]["current_chance"])) + "%)\n"
                                 "Новая: <b>" + c["symbol"] + "</b> (" + str(int(c["confidence"])) + "%)")
@@ -348,22 +358,17 @@ async def forecast_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     checked = STATE["auto"].get("bg_candidates", [])
     if not checked: return
     
+    vol_count = sum(1 for c in checked if c["atr_pct"] > 0.01)
+    if vol_count >= 15: dynamic_conf = 55.0
+    elif vol_count < 5: dynamic_conf = 75.0
+    else: dynamic_conf = 65.0
+    
     best = None
     for c in checked:
-        if c["confidence"] >= 65.0:
+        if c["confidence"] >= dynamic_conf:
             best = c
             break
-    if not best:
-        for c in checked:
-            if c["confidence"] >= 60.0:
-                best = c
-                break
-    if not best:
-        for c in checked:
-            if c["confidence"] >= 55.0:
-                best = c
-                break
-                
+            
     if not best:
         await update.callback_query.edit_message_text("Нет монет.", reply_markup=kb(nav_btns("start")))
         return
@@ -393,9 +398,15 @@ async def hascoins_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     candidates = STATE["auto"].get("bg_candidates", [])
     current_sym = STATE["auto"]["current_offer"]
+    
+    vol_count = sum(1 for c in candidates if c["atr_pct"] > 0.01)
+    if vol_count >= 15: dynamic_conf = 55.0
+    elif vol_count < 5: dynamic_conf = 75.0
+    else: dynamic_conf = 65.0
+    
     better = None
     for c in candidates:
-        if c["symbol"] != current_sym and c["confidence"] >= 65.0:
+        if c["symbol"] != current_sym and c["confidence"] >= dynamic_conf:
             better = c; break
             
     if better:
@@ -405,7 +416,7 @@ async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.edit_message_text("✅ Поменял на " + better["symbol"], reply_markup=kb(nav_btns("start")))
         key = better["symbol"] + ":" + better["signal"].action
         STATE["auto"]["seen_signals"].add(key)
-        await send_signal(ctx.application, better, "новая лучшая")
+        await send_signal(ctx.application, better, "новая лучшая", dynamic_conf)
     else:
         await update.callback_query.edit_message_text("Оставил текущую.", reply_markup=kb(nav_btns("start")))
 
@@ -476,7 +487,7 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
     STATE["auto"]["active"] = True
     STATE["auto"]["symbols"] = []
-    await update.callback_query.edit_message_text("Биржа: " + exchanges.EXCHANGES.get(key, key) + "\n⏳ Ищу монеты (65% -> 60% -> 55%)...", reply_markup=kb([]))
+    await update.callback_query.edit_message_text("Биржа: " + exchanges.EXCHANGES.get(key, key) + "\n⏳ Ищу монеты...", reply_markup=kb([]))
     if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
         STATE["auto"]["task"] = asyncio.create_task(_first_scan_then_loop(ctx.application))
 
