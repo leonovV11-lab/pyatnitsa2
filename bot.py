@@ -41,8 +41,8 @@ LOSS_LIMIT = 3
 SLEEP_MIN = 30
 MAX_POSITIONS = 2
 MAX_MULTI = 10
-SCAN_TOP = 150
-SCAN_CONCURRENCY = 50
+SCAN_TOP = 80
+SCAN_CONCURRENCY = 10
 SCAN_INTERVAL = 300
 MARKETS_TTL = 3600
 EMA200_TTL = 300
@@ -179,10 +179,12 @@ def get_exchange_obj(key):
     if key in _EX_CACHE:
         return _EX_CACHE[key]
     cls = getattr(ccxt, key)
-    params = {"enableRateLimit": True, "timeout": 15000,
-              "options": {"defaultType": "spot"}}
+    params = {"timeout": 10000, "options": {"defaultType": "spot"}}
     if key == "okx":
         params["options"]["fetchMarkets"] = ["spot"]
+        params["enableRateLimit"] = False
+    else:
+        params["enableRateLimit"] = True
     ex = cls(params)
     _EX_CACHE[key] = ex
     return ex
@@ -303,7 +305,7 @@ def strict_signal_check(symbol, sig, tf, atr_val):
         return (False, "чистая < 0.2%")
     return (True, "ok")
 
-# ---------- СКАН (БЫСТРЫЙ) ----------
+# ---------- СКАН ----------
 async def prefilter_symbols_async(exchange_key, tf="15m"):
     loop = asyncio.get_event_loop()
     task_m = loop.run_in_executor(None, lambda: get_markets(exchange_key))
@@ -334,16 +336,18 @@ async def fetch_and_score(ex, item, tf, sem):
         try:
             symbol = item["symbol"]
             loop = asyncio.get_event_loop()
-            raw = await loop.run_in_executor(
-                None, lambda: ex.fetch_ohlcv(symbol, tf, limit=60))
-            if not raw or len(raw) < 20:
+            raw = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: ex.fetch_ohlcv(symbol, tf, limit=30)),
+                timeout=8.0
+            )
+            if not raw or len(raw) < 15:
                 return None
             import pandas as pd
             df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
             df["ts"] = pd.to_datetime(df["ts"], unit="ms")
             f = Friday(symbol=symbol, exchange_name=STATE["auto"]["exchange"])
             df = f.enrich(df, tf).dropna().reset_index(drop=True)
-            if len(df) < 15:
+            if len(df) < 10:
                 return None
             last = df.iloc[-1]
             price = float(last["close"])
@@ -375,13 +379,24 @@ async def fast_scan(tf, need=1):
         return []
     ex = get_exchange_obj(ex_key)
     sem = asyncio.Semaphore(SCAN_CONCURRENCY)
-    tasks = [fetch_and_score(ex, c, tf, sem) for c in candidates]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
     good = []
-    for r in results:
-        if isinstance(r, Exception) or r is None:
-            continue
-        good.append(r)
+    for i in range(0, len(candidates), SCAN_CONCURRENCY):
+        chunk = candidates[i:i+SCAN_CONCURRENCY]
+        tasks = [fetch_and_score(ex, c, tf, sem) for c in chunk]
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            results = []
+        for r in results:
+            if isinstance(r, Exception) or r is None:
+                continue
+            good.append(r)
+        if len(good) >= 10:
+            break
+        await asyncio.sleep(0.2)
     good.sort(key=lambda x: x.get("profit_potential", 0), reverse=True)
     return good
 
@@ -475,7 +490,7 @@ async def _first_scan_then_loop(app):
             tf = STATE["auto"]["tf"]
             hours = STATE["auto"].get("work_hours", 24)
             t0 = time.time()
-            candidates = await fast_scan(tf, need=150)
+            candidates = await fast_scan(tf, need=80)
             dt = round(time.time() - t0, 1)
             STATE["auto"]["last_scan_ts"] = time.time()
             STATE["auto"]["first_scan_done"] = True
@@ -495,7 +510,7 @@ async def _first_scan_then_loop(app):
             STATE["auto"]["forecast"] = forecast
             STATE["auto"]["forecast_candidates"] = checked
             STATE["auto"]["forecast_confirmed"] = False
-            text = ("📊 <b>Лучшая монета из 150</b>\n\n"
+            text = ("📊 <b>Лучшая монета</b>\n\n"
                     "🪙 <b>" + forecast["symbol"] + "</b>\n"
                     "⏱ ТФ: <b>" + forecast["tf"] + "</b>\n"
                     "💰 Примерный потенциал за " + str(hours) + "ч: <b>+" +
@@ -535,7 +550,7 @@ async def scan_loop(app):
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
             t0 = time.time()
-            candidates = await fast_scan(tf, need=150)
+            candidates = await fast_scan(tf, need=80)
             dt = round(time.time() - t0, 1)
             STATE["auto"]["last_scan_ts"] = time.time()
             sent = False
@@ -611,7 +626,7 @@ async def demo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def demo_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("🔍 Сканирую...")
     tf = STATE["auto"]["tf"]
-    candidates = await fast_scan(tf, need=150)
+    candidates = await fast_scan(tf, need=80)
     best = None
     for r in candidates:
         r2 = run_strict_check_and_build_signal(r, tf)
