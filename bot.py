@@ -37,6 +37,7 @@ SLEEP_MIN = 30
 MAX_POSITIONS = 2
 SCAN_INTERVAL = 300
 DAILY_DD_LIMIT = 0.05
+FAST_SCAN_LIMIT = 30 # Ограничение для быстрого скана
 
 _EX_CACHE = {}
 _OKX_MARKETS = {"ts": 0, "symbols": set()}
@@ -226,19 +227,19 @@ async def bg_scan_market():
                 qv = float(t.get("quoteVolume") or 0)
                 if qv < VOL_MIN_24H or price <= 0: continue
                 
-                # ПРИОРИТЕТ НА МАКСИМАЛЬНОЕ ДВИЖЕНИЕ (ПОТЕНЦИАЛ), объем только как фильтр
                 change = abs(float(t.get("priceChangePercent") or 0))
                 potential = change 
                 
                 pre_candidates.append({"symbol": sym_fmt, "vol24": qv, "price": price, "potential": potential})
             
-            # Сортируем по чистой волатильности
             pre_candidates.sort(key=lambda x: x["potential"], reverse=True)
-            top_pairs = pre_candidates[:150]
+            
+            # БЕРЕМ ТОЛЬКО ТОП-30 ДЛЯ МАКСИМАЛЬНОЙ СКОРОСТИ
+            top_pairs = pre_candidates[:FAST_SCAN_LIMIT]
             
             tf = STATE["auto"]["tf"]
             
-            sem = asyncio.Semaphore(50)
+            sem = asyncio.Semaphore(30)
             async def strict_check(c):
                 async with sem:
                     try:
@@ -301,9 +302,12 @@ async def send_signal(app, r, reason="", dynamic_conf=55.0):
             "\nСтоп " + fmt_price(sig.stop_loss) + "\nТейк " + fmt_price(sig.take_profit) +
             "\n💰 Чистая ~" + str(round(net_pct, 2)) + "% (~$" + str(round(net_usdt, 2)) + ")")
     
-    rows = [[btn("✅ " + ("Купил" if sig.action == "BUY" else "Продал"), "sig_buy_signal" if sig.action == "BUY" else "sig_sell_signal")],
-            [btn("✏️ Своя сумма", "sig_buy_custom" if sig.action == "BUY" else "sig_sell_custom")],
-            [btn("❌ Пропустил", "sig_skipped")], [btn("🛑 СТОП", "auto_stop_signals")]]
+    rows = [
+        [btn("✅ Купил по сигналу", "sig_buy_signal" if sig.action == "BUY" else "sig_sell_signal")],
+        [btn("✏️ Своя сумма", "sig_buy_custom" if sig.action == "BUY" else "sig_sell_custom")],
+        [btn("❌ Пропустил", "sig_skipped")],
+        [btn("🛑 СТОП", "auto_stop_signals")]
+    ]
             
     chat_id = app.bot_data.get("chat_id", 0)
     if chat_id:
