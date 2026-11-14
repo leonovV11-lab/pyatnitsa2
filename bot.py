@@ -34,7 +34,7 @@ PANIC_INTERVAL = 5
 LOSS_LIMIT = 3
 SLEEP_MIN = 30
 MAX_POSITIONS = 2
-SCAN_TOP = 150
+SCAN_INTERVAL = 300
 DAILY_DD_LIMIT = 0.05
 
 _EX_CACHE = {}
@@ -47,8 +47,7 @@ STATE = {
     "auto": {
         "active": False, "task": None, "exchange": "okx", "tf": "1m",
         "work_hours": 24, "symbols": [], "seen_signals": set(),
-        "forecast": None, "forecast_candidates": [], "forecast_confirmed": False,
-        "last_scan_result": "",
+        "current_offer": None, "current_chance": 0,
         "bg_scan_done": False, "bg_candidates": [],
     },
     "manual": {"exchange": config.EXCHANGE, "pairs": [], "page": 0, "symbol": None},
@@ -127,45 +126,44 @@ def local_now():
     try: return datetime.datetime.now(ZoneInfo(STATE["tz"]))
     except Exception: return datetime.datetime.utcnow()
 
-# ---------- ФОНОВЫЙ СКАН И СИГНАЛЫ ----------
-async def fetch_candles_okx(session, symbol, tf):
-    inst_id = symbol.replace("/", "-")
-    bar = tf.upper() if tf in ("1h", "4h") else tf
-    url = "https://www.okx.com/api/v5/market/candles?instId=" + inst_id + "&bar=" + bar + "&limit=60"
-    try:
-        async with session.get(url, timeout=3.0) as r:
-            if r.status != 200: return None
-            d = await r.json()
-            if d.get("code") != "0" or not d.get("data"): return None
-            raw = d["data"]; raw.reverse()
-            import pandas as pd
-            df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"])
-            df = df[["ts", "open", "high", "low", "close", "vol"]]
-            df["ts"] = pd.to_datetime(df["ts"].astype(float), unit="ms")
-            for c in ["open", "high", "low", "close", "vol"]: df[c] = df[c].astype(float)
-            return df
-    except Exception: return None
-
+# ---------- СКАН И СИГНАЛЫ ----------
 async def bg_scan_market():
-    # Фоновый скан Binance (как независимого источника)
     try:
         ex = get_exchange_obj("binance")
         loop = asyncio.get_event_loop()
         tickers = await loop.run_in_executor(None, lambda: ex.fetch_tickers())
-        res = []
+        
+        pre_candidates = []
         for sym, t in tickers.items():
             if not sym.endswith("/USDT"): continue
             price = float(t.get("last") or 0)
-            open24 = float(t.get("open") or 0)
             qv = float(t.get("quoteVolume") or 0)
             if qv < VOL_MIN_24H or price <= 0: continue
-            change = abs((price - open24) / open24 * 100) if open24 > 0 else 0
-            potential = (qv / 1000000.0) * change
-            res.append({"symbol": sym, "score": potential, "potential": potential, "vol24": qv, "change": change, "price": price})
-        res.sort(key=lambda x: x["score"], reverse=True)
-        STATE["auto"]["bg_candidates"] = res[:SCAN_TOP]
+            pre_candidates.append({"symbol": sym, "vol24": qv, "price": price, "change": float(t.get("percentage") or 0)})
+        
+        pre_candidates.sort(key=lambda x: x["vol24"], reverse=True)
+        top_20 = pre_candidates[:20]
+        
+        async def get_chance(c):
+            try:
+                f = Friday(symbol=c["symbol"], exchange_name="binance")
+                df = await loop.run_in_executor(None, lambda: f.fetch("1m", 60))
+                df = f.enrich(df, "1m").dropna()
+                if len(df) < 10: return None
+                sig = f.analyze_filtered("1m", tp_mult=3.0)
+                chance = sig.confidence * 100
+                return {"symbol": c["symbol"], "chance": chance,
+                        "vol24": c["vol24"], "price": sig.price,
+                        "signal": sig, "tf": "1m", "regime": "normal"}
+            except Exception: return None
+                
+        tasks = [get_chance(c) for c in top_20]
+        results = await asyncio.gather(*tasks)
+        valid = [r for r in results if r is not None]
+        
+        valid.sort(key=lambda x: x["chance"], reverse=True)
+        STATE["auto"]["bg_candidates"] = valid
         STATE["auto"]["bg_scan_done"] = True
-        print(f"BG Scan done. Found {len(res)} candidates.")
     except Exception as e:
         print("BG Scan error:", e)
         STATE["auto"]["bg_scan_done"] = True
@@ -183,7 +181,9 @@ async def send_signal(app, r, reason=""):
     lot = qty * sig.price
     if lot <= 0: return
     
-    net = (abs(sig.take_profit - sig.price) / sig.price - 0.004) * 100
+    net_pct = (abs(sig.take_profit - sig.price) / sig.price - 0.004) * 100
+    net_usdt = lot * (net_pct / 100.0)
+    
     STATE["pending"]["signal"] = {"action": sig.action, "symbol": r["symbol"], "price": sig.price, "lot": lot, "qty": qty, "sl": sig.stop_loss, "tp": sig.take_profit}
     
     text = ("🎯 " + r["symbol"] + " · " + r["tf"] + ("\n" + reason if reason else "") +
@@ -192,7 +192,7 @@ async def send_signal(app, r, reason=""):
             "\n💵 Лот: " + str(round(lot, 2)) + " USDT" +
             "\n🛡 Риск: " + str(round(max_loss, 2)) + " USDT (" + str(round(risk_pct * 100, 1)) + "%)" +
             "\nСтоп " + fmt_price(sig.stop_loss) + "\nТейк " + fmt_price(sig.take_profit) +
-            "\n💰 Чистая ~" + str(round(net, 2)) + "%")
+            "\n💰 Чистая ~" + str(round(net_pct, 2)) + "% (~$" + str(round(net_usdt, 2)) + ")")
     
     rows = [[btn("✅ " + ("Купил" if sig.action == "BUY" else "Продал"), "sig_buy_signal" if sig.action == "BUY" else "sig_sell_signal")],
             [btn("✏️ Своя сумма", "sig_buy_custom" if sig.action == "BUY" else "sig_sell_custom")],
@@ -204,124 +204,112 @@ async def send_signal(app, r, reason=""):
 
 async def _first_scan_then_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
+    while not STATE["auto"]["bg_scan_done"] and STATE["auto"]["active"]:
+        await asyncio.sleep(1)
+        
+    candidates = STATE["auto"].get("bg_candidates", [])
+    if candidates:
+        best = candidates[0]
+        STATE["auto"]["current_offer"] = best["symbol"]
+        STATE["auto"]["current_chance"] = best["chance"]
+        hours = STATE["auto"].get("work_hours", 24)
+        
+        # Ожидаемая прибыль за сессию
+        est_pct = best["signal"].confidence * 100 * (hours / 1.5) * 0.35
+        est_usdt = STATE["daily_budget"] * (est_pct / 100.0)
+        
+        text = ("📊 <b>Лучшая монета</b>\n\n"
+                "🪙 <b>" + best["symbol"] + "</b>\n"
+                "🎯 Шанс: <b>" + str(int(best["chance"])) + "%</b>\n"
+                "📈 Прогноз за " + str(hours) + "ч: <b>+" + str(round(est_pct, 1)) + "%</b> (~$" + str(round(est_usdt, 2)) + ")\n"
+                "💰 Объем: <b>" + str(round(best["vol24"]/1000000, 1)) + "M</b>")
+        
+        rows = [[btn("✅ Берём", "forecast_go")], [btn("🔄 Ещё скан", "forecast_rescan")], [btn("🛑 СТОП", "auto_stop_signals")]]
+        if chat_id:
+            await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
+            
     while STATE["auto"]["active"]:
-        try:
-            day_rollover()
-            if STATE["day_halt"] or is_sleeping():
-                await asyncio.sleep(30)
-                continue
-            tf = STATE["auto"]["tf"]
-            hours = STATE["auto"].get("work_hours", 24)
-            
-            # Ждем, если фоновый скан еще не завершен
-            while not STATE["auto"]["bg_scan_done"] and STATE["auto"]["active"]:
-                await asyncio.sleep(1)
-                
-            candidates = STATE["auto"].get("bg_candidates", [])
-            if not candidates:
-                STATE["auto"]["last_scan_result"] = "пусто"
-                await asyncio.sleep(5)
-                continue
-                
-            best = candidates[0]
-            forecast = {
-                "symbol": best["symbol"], "tf": tf_label(tf), "tf_code": tf,
-                "est_pct": best["change"], "profit_potential": best["potential"],
-                "chance": 100, "atr_pct": best["change"]/100, "signal": None, "regime": "normal",
-                "score": best["score"], "hours": hours
-            }
-            STATE["auto"]["forecast"] = forecast
-            STATE["auto"]["forecast_candidates"] = candidates
-            STATE["auto"]["forecast_confirmed"] = False
-            
-            text = ("📊 <b>Лучшая монета</b>\n\n"
-                    "🪙 <b>" + forecast["symbol"] + "</b>\n"
-                    "⏱ ТФ: <b>" + forecast["tf"] + "</b>\n"
-                    "💰 Объем 24ч: <b>" + str(round(best["vol24"]/1000000, 1)) + "M</b>\n"
-                    "📈 Волатильность 24ч: <b>" + str(round(forecast["est_pct"], 1)) + "%</b>\n"
-                    "🎯 Потенциал: <b>" + str(round(forecast["profit_potential"], 1)) + "</b>")
-            
-            rows = [[btn("✅ Берём", "forecast_go")], [btn("🔄 Ещё скан", "forecast_rescan")], [btn("🛑 СТОП", "auto_stop_signals")]]
-            if chat_id:
-                await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
-            
-            while STATE["auto"]["active"] and not STATE["auto"].get("forecast_confirmed"):
-                await asyncio.sleep(2)
-            if not STATE["auto"]["active"]: return
-        except Exception as e:
-            print("first_scan error:", e)
-            await asyncio.sleep(5)
+        await asyncio.sleep(SCAN_INTERVAL)
+        if not STATE["auto"]["active"]: return
+        await bg_scan_market()
 
 async def scan_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
     while STATE["auto"]["active"]:
         try:
-            day_rollover()
             if STATE["day_halt"] or is_sleeping() or "signal" in STATE["pending"] or portfolio.count_open() >= MAX_POSITIONS:
-                await asyncio.sleep(30)
+                await asyncio.sleep(5)
                 continue
             
-            tf = STATE["auto"]["tf"]
+            current_sym = STATE["auto"]["current_offer"]
             candidates = STATE["auto"].get("bg_candidates", [])
+            current_data = next((c for c in candidates if c["symbol"] == current_sym), None)
             
-            sent = False
-            for r in candidates:
-                if "signal" in STATE["pending"] or portfolio.count_open() >= MAX_POSITIONS: break
-                
-                async with aiohttp.ClientSession() as s:
-                    df = await fetch_candles_okx(s, r["symbol"], tf)
-                    if df is None or len(df) < 15: continue
-                    f = Friday(symbol=r["symbol"], exchange_name="okx")
-                    df = f.enrich(df, tf).dropna().reset_index(drop=True)
-                    if len(df) < 10: continue
-                    try:
-                        sig = f.analyze_filtered(tf, tp_mult=3.0)
-                        if sig.confidence < CONF_MIN_AUTO: continue
-                        tp_dist = abs(sig.take_profit - sig.price) / sig.price if sig.price else 0
-                        if tp_dist < FEE_MIN_TP or (tp_dist - 0.004) * 100 < MIN_NET_PCT: continue
-                        r["signal"] = sig; r["regime"] = "normal"; r["tf"] = tf
-                    except Exception: continue
-                
-                key = r["symbol"] + ":" + r["signal"].action
-                if key in STATE["auto"]["seen_signals"]: continue
-                STATE["auto"]["seen_signals"].add(key)
-                reason = "🔥 лучше текущей" if STATE["auto"]["symbols"] and r["symbol"] not in STATE["auto"]["symbols"] else ""
-                await send_signal(app, r, reason)
-                sent = True
-                break
+            if current_data:
+                if current_data["chance"] >= CONF_MIN_AUTO * 100:
+                    key = current_data["symbol"] + ":" + current_data["signal"].action
+                    if key not in STATE["auto"]["seen_signals"]:
+                        STATE["auto"]["seen_signals"].add(key)
+                        await send_signal(app, current_data, "по текущей")
+                        continue
+            
+            if not STATE["auto"]["symbols"]:
+                for c in candidates:
+                    if c["symbol"] != current_sym and c["chance"] > STATE["auto"]["current_chance"] * 1.10:
+                        text = ("🔥 <b>Есть лучше!</b>\n\n"
+                                "Сейчас: " + current_sym + " (" + str(int(STATE["auto"]["current_chance"])) + "%)\n"
+                                "Новая: <b>" + c["symbol"] + "</b> (" + str(int(c["chance"])) + "%)")
+                        rows = [[btn("✅ Поменять", "switch_yes")], [btn("❌ Оставить", "switch_no")]]
+                        if chat_id:
+                            await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
+                        break
+                        
             await asyncio.sleep(5)
         except Exception as e:
             print("scan_loop:", e)
             await asyncio.sleep(5)
 
 async def forecast_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    STATE["auto"]["forecast_confirmed"] = True
-    checked = STATE["auto"].get("forecast_candidates", [])
-    if not checked:
-        await update.callback_query.edit_message_text("Нет кандидатов.", reply_markup=kb(nav_btns("start"))); return
-        
+    checked = STATE["auto"].get("bg_candidates", [])
+    if not checked: return
     best = checked[0]
-    tf = STATE["auto"]["tf"]
-    await update.callback_query.edit_message_text("✅ Взял " + best["symbol"] + ".\nПроверяю сигнал...", reply_markup=kb([]))
+    STATE["auto"]["symbols"] = [best["symbol"]]
+    STATE["auto"]["current_offer"] = best["symbol"]
+    STATE["auto"]["current_chance"] = best["chance"]
     
-    async with aiohttp.ClientSession() as s:
-        df = await fetch_candles_okx(s, best["symbol"], tf)
-        if df is not None and len(df) >= 15:
-            f = Friday(symbol=best["symbol"], exchange_name="okx")
-            df = f.enrich(df, tf).dropna().reset_index(drop=True)
-            if len(df) >= 10:
-                try:
-                    sig = f.analyze_filtered(tf, tp_mult=3.0)
-                    best["signal"] = sig; best["regime"] = "normal"; best["tf"] = tf
-                    STATE["auto"]["symbols"] = [best["symbol"]]
-                    await send_signal(ctx.application, best, "стартовая")
-                except Exception as e:
-                    await update.callback_query.edit_message_text("Ошибка анализа: " + str(e), reply_markup=kb(nav_btns("start"))); return
-    await scan_loop(ctx.application)
+    await update.callback_query.edit_message_text("✅ Взял " + best["symbol"] + ".\nЖду сигнала...", reply_markup=kb(nav_btns("start")))
+    
+    key = best["symbol"] + ":" + best["signal"].action
+    STATE["auto"]["seen_signals"].add(key)
+    await send_signal(ctx.application, best, "стартовая")
+    
+    if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
+        STATE["auto"]["task"] = asyncio.create_task(scan_loop(ctx.application))
 
 async def forecast_rescan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    STATE["auto"]["forecast_confirmed"] = True
     await update.callback_query.edit_message_text("🔄 Пересканирую...", reply_markup=kb(nav_btns("start")))
+
+async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    candidates = STATE["auto"].get("bg_candidates", [])
+    current_sym = STATE["auto"]["current_offer"]
+    better = None
+    for c in candidates:
+        if c["symbol"] != current_sym and c["chance"] > STATE["auto"]["current_chance"] * 1.10:
+            better = c; break
+            
+    if better:
+        STATE["auto"]["symbols"] = [better["symbol"]]
+        STATE["auto"]["current_offer"] = better["symbol"]
+        STATE["auto"]["current_chance"] = better["chance"]
+        await update.callback_query.edit_message_text("✅ Поменял на " + better["symbol"], reply_markup=kb(nav_btns("start")))
+        key = better["symbol"] + ":" + better["signal"].action
+        STATE["auto"]["seen_signals"].add(key)
+        await send_signal(ctx.application, better, "новая лучшая")
+    else:
+        await update.callback_query.edit_message_text("Оставил текущую.", reply_markup=kb(nav_btns("start")))
+
+async def switch_no(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.edit_message_text("Ок, оставил текущую.", reply_markup=kb(nav_btns("start")))
 
 # ---------- МЕНЮ ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -344,9 +332,7 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def auto_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["bg_scan_done"] = False
     STATE["auto"]["bg_candidates"] = []
-    # Запускаем фоновый скан прямо сейчас, пока пользователь вводит данные
     asyncio.create_task(bg_scan_market())
-    
     STATE["pending"]["auto"] = "balance"
     await update.callback_query.edit_message_text("Баланс (USDT)?", reply_markup=kb(nav_btns("start")))
 
@@ -387,13 +373,7 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
     STATE["auto"]["active"] = True
     STATE["auto"]["symbols"] = []
-    
-    await update.callback_query.edit_message_text("Биржа: " + exchanges.EXCHANGES.get(key, key) + "\n⏳ Фильтрую...", reply_markup=kb([]))
-    
-    # Ждем завершения фонового скана (он запущен с кнопки автопилота)
-    if not STATE["auto"]["bg_scan_done"]:
-        await asyncio.sleep(2)
-
+    await update.callback_query.edit_message_text("Биржа: " + exchanges.EXCHANGES.get(key, key) + "\n⏳ Жду скан...", reply_markup=kb([]))
     if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
         STATE["auto"]["task"] = asyncio.create_task(_first_scan_then_loop(ctx.application))
 
@@ -411,8 +391,6 @@ async def auto_tf_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def hascoins_no(update: Update, ctx: ContextTypes.DEFAULT_TYPE): await update.callback_query.edit_message_text("Ок.", reply_markup=kb(nav_btns("start")))
 async def hascoins_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE): await update.callback_query.edit_message_text("Ок.", reply_markup=kb(nav_btns("start")))
-async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE): await update.callback_query.edit_message_text("Ок.", reply_markup=kb(nav_btns("start")))
-async def switch_no(update: Update, ctx: ContextTypes.DEFAULT_TYPE): await update.callback_query.edit_message_text("Ок.", reply_markup=kb(nav_btns("start")))
 async def tf_ok_15m(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["tf"] = "15m"
     await update.callback_query.edit_message_text("Ок, 15m.", reply_markup=kb(nav_btns("start")))
@@ -423,14 +401,12 @@ async def demo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def demo_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("🔍 Сканирую...")
-    if not STATE["auto"]["bg_scan_done"]:
-        await bg_scan_market()
+    if not STATE["auto"]["bg_scan_done"]: await bg_scan_market()
     candidates = STATE["auto"].get("bg_candidates", [])
-    if not candidates:
-        await update.callback_query.edit_message_text("Не нашёл.", reply_markup=kb(nav_btns("demo"))); return
+    if not candidates: await update.callback_query.edit_message_text("Не нашёл.", reply_markup=kb(nav_btns("demo"))); return
     best = candidates[0]
     STATE["demo"]["symbol"] = best["symbol"]; STATE["demo"]["buy_price"] = best["price"]
-    text = ("🎮 ДЕМО\n" + best["symbol"] + "\nЛидер потенциала: " + str(round(best["potential"], 1)))
+    text = ("🎮 ДЕМО\n" + best["symbol"] + "\nШанс: " + str(int(best["chance"])) + "%")
     rows = [[btn("✅ Купил", "demo_buy")], [btn("❌ Пропустил", "demo_skip")], nav_btns("demo")[0]]
     await update.callback_query.edit_message_text(text, reply_markup=kb(rows))
 
@@ -449,6 +425,7 @@ async def demo_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _trailing_loop(app, symbol):
     chat_id = app.bot_data.get("chat_id", 0)
     STATE["trailing"]["active"][symbol] = True
+    live_pnl_sent = False
     while STATE["trailing"]["active"].get(symbol):
         await asyncio.sleep(30)
         try:
@@ -461,6 +438,13 @@ async def _trailing_loop(app, symbol):
             portfolio.update_peak(price, symbol)
             pos2 = portfolio.find_open(symbol)
             if not pos2: break
+            
+            # Live PnL: если профит больше 0.5% и еще не отправляли
+            pnl_now = portfolio.current_pnl(price, symbol)
+            if pnl_now and pnl_now["pnl_pct"] >= 0.5 and not live_pnl_sent and chat_id:
+                live_pnl_sent = True
+                await app.bot.send_message(chat_id=chat_id, text="📈 " + symbol + " сейчас +" + str(round(pnl_now["pnl_pct"], 2)) + "% (~$" + str(round(pnl_now["pnl_abs"], 2)) + ")")
+            
             best = pos2.get("peak", pos["entry"])
             if pos2["side"] == "BUY":
                 gain = (best - pos["entry"]) / pos["entry"]
@@ -472,7 +456,7 @@ async def _trailing_loop(app, symbol):
                     if "error" not in trade:
                         if trade["pnl_pct"] < 0: register_loss(trade.get("pnl_abs", 0))
                         else: register_win(trade.get("pnl_abs", 0))
-                        if chat_id: await app.bot.send_message(chat_id=chat_id, text="🛡 " + symbol + " PnL: " + str(round(trade["pnl_pct"], 2)) + "%")
+                        if chat_id: await app.bot.send_message(chat_id=chat_id, text="🛡 " + symbol + " PnL: " + str(round(trade["pnl_pct"], 2)) + "% (" + str(round(trade["pnl_abs"], 2)) + " USDT)")
                     break
             else:
                 gain = (pos["entry"] - best) / pos["entry"]
@@ -837,7 +821,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         STATE["pending"]["auto"] = "check_time"; local = local_now().strftime("%H:%M")
         await q.edit_message_text("Время? (" + local + ")", reply_markup=kb(nav_btns("auto_retry_city"))); return
     if data == "auto_stop_signals":
-        STATE["auto"]["active"] = False; STATE["auto"]["forecast_confirmed"] = True
+        STATE["auto"]["active"] = False
         if STATE["auto"].get("task"): STATE["auto"]["task"].cancel(); STATE["auto"]["task"] = None
         await q.edit_message_text("🛑 Стоп.", reply_markup=kb([[btn("🏠 В меню", "start")]])); return
     if data.startswith("auto_ex_set_"): await auto_ex_set(update, ctx); return
