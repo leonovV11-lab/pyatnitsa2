@@ -28,7 +28,7 @@ CONF_SIGNAL = 0.85
 CONF_MIN_RELAXED = 0.55  
 FEE_MIN_TP = 0.006
 MIN_NET_PCT = 0.2
-VOL_MIN_24H = 1000000.0
+VOL_MIN_24H = 1000000.0 
 VOL_MIN_SIGNAL = 100000.0
 PANIC_DROP = 0.02
 PANIC_INTERVAL = 5
@@ -131,7 +131,6 @@ def local_now():
 # ---------- БЫСТРЫЙ API ЗАПРОС ----------
 async def fetch_candles(session, symbol, tf, limit=60):
     try:
-        # Прямой запрос к Binance API (быстрее чем ccxt)
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol.replace('/', '')}&interval={tf}&limit={limit}"
         async with session.get(url, timeout=3.0) as resp:
             if resp.status != 200: return None
@@ -146,6 +145,15 @@ async def fetch_candles(session, symbol, tf, limit=60):
             return df
     except Exception:
         return None
+
+async def fetch_binance_tickers(session):
+    try:
+        url = "https://api.binance.com/api/v3/ticker/24hr"
+        async with session.get(url, timeout=5.0) as resp:
+            if resp.status != 200: return []
+            return await resp.json()
+    except Exception:
+        return []
 
 # ---------- СТРОГИЕ ПРОВЕРКИ ----------
 def strict_signal_check(app, sig, symbol, dynamic_conf):
@@ -180,31 +188,33 @@ async def check_volume(symbol):
 # ---------- СКАН И СИГНАЛЫ ----------
 async def bg_scan_market():
     try:
-        ex = get_exchange_obj("binance")
-        loop = asyncio.get_event_loop()
-        tickers = await loop.run_in_executor(None, lambda: ex.fetch_tickers())
-        
-        pre_candidates = []
-        for sym, t in tickers.items():
-            if not sym.endswith("/USDT"): continue
-            price = float(t.get("last") or 0)
-            qv = float(t.get("quoteVolume") or 0)
-            if qv < VOL_MIN_24H or price <= 0: continue
-            change = abs(float(t.get("percentage") or 0))
-            potential = (qv / 1000000.0) * change
-            pre_candidates.append({"symbol": sym, "vol24": qv, "price": price, "potential": potential})
-        
-        pre_candidates.sort(key=lambda x: x["potential"], reverse=True)
-        top_40 = pre_candidates[:40]
-        
-        tf = STATE["auto"]["tf"]
-        
-        # Параллельный быстрый скан
-        sem = asyncio.Semaphore(40)
-        async def strict_check(c):
-            async with sem:
-                try:
-                    async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession() as session:
+            raw_tickers = await fetch_binance_tickers(session)
+            if not raw_tickers: 
+                STATE["auto"]["bg_scan_done"] = True
+                return
+
+            pre_candidates = []
+            for t in raw_tickers:
+                sym = t.get("symbol", "")
+                if not sym.endswith("USDT"): continue
+                sym_fmt = sym[:-4] + "/USDT"
+                price = float(t.get("lastPrice") or 0)
+                qv = float(t.get("quoteVolume") or 0)
+                if qv < VOL_MIN_24H or price <= 0: continue
+                change = abs(float(t.get("priceChangePercent") or 0))
+                potential = (qv / 1000000.0) * change
+                pre_candidates.append({"symbol": sym_fmt, "vol24": qv, "price": price, "potential": potential})
+            
+            pre_candidates.sort(key=lambda x: x["potential"], reverse=True)
+            top_pairs = pre_candidates 
+            
+            tf = STATE["auto"]["tf"]
+            
+            sem = asyncio.Semaphore(100)
+            async def strict_check(c):
+                async with sem:
+                    try:
                         df = await fetch_candles(session, c["symbol"], tf, 60)
                         if df is None or len(df) < 20: return None
                         
@@ -219,15 +229,15 @@ async def bg_scan_market():
                         return {"symbol": c["symbol"], "confidence": confidence, "atr_pct": atr_pct,
                                 "potential": c["potential"], "vol24": c["vol24"], "price": sig.price,
                                 "signal": sig, "tf": tf, "regime": "normal"}
-                except Exception: return None
-                    
-        tasks = [strict_check(c) for c in top_40]
-        results = await asyncio.gather(*tasks)
-        valid = [r for r in results if r is not None]
-        
-        valid.sort(key=lambda x: x["confidence"], reverse=True)
-        STATE["auto"]["bg_candidates"] = valid
-        STATE["auto"]["bg_scan_done"] = True
+                    except Exception: return None
+                        
+            tasks = [strict_check(c) for c in top_pairs]
+            results = await asyncio.gather(*tasks)
+            valid = [r for r in results if r is not None]
+            
+            valid.sort(key=lambda x: x["confidence"], reverse=True)
+            STATE["auto"]["bg_candidates"] = valid
+            STATE["auto"]["bg_scan_done"] = True
     except Exception as e:
         print("BG Scan error:", e)
         STATE["auto"]["bg_scan_done"] = True
@@ -474,27 +484,15 @@ async def auto_after_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else: await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("auto_start")))
 
 async def auto_after_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    STATE["pending"]["auto"] = "city"
-    msg = "Бюджет " + str(STATE["daily_budget"]) + ".\nГород?"
+    STATE["pending"]["auto"] = "work_time"
+    msg = "Бюджет " + str(STATE["daily_budget"]) + ".\nСколько работаем? ('2 часа', '1 день')"
     if update.message: await update.message.reply_text(msg, reply_markup=kb(nav_btns("auto_retry_balance")))
     else: await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("auto_retry_balance")))
 
-async def auto_after_city(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    STATE["pending"]["auto"] = "check_time"
-    msg = "Город: " + STATE["city"] + ".\nВремя? (" + local_now().strftime("%H:%M") + ")"
-    if update.message: await update.message.reply_text(msg, reply_markup=kb(nav_btns("auto_retry_budget")))
-    else: await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("auto_retry_budget")))
-
-async def auto_after_check_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    STATE["pending"]["auto"] = "work_time"
-    msg = "Сколько работаем? ('2 часа', '1 день')"
-    if update.message: await update.message.reply_text(msg, reply_markup=kb(nav_btns("auto_retry_city")))
-    else: await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("auto_retry_city")))
-
 async def auto_ask_exchange(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = [[btn(name, "auto_ex_set_" + key)] for key, name in exchanges.EXCHANGES.items()]
-    rows.append(nav_btns("auto_retry_check_time")[0])
-    msg = "Биржа:"
+    rows.append(nav_btns("start")[0])
+    msg = "Выбери биржу:"
     if update.message: await update.message.reply_text(msg, reply_markup=kb(rows))
     else: await update.callback_query.edit_message_text(msg, reply_markup=kb(rows))
 
@@ -919,11 +917,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try: STATE["daily_budget"] = float(txt)
             except Exception: await update.message.reply_text("Число.", reply_markup=kb(nav_btns("auto_start"))); return
             pend.pop("auto"); await auto_after_budget(update, ctx); return
-        if k == "city":
-            STATE["city"] = txt; STATE["tz"] = city_to_tz(txt)
-            pend.pop("auto"); await auto_after_city(update, ctx); return
-        if k == "check_time":
-            pend.pop("auto"); await auto_after_check_time(update, ctx); return
         if k == "work_time":
             hours = _parse_hours(txt); STATE["auto"]["work_hours"] = int(hours)
             STATE["auto"]["multi_day"] = ("д" in txt.lower() or "day" in txt.lower())
