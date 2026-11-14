@@ -39,6 +39,7 @@ SCAN_INTERVAL = 300
 DAILY_DD_LIMIT = 0.05
 
 _EX_CACHE = {}
+_OKX_MARKETS = {"ts": 0, "symbols": set()}
 
 STATE = {
     "balance": 0.0, "daily_budget": 0.0, "city": "", "tz": "UTC",
@@ -155,6 +156,22 @@ async def fetch_binance_tickers(session):
     except Exception:
         return []
 
+def get_okx_symbols():
+    if time.time() - _OKX_MARKETS["ts"] < 600:
+        return _OKX_MARKETS["symbols"]
+    try:
+        ex = get_exchange_obj("okx")
+        m = ex.load_markets()
+        syms = set()
+        for sym, mk in m.items():
+            if mk.get("active") and mk.get("spot") and mk.get("quote") == "USDT":
+                syms.add(sym)
+        _OKX_MARKETS["symbols"] = syms
+        _OKX_MARKETS["ts"] = time.time()
+        return syms
+    except Exception:
+        return _OKX_MARKETS["symbols"]
+
 # ---------- СТРОГИЕ ПРОВЕРКИ ----------
 def strict_signal_check(app, sig, symbol, dynamic_conf):
     if sig.confidence < dynamic_conf: return False, "conf < dynamic"
@@ -194,24 +211,34 @@ async def bg_scan_market():
                 STATE["auto"]["bg_scan_done"] = True
                 return
 
+            allowed_symbols = get_okx_symbols() if STATE["auto"]["exchange"] == "okx" else None
+
             pre_candidates = []
             for t in raw_tickers:
                 sym = t.get("symbol", "")
                 if not sym.endswith("USDT"): continue
                 sym_fmt = sym[:-4] + "/USDT"
+                
+                if allowed_symbols is not None and sym_fmt not in allowed_symbols:
+                    continue
+                    
                 price = float(t.get("lastPrice") or 0)
                 qv = float(t.get("quoteVolume") or 0)
                 if qv < VOL_MIN_24H or price <= 0: continue
+                
+                # ПРИОРИТЕТ НА МАКСИМАЛЬНОЕ ДВИЖЕНИЕ (ПОТЕНЦИАЛ), объем только как фильтр
                 change = abs(float(t.get("priceChangePercent") or 0))
-                potential = (qv / 1000000.0) * change
+                potential = change 
+                
                 pre_candidates.append({"symbol": sym_fmt, "vol24": qv, "price": price, "potential": potential})
             
+            # Сортируем по чистой волатильности
             pre_candidates.sort(key=lambda x: x["potential"], reverse=True)
-            top_pairs = pre_candidates 
+            top_pairs = pre_candidates[:150]
             
             tf = STATE["auto"]["tf"]
             
-            sem = asyncio.Semaphore(100)
+            sem = asyncio.Semaphore(50)
             async def strict_check(c):
                 async with sem:
                     try:
@@ -927,7 +954,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not re.match(r"^\d+[mhd]$", tf): await update.message.reply_text("5m, 1h.", reply_markup=kb(nav_btns("tf_bad"))); return
             STATE["auto"]["tf"] = tf
             
-            # Если мы уже на этапе выбора монеты, пересчитываем для текущей
             if STATE["auto"]["current_offer"]:
                 best_sym = STATE["auto"]["current_offer"]
                 f = Friday(symbol=best_sym, exchange_name="binance")
