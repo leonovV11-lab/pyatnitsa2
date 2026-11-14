@@ -198,3 +198,4 @@ def stats_filtered(period="all", source="all"):
             "winrate": len(wins) / len(hist) * 100, "total_pnl": total_pnl,
             "total_abs": total_abs, "avg_win": avg_win,
             "avg_loss": avg_loss, "pf": pf}
+            
