@@ -128,6 +128,25 @@ def local_now():
     try: return datetime.datetime.now(ZoneInfo(STATE["tz"]))
     except Exception: return datetime.datetime.utcnow()
 
+# ---------- БЫСТРЫЙ API ЗАПРОС ----------
+async def fetch_candles(session, symbol, tf, limit=60):
+    try:
+        # Прямой запрос к Binance API (быстрее чем ccxt)
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol.replace('/', '')}&interval={tf}&limit={limit}"
+        async with session.get(url, timeout=3.0) as resp:
+            if resp.status != 200: return None
+            data = await resp.json()
+            if not isinstance(data, list): return None
+            
+            import pandas as pd
+            df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume", "close_time", "qav", "trades", "taker_base", "taker_quote", "ignore"])
+            df = df[["ts", "open", "high", "low", "close", "volume"]]
+            for c in ["open", "high", "low", "close", "volume"]: df[c] = df[c].astype(float)
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+            return df
+    except Exception:
+        return None
+
 # ---------- СТРОГИЕ ПРОВЕРКИ ----------
 def strict_signal_check(app, sig, symbol, dynamic_conf):
     if sig.confidence < dynamic_conf: return False, "conf < dynamic"
@@ -149,12 +168,13 @@ def strict_signal_check(app, sig, symbol, dynamic_conf):
 
 async def check_volume(symbol):
     try:
-        ex = get_exchange_obj("binance")
-        loop = asyncio.get_event_loop()
-        raw = await loop.run_in_executor(None, lambda: ex.fetch_ohlcv(symbol, "15m", limit=96))
-        if not raw: return False
-        vol = sum(float(r[5]) * float(r[4]) for r in raw)
-        return vol >= VOL_MIN_SIGNAL
+        async with aiohttp.ClientSession() as session:
+            url = f"https://api.binance.com/api/v3/klines?symbol={symbol.replace('/', '')}&interval=15m&limit=96"
+            async with session.get(url, timeout=3.0) as resp:
+                if resp.status != 200: return False
+                data = await resp.json()
+                vol = sum(float(r[5]) * float(r[4]) for r in data)
+                return vol >= VOL_MIN_SIGNAL
     except Exception: return False
 
 # ---------- СКАН И СИГНАЛЫ ----------
@@ -179,22 +199,26 @@ async def bg_scan_market():
         
         tf = STATE["auto"]["tf"]
         
-        sem = asyncio.Semaphore(20)
+        # Параллельный быстрый скан
+        sem = asyncio.Semaphore(40)
         async def strict_check(c):
             async with sem:
                 try:
-                    f = Friday(symbol=c["symbol"], exchange_name="binance")
-                    df = await loop.run_in_executor(None, lambda: f.fetch(tf, 60))
-                    df = f.enrich(df, tf).dropna()
-                    if len(df) < 20: return None
-                    
-                    sig = f.analyze_filtered(tf, tp_mult=3.0)
-                    confidence = sig.confidence * 100
-                    atr_pct = float(df["atr"].iloc[-1]) / sig.price if sig.price else 0
-                    
-                    return {"symbol": c["symbol"], "confidence": confidence, "atr_pct": atr_pct,
-                            "potential": c["potential"], "vol24": c["vol24"], "price": sig.price,
-                            "signal": sig, "tf": tf, "regime": "normal"}
+                    async with aiohttp.ClientSession() as session:
+                        df = await fetch_candles(session, c["symbol"], tf, 60)
+                        if df is None or len(df) < 20: return None
+                        
+                        f = Friday(symbol=c["symbol"], exchange_name="binance")
+                        df = f.enrich(df, tf).dropna()
+                        if len(df) < 20: return None
+                        
+                        sig = f.analyze_filtered(tf, tp_mult=3.0)
+                        confidence = sig.confidence * 100
+                        atr_pct = float(df["atr"].iloc[-1]) / sig.price if sig.price else 0
+                        
+                        return {"symbol": c["symbol"], "confidence": confidence, "atr_pct": atr_pct,
+                                "potential": c["potential"], "vol24": c["vol24"], "price": sig.price,
+                                "signal": sig, "tf": tf, "regime": "normal"}
                 except Exception: return None
                     
         tasks = [strict_check(c) for c in top_40]
@@ -266,22 +290,11 @@ async def _first_scan_then_loop(app):
             await asyncio.sleep(15)
             continue
             
-        # АДАПТИВНЫЙ ПОРОГ
-        # Считаем сколько монет имеют хорошую волатильность (ATR > 1%)
         vol_count = sum(1 for c in candidates if c["atr_pct"] > 0.01)
         
-        if vol_count >= 15:
-            # Рынок хороший, можно рискнуть (порог 55%)
-            dynamic_conf = 55.0
-            market_state = "стабильный"
-        elif vol_count < 5:
-            # Рынок слабый, закручиваем гайки (порог 75%)
-            dynamic_conf = 75.0
-            market_state = "слабый"
-        else:
-            # Средний (порог 65%)
-            dynamic_conf = 65.0
-            market_state = "средний"
+        if vol_count >= 15: dynamic_conf = 55.0
+        elif vol_count < 5: dynamic_conf = 75.0
+        else: dynamic_conf = 65.0
             
         best = None
         for c in candidates:
@@ -298,7 +311,6 @@ async def _first_scan_then_loop(app):
             est_usdt = STATE["daily_budget"] * (est_pct / 100.0)
             
             text = ("📊 <b>Лучшая монета</b>\n\n"
-                    "Рынок: <b>" + market_state + "</b> (порог " + str(int(dynamic_conf)) + "%)\n\n"
                     "🪙 <b>" + best["symbol"] + "</b>\n"
                     "⏱ ТФ: <b>" + tf_label(best["tf"]) + "</b>\n"
                     "🎯 Уверенность: <b>" + str(int(best["confidence"])) + "%</b>\n"
@@ -322,7 +334,6 @@ async def scan_loop(app):
             current_sym = STATE["auto"]["current_offer"]
             candidates = STATE["auto"].get("bg_candidates", [])
             
-            # Считаем динамический порог для сигналов
             vol_count = sum(1 for c in candidates if c["atr_pct"] > 0.01)
             if vol_count >= 15: dynamic_conf = 55.0
             elif vol_count < 5: dynamic_conf = 75.0
@@ -377,8 +388,14 @@ async def forecast_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["current_offer"] = best["symbol"]
     STATE["auto"]["current_chance"] = best["confidence"]
     
-    rows = [[btn("Нет", "hascoins_no")], [btn("Да", "hascoins_yes")]]
-    await update.callback_query.edit_message_text("Есть у тебя " + best["symbol"] + "?", reply_markup=kb(rows))
+    rows = [
+        [btn("Нет", "hascoins_no"), btn("Да", "hascoins_yes")],
+        [btn("⏱ Сменить ТФ (" + tf_label(STATE["auto"]["tf"]) + ")", "tf_bad")],
+        nav_btns("start")[0]
+    ]
+    await update.callback_query.edit_message_text(
+        "Монета: <b>" + best["symbol"] + "</b>\nТФ: <b>" + tf_label(STATE["auto"]["tf"]) + "</b>\n\nЕсть у тебя " + best["symbol"] + "?", 
+        reply_markup=kb(rows), parse_mode="HTML")
 
 async def forecast_rescan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("🔄 Пересканирую...", reply_markup=kb(nav_btns("start")))
@@ -499,8 +516,32 @@ async def auto_tf_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tf = update.callback_query.data.replace("auto_tf_", "")
     if tf == "custom":
         STATE["pending"]["auto"] = "tf_custom"
-        await update.callback_query.edit_message_text("Впиши ТФ:", reply_markup=kb(nav_btns("tf_bad"))); return
+        await update.callback_query.edit_message_text("Впиши ТФ (например 3m, 45m):", reply_markup=kb(nav_btns("tf_bad"))); return
     STATE["auto"]["tf"] = tf
+    
+    if STATE["auto"]["current_offer"]:
+        best_sym = STATE["auto"]["current_offer"]
+        f = Friday(symbol=best_sym, exchange_name="binance")
+        loop = asyncio.get_event_loop()
+        df = await loop.run_in_executor(None, lambda: f.fetch(tf, 60))
+        df = f.enrich(df, tf).dropna()
+        if len(df) >= 20:
+            sig = f.analyze_filtered(tf, tp_mult=3.0)
+            r = {"symbol": best_sym, "confidence": sig.confidence * 100, "signal": sig, "tf": tf, "regime": "normal", "atr_pct": 0, "vol24": 0, "price": sig.price, "potential": 0}
+            
+            STATE["auto"]["bg_candidates"] = [r] + STATE["auto"]["bg_candidates"]
+            STATE["auto"]["current_chance"] = r["confidence"]
+            
+            rows = [
+                [btn("Нет", "hascoins_no"), btn("Да", "hascoins_yes")],
+                [btn("⏱ Сменить ТФ (" + tf_label(tf) + ")", "tf_bad")],
+                nav_btns("start")[0]
+            ]
+            await update.callback_query.edit_message_text(
+                "Монета: <b>" + best_sym + "</b>\nТФ: <b>" + tf_label(tf) + "</b>\n\nЕсть у тебя " + best_sym + "?", 
+                reply_markup=kb(rows), parse_mode="HTML")
+            return
+
     await update.callback_query.edit_message_text("Ок, " + tf_label(tf) + ".", reply_markup=kb(nav_btns("start")))
 
 async def tf_ok_15m(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -891,7 +932,33 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if k == "tf_custom":
             tf = txt.strip()
             if not re.match(r"^\d+[mhd]$", tf): await update.message.reply_text("5m, 1h.", reply_markup=kb(nav_btns("tf_bad"))); return
-            STATE["auto"]["tf"] = tf; pend.pop("auto"); await update.message.reply_text("Ок, " + tf_label(tf) + ".", reply_markup=kb(nav_btns("start"))); return
+            STATE["auto"]["tf"] = tf
+            
+            # Если мы уже на этапе выбора монеты, пересчитываем для текущей
+            if STATE["auto"]["current_offer"]:
+                best_sym = STATE["auto"]["current_offer"]
+                f = Friday(symbol=best_sym, exchange_name="binance")
+                loop = asyncio.get_event_loop()
+                df = await loop.run_in_executor(None, lambda: f.fetch(tf, 60))
+                df = f.enrich(df, tf).dropna()
+                if len(df) >= 20:
+                    sig = f.analyze_filtered(tf, tp_mult=3.0)
+                    r = {"symbol": best_sym, "confidence": sig.confidence * 100, "signal": sig, "tf": tf, "regime": "normal", "atr_pct": 0, "vol24": 0, "price": sig.price, "potential": 0}
+                    
+                    STATE["auto"]["bg_candidates"] = [r] + STATE["auto"]["bg_candidates"]
+                    STATE["auto"]["current_chance"] = r["confidence"]
+                    
+                    rows = [
+                        [btn("Нет", "hascoins_no"), btn("Да", "hascoins_yes")],
+                        [btn("⏱ Сменить ТФ (" + tf_label(tf) + ")", "tf_bad")],
+                        nav_btns("start")[0]
+                    ]
+                    await update.message.reply_text(
+                        "Монета: <b>" + best_sym + "</b>\nТФ: <b>" + tf_label(tf) + "</b>\n\nЕсть у тебя " + best_sym + "?", 
+                        reply_markup=kb(rows), parse_mode="HTML")
+                    return
+
+            pend.pop("auto"); await update.message.reply_text("Ок, " + tf_label(tf) + ".", reply_markup=kb(nav_btns("start"))); return
 
     if "manual" in pend:
         if pend["manual"] == "search":
