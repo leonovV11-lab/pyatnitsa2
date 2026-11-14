@@ -44,10 +44,11 @@ SIDEWAYS_ATR_MIN = 0.02
 SIDEWAYS_ATR_MAX = 0.06
 SIDEWAYS_RANGE_MIN = 0.005
 SCAN_TOP = 200
-SCAN_CONCURRENCY = 20
+SCAN_CONCURRENCY = 30
 SCAN_INTERVAL = 300
-MARKETS_TTL = 600
+MARKETS_TTL = 3600
 EMA200_TTL = 300
+TICKERS_TTL = 30
 
 # ---------- КЕШ ----------
 _CACHE = {
@@ -55,6 +56,7 @@ _CACHE = {
     "ema200": {}, "ema200_ts": {},
     "tickers": {}, "tickers_ts": {},
 }
+_EX_CACHE = {}
 
 def cache_get(kind, key, ttl):
     ts = _CACHE.get(kind + "_ts", {}).get(key, 0)
@@ -150,7 +152,16 @@ def calc_qty(price, sl_price, confidence):
     return round(min(qty, max_qty), 8)
 
 def get_exchange_obj(key):
-    return getattr(ccxt, key)({"enableRateLimit": True, "timeout": 15000})
+    if key in _EX_CACHE:
+        return _EX_CACHE[key]
+    cls = getattr(ccxt, key)
+    params = {"enableRateLimit": True, "timeout": 15000,
+              "options": {"defaultType": "spot"}}
+    if key == "okx":
+        params["options"]["fetchMarkets"] = ["spot"]
+    ex = cls(params)
+    _EX_CACHE[key] = ex
+    return ex
 
 def get_markets(key):
     cached = cache_get("markets", key, MARKETS_TTL)
@@ -162,11 +173,17 @@ def get_markets(key):
     return m
 
 def get_tickers(key):
-    cached = cache_get("tickers", key, 30)
+    cached = cache_get("tickers", key, TICKERS_TTL)
     if cached is not None:
         return cached
     ex = get_exchange_obj(key)
-    t = ex.fetch_tickers()
+    try:
+        if key == "okx":
+            t = ex.fetch_tickers(params={"instType": "SPOT"})
+        else:
+            t = ex.fetch_tickers()
+    except Exception:
+        t = ex.fetch_tickers()
     cache_set("tickers", key, t)
     return t
 
@@ -225,9 +242,10 @@ def market_regime(atr_pct, price, df_15m):
     return "normal"
 
 # ---------- БЫСТРЫЙ СКАН ----------
-def prefilter_symbols(exchange_key):
-    markets = get_markets(exchange_key)
-    tickers = get_tickers(exchange_key)
+async def prefilter_symbols_async(exchange_key):
+    loop = asyncio.get_event_loop()
+    markets = await loop.run_in_executor(None, lambda: get_markets(exchange_key))
+    tickers = await loop.run_in_executor(None, lambda: get_tickers(exchange_key))
     result = []
     for sym, m in markets.items():
         if not (m.get("active") and m.get("spot") and m.get("quote") == "USDT"):
@@ -240,18 +258,40 @@ def prefilter_symbols(exchange_key):
             continue
         bid = float(t.get("bid") or 0)
         ask = float(t.get("ask") or 0)
-        if bid > 0 and ask > 0:
-            spread = (ask - bid) / bid
-            if spread > SPREAD_MAX:
-                continue
-        else:
-            spread = 0.0
+        spread = (ask - bid) / bid if bid > 0 and ask > 0 else 0.0
+        if spread > SPREAD_MAX:
+            continue
         change = abs(float(t.get("percentage") or 0))
         score = qv * (change / 100.0 + 0.001)
         result.append({"symbol": sym, "score": score, "vol24": qv,
-                       "spread": spread, "change": change, "price": float(t.get("last") or 0)})
+                       "spread": spread, "change": change,
+                       "price": float(t.get("last") or 0)})
     result.sort(key=lambda x: x["score"], reverse=True)
     return result[:SCAN_TOP]
+
+def trend_1h_ok(symbol, direction):
+    d = get_ema200_1h(STATE["auto"]["exchange"], symbol)
+    if not d:
+        return True
+    if direction == "BUY":
+        return d["close"] > d["ema"]
+    return d["close"] < d["ema"]
+
+def mtf_confirm_cached(symbol, direction):
+    try:
+        ex = get_exchange_obj(STATE["auto"]["exchange"])
+        raw = ex.fetch_ohlcv(symbol, "15m", limit=120)
+        if not raw or len(raw) < 60:
+            return True
+        import pandas as pd
+        df = pd.DataFrame(raw, columns=["ts", "o", "h", "l", "c", "v"])
+        ef = df["c"].ewm(span=20, adjust=False).mean().iloc[-1]
+        es = df["c"].ewm(span=50, adjust=False).mean().iloc[-1]
+        if direction == "BUY":
+            return float(ef) > float(es)
+        return float(ef) < float(es)
+    except Exception:
+        return True
 
 async def fetch_and_score(ex, item, tf, sem):
     async with sem:
@@ -291,35 +331,10 @@ async def fetch_and_score(ex, item, tf, sem):
         except Exception:
             return None
 
-def trend_1h_ok(symbol, direction):
-    d = get_ema200_1h(STATE["auto"]["exchange"], symbol)
-    if not d:
-        return True
-    if direction == "BUY":
-        return d["close"] > d["ema"]
-    return d["close"] < d["ema"]
-
-def mtf_confirm_cached(symbol, direction):
-    try:
-        ex = get_exchange_obj(STATE["auto"]["exchange"])
-        raw = ex.fetch_ohlcv(symbol, "15m", limit=120)
-        if not raw or len(raw) < 60:
-            return True
-        import pandas as pd
-        df = pd.DataFrame(raw, columns=["ts", "o", "h", "l", "c", "v"])
-        ef = df["c"].ewm(span=20, adjust=False).mean().iloc[-1]
-        es = df["c"].ewm(span=50, adjust=False).mean().iloc[-1]
-        if direction == "BUY":
-            return float(ef) > float(es)
-        return float(ef) < float(es)
-    except Exception:
-        return True
-
 async def fast_scan():
     ex_key = STATE["auto"]["exchange"]
     tf = STATE["auto"].get("tf", "15m")
-    await asyncio.get_event_loop().run_in_executor(None, lambda: get_markets(ex_key))
-    candidates = await asyncio.get_event_loop().run_in_executor(None, lambda: prefilter_symbols(ex_key))
+    candidates = await prefilter_symbols_async(ex_key)
     if not candidates:
         return None
     ex = get_exchange_obj(ex_key)
@@ -347,7 +362,6 @@ async def scan_loop(app):
             STATE["auto"]["last_scan_ts"] = time.time()
             if best:
                 STATE["auto"]["last_scan_result"] = best["symbol"] + " (" + str(dt) + "s)"
-                chat_id = app.bot_data.get("chat_id", 0)
                 current = STATE["auto"]["current_offer"]
                 if not current:
                     STATE["auto"]["current_offer"] = best["symbol"]
@@ -501,8 +515,11 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["exchange"] = key
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
     await update.callback_query.edit_message_text(
-        "Биржа: " + exchanges.EXCHANGES.get(key, key) + ".\nПервый скан ~30-60 сек...",
+        "Биржа: " + exchanges.EXCHANGES.get(key, key) + ".\nПервый скан...",
         reply_markup=kb(nav_btns("start")))
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, lambda: get_markets(key))
+    loop.run_in_executor(None, lambda: get_tickers(key))
     if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
         STATE["auto"]["active"] = True
         STATE["auto"]["symbols"] = []
@@ -1299,19 +1316,14 @@ async def multi_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     n = int(update.callback_query.data.replace("multi_start_", ""))
     await update.callback_query.edit_message_text("Сканирую топ-" + str(n) + "...",
         reply_markup=kb(nav_btns("start")))
-    bests = []
     ex_key = STATE["auto"]["exchange"]
     tf = STATE["auto"].get("tf", "15m")
-    await asyncio.get_event_loop().run_in_executor(None, lambda: get_markets(ex_key))
-    candidates = await asyncio.get_event_loop().run_in_executor(None, lambda: prefilter_symbols(ex_key))
+    candidates = await prefilter_symbols_async(ex_key)
     ex = get_exchange_obj(ex_key)
     sem = asyncio.Semaphore(SCAN_CONCURRENCY)
     tasks = [fetch_and_score(ex, item, tf, sem) for item in candidates]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    for r in results:
-        if isinstance(r, Exception) or r is None:
-            continue
-        bests.append(r)
+    bests = [r for r in results if not isinstance(r, Exception) and r is not None]
     bests.sort(key=lambda x: x["score"], reverse=True)
     top = bests[:n]
     if not top:
