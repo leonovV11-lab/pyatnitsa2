@@ -25,7 +25,7 @@ from timezonefinder import TimezoneFinder
 
 # ---------- КОНСТАНТЫ ----------
 CONF_SIGNAL = 0.85
-CONF_MIN_STRICT = 0.65   # 65% уверенности
+CONF_MIN_STRICT = 0.65
 CONF_MIN_RELAXED = 0.55  
 FEE_MIN_TP = 0.006
 MIN_NET_PCT = 0.2
@@ -106,7 +106,7 @@ def tf_from_hours(hours):
     if h <= 2: return "1m"
     if h <= 6: return "5m"
     if h <= 12: return "15m"
-    return "4h"
+    return "1h"
 
 def tf_label(tf):
     return {"1m": "1 минута", "5m": "5 минут", "15m": "15 минут", "1h": "1 час", "4h": "4 часа"}.get(tf, tf)
@@ -178,22 +178,23 @@ async def bg_scan_market():
         pre_candidates.sort(key=lambda x: x["potential"], reverse=True)
         top_40 = pre_candidates[:40]
         
-        # Параллельный запрос свечей и расчет уверенности БЕЗ тяжелых циклов
+        tf = STATE["auto"]["tf"]
+        
         sem = asyncio.Semaphore(20)
         async def strict_check(c):
             async with sem:
                 try:
                     f = Friday(symbol=c["symbol"], exchange_name="binance")
-                    df = await loop.run_in_executor(None, lambda: f.fetch("5m", 60))
-                    df = f.enrich(df, "5m").dropna()
+                    df = await loop.run_in_executor(None, lambda: f.fetch(tf, 60))
+                    df = f.enrich(df, tf).dropna()
                     if len(df) < 20: return None
                     
-                    sig = f.analyze_filtered("5m", tp_mult=3.0)
-                    confidence = sig.confidence * 100 # Берем уверенность из Friday (0-100%)
+                    sig = f.analyze_filtered(tf, tp_mult=3.0)
+                    confidence = sig.confidence * 100
                     
                     return {"symbol": c["symbol"], "confidence": confidence,
                             "potential": c["potential"], "vol24": c["vol24"], "price": sig.price,
-                            "signal": sig, "tf": "5m", "regime": "normal"}
+                            "signal": sig, "tf": tf, "regime": "normal"}
                 except Exception: return None
                     
         tasks = [strict_check(c) for c in top_40]
@@ -231,7 +232,7 @@ async def send_signal(app, r, reason=""):
     
     STATE["pending"]["signal"] = {"action": sig.action, "symbol": r["symbol"], "price": sig.price, "lot": lot, "qty": qty, "sl": sig.stop_loss, "tp": sig.take_profit}
     
-    text = ("🎯 " + r["symbol"] + " · " + r["tf"] + ("\n" + reason if reason else "") +
+    text = ("🎯 " + r["symbol"] + " · " + tf_label(r["tf"]) + ("\n" + reason if reason else "") +
             "\n" + sig.action + " @ " + fmt_price(sig.price) +
             "\n🎯 Уверенность: " + str(int(r["confidence"])) + "%" +
             "\n💵 Лот: " + str(round(lot, 2)) + " USDT" +
@@ -249,42 +250,39 @@ async def send_signal(app, r, reason=""):
 
 async def _first_scan_then_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
-    while not STATE["auto"]["bg_scan_done"] and STATE["auto"]["active"]:
-        await asyncio.sleep(0.5)
-        
-    candidates = STATE["auto"].get("bg_candidates", [])
     
-    best = None
-    for c in candidates:
-        if c["confidence"] >= CONF_MIN_STRICT * 100:
-            best = c
-            break
-            
-    if best:
-        STATE["auto"]["current_offer"] = best["symbol"]
-        STATE["auto"]["current_chance"] = best["confidence"]
-        hours = STATE["auto"].get("work_hours", 24)
-        
-        est_pct = best["confidence"] * (hours / 1.5) * 0.35
-        est_usdt = STATE["daily_budget"] * (est_pct / 100.0)
-        
-        text = ("📊 <b>Лучшая монета</b>\n\n"
-                "🪙 <b>" + best["symbol"] + "</b>\n"
-                "🎯 Уверенность: <b>" + str(int(best["confidence"])) + "%</b>\n"
-                "📈 Прогноз за " + str(hours) + "ч: <b>+" + str(round(est_pct, 1)) + "%</b> (~$" + str(round(est_usdt, 2)) + ")\n"
-                "💰 Объем: <b>" + str(round(best["vol24"]/1000000, 1)) + "M</b>")
-        
-        rows = [[btn("✅ Берём", "forecast_go")], [btn("🔄 Ещё скан", "forecast_rescan")], [btn("🛑 СТОП", "auto_stop_signals")]]
-        if chat_id:
-            await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
-    else:
-        if chat_id:
-            await app.bot.send_message(chat_id=chat_id, text="Нет монет с уверенностью 65%+.", reply_markup=kb([[btn("🛑 СТОП", "auto_stop_signals")]]))
-            
     while STATE["auto"]["active"]:
-        await asyncio.sleep(SCAN_INTERVAL)
-        if not STATE["auto"]["active"]: return
         await bg_scan_market()
+        
+        candidates = STATE["auto"].get("bg_candidates", [])
+        best = None
+        for c in candidates:
+            if c["confidence"] >= CONF_MIN_STRICT * 100:
+                best = c
+                break
+                
+        if best:
+            STATE["auto"]["current_offer"] = best["symbol"]
+            STATE["auto"]["current_chance"] = best["confidence"]
+            hours = STATE["auto"].get("work_hours", 24)
+            
+            est_pct = best["confidence"] * (hours / 1.5) * 0.35
+            est_usdt = STATE["daily_budget"] * (est_pct / 100.0)
+            
+            text = ("📊 <b>Лучшая монета</b>\n\n"
+                    "🪙 <b>" + best["symbol"] + "</b>\n"
+                    "⏱ ТФ: <b>" + tf_label(best["tf"]) + "</b>\n"
+                    "🎯 Уверенность: <b>" + str(int(best["confidence"])) + "%</b>\n"
+                    "📈 Прогноз за " + str(hours) + "ч: <b>+" + str(round(est_pct, 1)) + "%</b> (~$" + str(round(est_usdt, 2)) + ")\n"
+                    "💰 Объем: <b>" + str(round(best["vol24"]/1000000, 1)) + "M</b>")
+            
+            rows = [[btn("✅ Берём", "forecast_go")], [btn("🔄 Ещё скан", "forecast_rescan")], [btn("🛑 СТОП", "auto_stop_signals")]]
+            if chat_id:
+                await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
+            return
+            
+        await asyncio.sleep(15)
+        if not STATE["auto"]["active"]: return
 
 async def scan_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
@@ -403,7 +401,6 @@ async def auto_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["have_coin"] = None
     STATE["auto"]["coin_qty"] = 0.0
     STATE["auto"]["seen_signals"] = set()
-    asyncio.create_task(bg_scan_market())
     STATE["pending"]["auto"] = "balance"
     await update.callback_query.edit_message_text("Баланс (USDT)?", reply_markup=kb(nav_btns("start")))
 
