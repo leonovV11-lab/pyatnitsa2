@@ -6,6 +6,7 @@ import os
 import re
 import time
 from zoneinfo import ZoneInfo
+import aiohttp
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -42,7 +43,7 @@ SLEEP_MIN = 30
 MAX_POSITIONS = 2
 MAX_MULTI = 10
 SCAN_TOP = 80
-SCAN_CONCURRENCY = 10
+SCAN_CONCURRENCY = 15
 SCAN_INTERVAL = 300
 MARKETS_TTL = 3600
 EMA200_TTL = 300
@@ -235,27 +236,6 @@ def get_cmc_top(n=CMC_TOP_N):
     except Exception:
         return None
 
-def get_ema200_1h(key, symbol):
-    k = key + ":" + symbol
-    cached = cache_get("ema200", k, EMA200_TTL)
-    if cached is not None:
-        return cached
-    try:
-        ex = get_exchange_obj(key)
-        raw = ex.fetch_ohlcv(symbol, "1h", limit=250)
-        if not raw or len(raw) < 200:
-            cache_set("ema200", k, None)
-            return None
-        import pandas as pd
-        df = pd.DataFrame(raw, columns=["ts", "o", "h", "l", "c", "v"])
-        ema = float(df["c"].ewm(span=200, adjust=False).mean().iloc[-1])
-        last = float(df["c"].iloc[-1])
-        cache_set("ema200", k, {"ema": ema, "close": last})
-        return {"ema": ema, "close": last}
-    except Exception:
-        cache_set("ema200", k, None)
-        return None
-
 def city_to_tz(city):
     try:
         geo = Nominatim(user_agent="friday_bot")
@@ -331,6 +311,60 @@ async def prefilter_symbols_async(exchange_key, tf="15m"):
     result.sort(key=lambda x: x["score"], reverse=True)
     return result[:SCAN_TOP]
 
+async def fetch_and_score_okx(session, item, tf, sem):
+    async with sem:
+        try:
+            symbol = item["symbol"]
+            inst_id = symbol.replace("/", "-")
+            bar = tf.upper() if tf in ("1h", "4h") else tf
+            url = "https://www.okx.com/api/v5/market/candles?instId=" + inst_id + "&bar=" + bar + "&limit=60"
+            async with session.get(url, timeout=3.0) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                if data.get("code") != "0" or not data.get("data"):
+                    return None
+                raw = data["data"]
+                raw.reverse()
+                
+                import pandas as pd
+                df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"])
+                df = df[["ts", "open", "high", "low", "close", "vol"]]
+                df["ts"] = pd.to_datetime(df["ts"].astype(float), unit="ms")
+                for c in ["open", "high", "low", "close", "vol"]:
+                    df[c] = df[c].astype(float)
+                
+                f = Friday(symbol=symbol, exchange_name="okx")
+                df = f.enrich(df, tf).dropna().reset_index(drop=True)
+                if len(df) < 10:
+                    return None
+                
+                last = df.iloc[-1]
+                price = float(last["close"])
+                atr_val = float(last["atr"])
+                atr_pct = atr_val / price if price else 0
+                
+                try:
+                    sig = f.analyze_filtered(tf, tp_mult=3.0)
+                except Exception:
+                    return None
+                
+                vol24 = item.get("vol24", 0)
+                hours = STATE["auto"].get("work_hours", 24)
+                liq_coef = vol24 / 10000000.0
+                hours_coef = max(0.5, hours / 2.0)
+                profit_potential = (atr_pct * 100) * liq_coef * hours_coef
+                
+                return {"symbol": symbol, "score": profit_potential,
+                        "profit_potential": profit_potential,
+                        "chance": sig.confidence * 100,
+                        "signal": sig, "price": price,
+                        "atr_pct": atr_pct, "atr_val": atr_val,
+                        "vol24": vol24, "regime": "normal", "tf": tf,
+                        "df": df, "f": f}
+        except Exception:
+            return None
+
 async def fetch_and_score(ex, item, tf, sem):
     async with sem:
         try:
@@ -338,7 +372,7 @@ async def fetch_and_score(ex, item, tf, sem):
             loop = asyncio.get_event_loop()
             raw = await asyncio.wait_for(
                 loop.run_in_executor(None, lambda: ex.fetch_ohlcv(symbol, tf, limit=30)),
-                timeout=8.0
+                timeout=3.0
             )
             if not raw or len(raw) < 15:
                 return None
@@ -377,26 +411,43 @@ async def fast_scan(tf, need=1):
     candidates = await prefilter_symbols_async(ex_key, tf)
     if not candidates:
         return []
-    ex = get_exchange_obj(ex_key)
-    sem = asyncio.Semaphore(SCAN_CONCURRENCY)
+        
     good = []
-    for i in range(0, len(candidates), SCAN_CONCURRENCY):
-        chunk = candidates[i:i+SCAN_CONCURRENCY]
-        tasks = [fetch_and_score(ex, c, tf, sem) for c in chunk]
-        try:
-            results = await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True),
-                timeout=10.0
-            )
-        except asyncio.TimeoutError:
-            results = []
-        for r in results:
-            if isinstance(r, Exception) or r is None:
-                continue
-            good.append(r)
-        if len(good) >= 10:
-            break
-        await asyncio.sleep(0.2)
+    sem = asyncio.Semaphore(SCAN_CONCURRENCY)
+    
+    if ex_key == "okx":
+        async with aiohttp.ClientSession() as session:
+            for i in range(0, len(candidates), SCAN_CONCURRENCY):
+                chunk = candidates[i:i+SCAN_CONCURRENCY]
+                tasks = [fetch_and_score_okx(session, c, tf, sem) for c in chunk]
+                try:
+                    results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
+                except asyncio.TimeoutError:
+                    results = []
+                for r in results:
+                    if isinstance(r, Exception) or r is None:
+                        continue
+                    good.append(r)
+                if len(good) >= 10:
+                    break
+                await asyncio.sleep(0.1)
+    else:
+        ex = get_exchange_obj(ex_key)
+        for i in range(0, len(candidates), SCAN_CONCURRENCY):
+            chunk = candidates[i:i+SCAN_CONCURRENCY]
+            tasks = [fetch_and_score(ex, c, tf, sem) for c in chunk]
+            try:
+                results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
+            except asyncio.TimeoutError:
+                results = []
+            for r in results:
+                if isinstance(r, Exception) or r is None:
+                    continue
+                good.append(r)
+            if len(good) >= 10:
+                break
+            await asyncio.sleep(0.1)
+            
     good.sort(key=lambda x: x.get("profit_potential", 0), reverse=True)
     return good
 
