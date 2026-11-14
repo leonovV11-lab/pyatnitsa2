@@ -25,7 +25,7 @@ from timezonefinder import TimezoneFinder
 
 # ---------- КОНСТАНТЫ ----------
 CONF_SIGNAL = 0.85
-CONF_MIN_STRICT = 0.65
+CONF_MIN_STRICT = 0.65   # 65% уверенности
 CONF_MIN_RELAXED = 0.55  
 FEE_MIN_TP = 0.006
 MIN_NET_PCT = 0.2
@@ -252,15 +252,32 @@ async def _first_scan_then_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
     
     while STATE["auto"]["active"]:
+        # СКАНИРУЕМ 1 РАЗ
         await bg_scan_market()
         
         candidates = STATE["auto"].get("bg_candidates", [])
         best = None
+        
+        # 1. Ищем >= 65%
         for c in candidates:
-            if c["confidence"] >= CONF_MIN_STRICT * 100:
+            if c["confidence"] >= 65.0:
                 best = c
                 break
                 
+        # 2. Если не нашли, ищем >= 60%
+        if not best:
+            for c in candidates:
+                if c["confidence"] >= 60.0:
+                    best = c
+                    break
+                    
+        # 3. Если не нашли, ищем >= 55%
+        if not best:
+            for c in candidates:
+                if c["confidence"] >= 55.0:
+                    best = c
+                    break
+                    
         if best:
             STATE["auto"]["current_offer"] = best["symbol"]
             STATE["auto"]["current_chance"] = best["confidence"]
@@ -281,6 +298,12 @@ async def _first_scan_then_loop(app):
                 await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
             return
             
+        # Если ни 65, ни 60, ни 55 не нашли — пишем про неудачный день
+        if chat_id:
+            await app.bot.send_message(chat_id=chat_id, text="Сегодня неудачный день. Максимум что есть — ниже 55%. Не торгую.", reply_markup=kb([[btn("🏠 В меню", "start")]]))
+            STATE["auto"]["active"] = False
+            return
+        
         await asyncio.sleep(15)
         if not STATE["auto"]["active"]: return
 
@@ -306,7 +329,8 @@ async def scan_loop(app):
             
             if not STATE["auto"]["symbols"]:
                 for c in candidates:
-                    if c["symbol"] != current_sym and c["confidence"] >= CONF_MIN_STRICT * 100:
+                    # Ищем лучше текущей, но не ниже 65
+                    if c["symbol"] != current_sym and c["confidence"] >= 65.0:
                         text = ("🔥 <b>Есть лучше!</b>\n\n"
                                 "Сейчас: " + current_sym + " (" + str(int(STATE["auto"]["current_chance"])) + "%)\n"
                                 "Новая: <b>" + c["symbol"] + "</b> (" + str(int(c["confidence"])) + "%)")
@@ -326,11 +350,22 @@ async def forecast_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     best = None
     for c in checked:
-        if c["confidence"] >= CONF_MIN_STRICT * 100:
+        if c["confidence"] >= 65.0:
             best = c
             break
     if not best:
-        await update.callback_query.edit_message_text("Нет монет 65%+.", reply_markup=kb(nav_btns("start")))
+        for c in checked:
+            if c["confidence"] >= 60.0:
+                best = c
+                break
+    if not best:
+        for c in checked:
+            if c["confidence"] >= 55.0:
+                best = c
+                break
+                
+    if not best:
+        await update.callback_query.edit_message_text("Нет монет.", reply_markup=kb(nav_btns("start")))
         return
     
     STATE["auto"]["symbols"] = [best["symbol"]]
@@ -360,7 +395,7 @@ async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     current_sym = STATE["auto"]["current_offer"]
     better = None
     for c in candidates:
-        if c["symbol"] != current_sym and c["confidence"] >= CONF_MIN_STRICT * 100:
+        if c["symbol"] != current_sym and c["confidence"] >= 65.0:
             better = c; break
             
     if better:
@@ -441,7 +476,7 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
     STATE["auto"]["active"] = True
     STATE["auto"]["symbols"] = []
-    await update.callback_query.edit_message_text("Биржа: " + exchanges.EXCHANGES.get(key, key) + "\n⏳ Ищу монеты с уверенностью 65%+...", reply_markup=kb([]))
+    await update.callback_query.edit_message_text("Биржа: " + exchanges.EXCHANGES.get(key, key) + "\n⏳ Ищу монеты (65% -> 60% -> 55%)...", reply_markup=kb([]))
     if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
         STATE["auto"]["task"] = asyncio.create_task(_first_scan_then_loop(ctx.application))
 
