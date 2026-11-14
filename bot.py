@@ -37,7 +37,7 @@ SLEEP_MIN = 30
 MAX_POSITIONS = 2
 SCAN_INTERVAL = 300
 DAILY_DD_LIMIT = 0.05
-FAST_SCAN_LIMIT = 30 # Ограничение для быстрого скана
+FAST_SCAN_LIMIT = 20 # Для скорости берем только 20 лучших
 
 _EX_CACHE = {}
 _OKX_MARKETS = {"ts": 0, "symbols": set()}
@@ -228,18 +228,20 @@ async def bg_scan_market():
                 if qv < VOL_MIN_24H or price <= 0: continue
                 
                 change = abs(float(t.get("priceChangePercent") or 0))
+                if change < 1.5: continue # Фильтр минимальной волатильности
+                
                 potential = change 
                 
                 pre_candidates.append({"symbol": sym_fmt, "vol24": qv, "price": price, "potential": potential})
             
             pre_candidates.sort(key=lambda x: x["potential"], reverse=True)
             
-            # БЕРЕМ ТОЛЬКО ТОП-30 ДЛЯ МАКСИМАЛЬНОЙ СКОРОСТИ
+            # БЕРЕМ ТОЛЬКО 20 ЛУЧШИХ ДЛЯ МАКСИМАЛЬНОЙ СКОРОСТИ
             top_pairs = pre_candidates[:FAST_SCAN_LIMIT]
             
             tf = STATE["auto"]["tf"]
             
-            sem = asyncio.Semaphore(30)
+            sem = asyncio.Semaphore(20)
             async def strict_check(c):
                 async with sem:
                     try:
