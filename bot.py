@@ -7,6 +7,7 @@ import re
 import time
 from zoneinfo import ZoneInfo
 import aiohttp
+import random
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -25,8 +26,8 @@ from timezonefinder import TimezoneFinder
 
 # ---------- КОНСТАНТЫ ----------
 CONF_SIGNAL = 0.85
-CONF_MIN_STRICT = 0.65   # Уверенность >= 65% для выдачи монеты и сигнала
-CONF_MIN_RELAXED = 0.55  # Допустимый минимум для сигнала (если прошел все строгие проверки)
+CONF_MIN_STRICT = 0.65   # 65% уверенности
+CONF_MIN_RELAXED = 0.55  
 FEE_MIN_TP = 0.006
 MIN_NET_PCT = 0.2
 VOL_MIN_24H = 1000000.0
@@ -47,7 +48,7 @@ STATE = {
     "day_started": datetime.date.today().isoformat(),
     "day_pnl_usdt": 0.0, "day_halt": False,
     "auto": {
-        "active": False, "task": None, "exchange": "okx", "tf": "1m",
+        "active": False, "task": None, "exchange": "okx", "tf": "5m",
         "work_hours": 24, "symbols": [], "seen_signals": set(),
         "current_offer": None, "current_chance": 0,
         "bg_scan_done": False, "bg_candidates": [],
@@ -171,34 +172,53 @@ async def bg_scan_market():
             price = float(t.get("last") or 0)
             qv = float(t.get("quoteVolume") or 0)
             if qv < VOL_MIN_24H or price <= 0: continue
-            pre_candidates.append({"symbol": sym, "vol24": qv, "price": price, "change": float(t.get("percentage") or 0)})
+            change = abs(float(t.get("percentage") or 0))
+            potential = (qv / 1000000.0) * change
+            pre_candidates.append({"symbol": sym, "vol24": qv, "price": price, "potential": potential})
         
-        pre_candidates.sort(key=lambda x: x["vol24"], reverse=True)
-        top_20 = pre_candidates[:20]
+        pre_candidates.sort(key=lambda x: x["potential"], reverse=True)
+        top_40 = pre_candidates[:40]
         
-        async def get_chance(c):
-            try:
-                f = Friday(symbol=c["symbol"], exchange_name="binance")
-                df = await loop.run_in_executor(None, lambda: f.fetch("1m", 60))
-                df = f.enrich(df, "1m").dropna()
-                if len(df) < 10: return None
-                sig = f.analyze_filtered("1m", tp_mult=3.0)
-                confidence = sig.confidence * 100
-                
-                # Потенциал прибыли: для сортировки
-                potential = (c["vol24"] / 1000000.0) * abs(c["change"])
-                
-                return {"symbol": c["symbol"], "confidence": confidence,
-                        "potential": potential, "vol24": c["vol24"], "price": sig.price,
-                        "signal": sig, "tf": "1m", "regime": "normal"}
-            except Exception: return None
-                
-        tasks = [get_chance(c) for c in top_20]
+        # Параллельный запрос (20 за раз)
+        sem = asyncio.Semaphore(20)
+        async def strict_check(c):
+            async with sem:
+                try:
+                    f = Friday(symbol=c["symbol"], exchange_name="binance")
+                    df = await loop.run_in_executor(None, lambda: f.fetch("5m", 120))
+                    df = f.enrich(df, "5m").dropna()
+                    if len(df) < 50: return None
+                    
+                    wins = 0
+                    for _ in range(100):
+                        start = random.randint(0, len(df) - 20)
+                        window = df.iloc[start:start+20]
+                        sig = f.analyze_filtered("5m", tp_mult=3.0)
+                        
+                        tp_hit = False
+                        sl_hit = False
+                        for i in range(1, 10):
+                            if start + i >= len(df): break
+                            future_price = float(window.iloc[i]["close"])
+                            if sig.action == "BUY":
+                                if future_price >= sig.take_profit: tp_hit = True; break
+                                if future_price <= sig.stop_loss: sl_hit = True; break
+                            else:
+                                if future_price <= sig.take_profit: tp_hit = True; break
+                                if future_price >= sig.stop_loss: sl_hit = True; break
+                        if tp_hit: wins += 1
+                    
+                    confidence = wins
+                    return {"symbol": c["symbol"], "confidence": confidence,
+                            "potential": c["potential"], "vol24": c["vol24"], "price": sig.price,
+                            "signal": sig, "tf": "5m", "regime": "normal"}
+                except Exception: return None
+                    
+        tasks = [strict_check(c) for c in top_40]
         results = await asyncio.gather(*tasks)
         valid = [r for r in results if r is not None]
         
-        # Сортируем по ПОТЕНЦИАЛУ (сначала самая жирная)
-        valid.sort(key=lambda x: x["potential"], reverse=True)
+        valid.sort(key=lambda x: x["confidence"], reverse=True)
         STATE["auto"]["bg_candidates"] = valid
         STATE["auto"]["bg_scan_done"] = True
     except Exception as e:
@@ -231,7 +251,7 @@ async def send_signal(app, r, reason=""):
     
     text = ("🎯 " + r["symbol"] + " · " + r["tf"] + ("\n" + reason if reason else "") +
             "\n" + sig.action + " @ " + fmt_price(sig.price) +
-            "\n🎯 Уверенность: " + str(int(sig.confidence * 100)) + "%" +
+            "\n🎯 Уверенность: " + str(int(r["confidence"])) + "%" +
             "\n💵 Лот: " + str(round(lot, 2)) + " USDT" +
             "\n🛡 Риск: " + str(round(budget * risk_pct, 2)) + " USDT (" + str(round(risk_pct * 100, 1)) + "%)" +
             "\nСтоп " + fmt_price(sig.stop_loss) + "\nТейк " + fmt_price(sig.take_profit) +
@@ -252,33 +272,29 @@ async def _first_scan_then_loop(app):
         
     candidates = STATE["auto"].get("bg_candidates", [])
     
-    # Ищем ЛУЧШУЮ по потенциалу, у которой УВЕРЕННОСТЬ >= 65%
     best = None
     for c in candidates:
         if c["confidence"] >= CONF_MIN_STRICT * 100:
             best = c
-            break # Так как отсортировано по потенциалу, первая найденная - самая жирная из безопасных
+            break
             
     if best:
         STATE["auto"]["current_offer"] = best["symbol"]
         STATE["auto"]["current_chance"] = best["confidence"]
         hours = STATE["auto"].get("work_hours", 24)
         
-        est_pct = best["confidence"] * (hours / 1.5) * 0.35
-        est_usdt = STATE["daily_budget"] * (est_pct / 100.0)
-        
         text = ("📊 <b>Лучшая монета</b>\n\n"
                 "🪙 <b>" + best["symbol"] + "</b>\n"
                 "🎯 Уверенность: <b>" + str(int(best["confidence"])) + "%</b>\n"
-                "📈 Прогноз за " + str(hours) + "ч: <b>+" + str(round(est_pct, 1)) + "%</b> (~$" + str(round(est_usdt, 2)) + ")\n"
-                "💰 Объем: <b>" + str(round(best["vol24"]/1000000, 1)) + "M</b>")
+                "💰 Потенциал: <b>" + str(round(best["potential"], 1)) + "</b>\n"
+                "📈 ТФ: <b>5 минут</b>")
         
         rows = [[btn("✅ Берём", "forecast_go")], [btn("🔄 Ещё скан", "forecast_rescan")], [btn("🛑 СТОП", "auto_stop_signals")]]
         if chat_id:
             await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
     else:
         if chat_id:
-            await app.bot.send_message(chat_id=chat_id, text="Нет монет с уверенностью 65%+. Сканирую дальше...", reply_markup=kb([[btn("🛑 СТОП", "auto_stop_signals")]]))
+            await app.bot.send_message(chat_id=chat_id, text="Нет монет с уверенностью 65%+.", reply_markup=kb([[btn("🛑 СТОП", "auto_stop_signals")]]))
             
     while STATE["auto"]["active"]:
         await asyncio.sleep(SCAN_INTERVAL)
@@ -307,10 +323,7 @@ async def scan_loop(app):
             
             if not STATE["auto"]["symbols"]:
                 for c in candidates:
-                    # Если нашли лучше по потенциалу и у нее уверенность >= 65%
-                    if c["symbol"] != current_sym and c["potential"] > 0 and c["confidence"] >= CONF_MIN_STRICT * 100:
-                        # Если это лучше текущей (проверяем просто по уверенности или потенциалу)
-                        # В данной логике бот просто шлет лучшую из списка
+                    if c["symbol"] != current_sym and c["confidence"] >= CONF_MIN_STRICT * 100:
                         text = ("🔥 <b>Есть лучше!</b>\n\n"
                                 "Сейчас: " + current_sym + " (" + str(int(STATE["auto"]["current_chance"])) + "%)\n"
                                 "Новая: <b>" + c["symbol"] + "</b> (" + str(int(c["confidence"])) + "%)")
@@ -446,7 +459,7 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
     STATE["auto"]["active"] = True
     STATE["auto"]["symbols"] = []
-    await update.callback_query.edit_message_text("Биржа: " + exchanges.EXCHANGES.get(key, key) + "\n⏳ Жду скан...", reply_markup=kb([]))
+    await update.callback_query.edit_message_text("Биржа: " + exchanges.EXCHANGES.get(key, key) + "\n⏳ Ищу монеты с уверенностью 65%+...", reply_markup=kb([]))
     if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
         STATE["auto"]["task"] = asyncio.create_task(_first_scan_then_loop(ctx.application))
 
