@@ -25,21 +25,22 @@ from chart import build_chart
 from geopy.geocoders import Nominatim
 from timezonefinder import TimezoneFinder
 
-# --- НАСТРОЙКИ МАКСИМАЛЬНОЙ ПРИБЫЛИ ---
+# --- ИСПРАВЛЕННЫЕ НАСТРОЙКИ ---
+CONF_FLOOR = 0.65  # ЖЕСТКИЙ МИНИМУМ 65%
 MIN_ATR_PCT = 0.3
 FEE_RT_PCT = 0.004
 LIMIT_OFFSET = 0.001
 MAX_TRADE_TIME_MIN = 60
 
-PANIC_DROP = 0.015 # Раньше закрываем при панике
+PANIC_DROP = 0.015 
 PANIC_INTERVAL = 5
-TRAIL_INTERVAL = 3 # Проверяем трейлинг каждые 3 секунды
+TRAIL_INTERVAL = 3 
 LOSS_LIMIT = 3
 SLEEP_MIN = 30
 MAX_POSITIONS = 3
 DAILY_DD_LIMIT = 0.05
-TOP_N_SCAN = 40 
-VOL_MIN_24H = 500000.0
+TOP_N_SCAN = 80  # Расширили для поиска качественных сигналов
+VOL_MIN_24H = 300000.0
 
 STATE = {
     "balance": 0.0, "daily_budget": 0.0, "tz": "UTC",
@@ -62,13 +63,13 @@ def is_sleeping(): return STATE["sleep_until"] and datetime.datetime.utcnow() < 
 def net_pct(sig): return (abs(sig.take_profit - sig.price) / sig.price - FEE_RT_PCT) * 100 if sig.price > 0 else 0.0
 
 def get_trade_params(work_hours):
-    """Адаптация под время"""
+    """Адаптация под время, но порог всегда >= 65%"""
     if work_hours <= 2:
-        return {"tf": "1m", "conf": 0.50, "tp_mult": 2.0, "sl_mult": 1.0, "risk": 0.03} # Быстрый скальпинг
+        return {"tf": "1m", "conf": 0.65, "tp_mult": 2.0, "sl_mult": 1.0, "risk": 0.03} 
     elif work_hours <= 6:
-        return {"tf": "5m", "conf": 0.55, "tp_mult": 2.5, "sl_mult": 1.2, "risk": 0.02} # Средний ТФ
+        return {"tf": "5m", "conf": 0.65, "tp_mult": 2.5, "sl_mult": 1.2, "risk": 0.02} 
     else:
-        return {"tf": "15m", "conf": 0.60, "tp_mult": 3.0, "sl_mult": 1.5, "risk": 0.015} # Трендовый ТФ
+        return {"tf": "15m", "conf": 0.70, "tp_mult": 3.0, "sl_mult": 1.5, "risk": 0.015}
 
 def register_loss(pnl=0.0, symbol=None):
     STATE["day_pnl_usdt"] += pnl; STATE["loss_streak"] += 1
@@ -125,7 +126,8 @@ async def check_setup(session, symbol, params):
         
         sig = await loop.run_in_executor(None, lambda: f.analyze_filtered(tf, tp_mult=params["tp_mult"]))
         
-        if sig.confidence < params["conf"]: return None
+        # ЖЕСТКИЙ ФИЛЬТР 65%
+        if sig.confidence < CONF_FLOOR: return None
         if net_pct(sig) < 0.15: return None
             
         return {"symbol": symbol, "signal": sig, "net": net_pct(sig), "tf": tf}
@@ -212,7 +214,7 @@ async def _first_scan_loop(app):
                 scan_count += 1
                 if scan_count % 3 == 0 and chat_id:
                     try:
-                        msg_text = f"⏳ Сканирую Топ-{TOP_N_SCAN} монет...\nПопытка {scan_count}. Ищу лучшие точки."
+                        msg_text = f"⏳ Сканирую Топ-{TOP_N_SCAN} монет...\nПопытка {scan_count}. Ищу уверенность >{int(CONF_FLOOR*100)}%."
                         if not STATE["auto"]["scan_msg_id"]:
                             msg = await app.bot.send_message(chat_id=chat_id, text=msg_text)
                             STATE["auto"]["scan_msg_id"] = msg.message_id
@@ -226,7 +228,7 @@ async def _first_scan_loop(app):
             print("scan err:", e)
             await asyncio.sleep(3)
 
-# --- УМНЫЙ ТРЕЙЛИНГ (Перевод в безубыток на 0.5R) ---
+# --- ТРЕЙЛИНГ И ПАНИКА ---
 async def _trailing_loop(app, symbol):
     chat_id = app.bot_data.get("chat_id", 0)
     STATE["trailing"]["active"][symbol] = True
@@ -271,7 +273,7 @@ async def _trailing_loop(app, symbol):
                 profit = (best - entry) / entry if entry else 0
                 if R_pct > 0:
                     if profit >= 1.5 * R_pct: new_sl = max(cur_sl, entry + R_abs)
-                    elif profit >= 0.5 * R_pct: new_sl = max(cur_sl, entry) # Безубыток на 0.5R
+                    elif profit >= 0.5 * R_pct: new_sl = max(cur_sl, entry)
                 if new_sl >= entry and best > entry:
                     trail = best - 0.2 * atr_v
                     if trail > new_sl: new_sl = trail
@@ -288,7 +290,7 @@ async def _trailing_loop(app, symbol):
                 profit = (entry - best) / entry if entry else 0
                 if R_pct > 0:
                     if profit >= 1.5 * R_pct: new_sl = min(cur_sl if cur_sl else entry * 2, entry - R_abs)
-                    elif profit >= 0.5 * R_pct: new_sl = min(cur_sl if cur_sl else entry * 2, entry) # Безубыток на 0.5R
+                    elif profit >= 0.5 * R_pct: new_sl = min(cur_sl if cur_sl else entry * 2, entry)
                 if new_sl <= entry and best < entry:
                     trail = best + 0.2 * atr_v
                     if new_sl == 0 or trail < new_sl: new_sl = trail
@@ -304,7 +306,6 @@ async def _trailing_loop(app, symbol):
         except Exception: pass
     STATE["trailing"]["active"][symbol] = False
 
-# --- ОСТАЛЬНОЙ КОД (БЕЗ ИЗМЕНЕНИЙ) ---
 async def _panic_loop(app, symbol):
     chat_id = app.bot_data.get("chat_id", 0)
     STATE["panic"]["active"][symbol] = True
@@ -431,12 +432,11 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["exchange"] = key
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
     
-    # Настраиваем параметры на основе введенного времени
     params = get_trade_params(STATE["auto"]["work_hours"])
     STATE["auto"]["params"] = params
     
     STATE["pending"]["auto"] = "my_coins"
-    msg = f"Биржа выбрана. Стратегия: ТФ {params['tf']} (Риск {int(params['risk']*100)}%).\n\n<b>Какие монеты у тебя есть сейчас?</b>\nВпиши через запятую (например: BTC, ETH, ZRO). Если нет — напиши 'нет'."
+    msg = f"Биржа выбрана. ТФ {params['tf']} (Порог 65%).\n\n<b>Какие монеты у тебя есть сейчас?</b>\nВпиши через запятую (например: BTC, ETH, ZRO). Если нет — напиши 'нет'."
     await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("start")), parse_mode="HTML")
 
 async def auto_ex_start_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -448,7 +448,6 @@ async def auto_ex_start_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else: await update.callback_query.edit_message_text(msg, reply_markup=kb([]))
     asyncio.create_task(_first_scan_loop(ctx.application))
 
-# --- ОСТАЛЬНЫЕ ФУНКЦИИ (DEMO, MANUAL, HISTORY) ---
 async def demo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = [[btn("🚀 Найти монету", "demo_scan")], nav_btns("start")[0]]
     await update.callback_query.edit_message_text("🎮 Демо.", reply_markup=kb(rows))
