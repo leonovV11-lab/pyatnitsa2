@@ -37,7 +37,7 @@ SLEEP_MIN = 30
 MAX_POSITIONS = 2
 SCAN_INTERVAL = 300
 DAILY_DD_LIMIT = 0.05
-FAST_SCAN_LIMIT = 20 # Для скорости берем только 20 лучших
+FAST_SCAN_LIMIT = 20
 
 _EX_CACHE = {}
 _OKX_MARKETS = {"ts": 0, "symbols": set()}
@@ -228,15 +228,13 @@ async def bg_scan_market():
                 if qv < VOL_MIN_24H or price <= 0: continue
                 
                 change = abs(float(t.get("priceChangePercent") or 0))
-                if change < 1.5: continue # Фильтр минимальной волатильности
+                if change < 1.5: continue
                 
                 potential = change 
                 
                 pre_candidates.append({"symbol": sym_fmt, "vol24": qv, "price": price, "potential": potential})
             
             pre_candidates.sort(key=lambda x: x["potential"], reverse=True)
-            
-            # БЕРЕМ ТОЛЬКО 20 ЛУЧШИХ ДЛЯ МАКСИМАЛЬНОЙ СКОРОСТИ
             top_pairs = pre_candidates[:FAST_SCAN_LIMIT]
             
             tf = STATE["auto"]["tf"]
@@ -317,15 +315,8 @@ async def send_signal(app, r, reason="", dynamic_conf=55.0):
 
 async def _first_scan_then_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
-    start_time = time.time()
     
     while STATE["auto"]["active"]:
-        if time.time() - start_time > 600:
-            if chat_id:
-                await app.bot.send_message(chat_id=chat_id, text="⏱ 10 минут прошло. Не нашел точек входа с покрытием комиссии. Останавливаюсь.", reply_markup=kb([[btn("🏠 В меню", "start")]]))
-                STATE["auto"]["active"] = False
-            return
-
         await bg_scan_market()
         
         candidates = STATE["auto"].get("bg_candidates", [])
@@ -333,18 +324,15 @@ async def _first_scan_then_loop(app):
             await asyncio.sleep(15)
             continue
             
-        vol_count = sum(1 for c in candidates if c["atr_pct"] > 0.01)
-        
-        if vol_count >= 15: dynamic_conf = 55.0
-        elif vol_count < 5: dynamic_conf = 75.0
-        else: dynamic_conf = 65.0
-            
+        # КАСКАД УВЕРЕННОСТИ
         best = None
-        for c in candidates:
-            if c["confidence"] >= dynamic_conf:
-                best = c
-                break
-                
+        for conf in [65.0, 60.0, 55.0]:
+            for c in candidates:
+                if c["confidence"] >= conf:
+                    best = c
+                    break
+            if best: break
+            
         if best:
             STATE["auto"]["current_offer"] = best["symbol"]
             STATE["auto"]["current_chance"] = best["confidence"]
@@ -364,6 +352,7 @@ async def _first_scan_then_loop(app):
                 await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
             return
             
+        # Если нет даже 55% - просто спим 15 сек и сканируем снова
         await asyncio.sleep(15)
 
 async def scan_loop(app):
@@ -377,24 +366,19 @@ async def scan_loop(app):
             current_sym = STATE["auto"]["current_offer"]
             candidates = STATE["auto"].get("bg_candidates", [])
             
-            vol_count = sum(1 for c in candidates if c["atr_pct"] > 0.01)
-            if vol_count >= 15: dynamic_conf = 55.0
-            elif vol_count < 5: dynamic_conf = 75.0
-            else: dynamic_conf = 65.0
-            
             current_data = next((c for c in candidates if c["symbol"] == current_sym), None)
             
             if current_data:
-                if current_data["confidence"] >= dynamic_conf:
+                if current_data["confidence"] >= 55.0:
                     key = current_data["symbol"] + ":" + current_data["signal"].action
                     if key not in STATE["auto"]["seen_signals"]:
                         STATE["auto"]["seen_signals"].add(key)
-                        await send_signal(app, current_data, "по текущей", dynamic_conf)
+                        await send_signal(app, current_data, "по текущей", 55.0)
                         continue
             
             if not STATE["auto"]["symbols"]:
                 for c in candidates:
-                    if c["symbol"] != current_sym and c["confidence"] >= dynamic_conf:
+                    if c["symbol"] != current_sym and c["confidence"] >= 65.0:
                         text = ("🔥 <b>Есть лучше!</b>\n\n"
                                 "Сейчас: " + current_sym + " (" + str(int(STATE["auto"]["current_chance"])) + "%)\n"
                                 "Новая: <b>" + c["symbol"] + "</b> (" + str(int(c["confidence"])) + "%)")
@@ -412,16 +396,13 @@ async def forecast_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     checked = STATE["auto"].get("bg_candidates", [])
     if not checked: return
     
-    vol_count = sum(1 for c in checked if c["atr_pct"] > 0.01)
-    if vol_count >= 15: dynamic_conf = 55.0
-    elif vol_count < 5: dynamic_conf = 75.0
-    else: dynamic_conf = 65.0
-    
     best = None
-    for c in checked:
-        if c["confidence"] >= dynamic_conf:
-            best = c
-            break
+    for conf in [65.0, 60.0, 55.0]:
+        for c in checked:
+            if c["confidence"] >= conf:
+                best = c
+                break
+        if best: break
             
     if not best:
         await update.callback_query.edit_message_text("Нет монет.", reply_markup=kb(nav_btns("start")))
@@ -459,14 +440,9 @@ async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     candidates = STATE["auto"].get("bg_candidates", [])
     current_sym = STATE["auto"]["current_offer"]
     
-    vol_count = sum(1 for c in candidates if c["atr_pct"] > 0.01)
-    if vol_count >= 15: dynamic_conf = 55.0
-    elif vol_count < 5: dynamic_conf = 75.0
-    else: dynamic_conf = 65.0
-    
     better = None
     for c in candidates:
-        if c["symbol"] != current_sym and c["confidence"] >= dynamic_conf:
+        if c["symbol"] != current_sym and c["confidence"] >= 65.0:
             better = c; break
             
     if better:
@@ -476,7 +452,7 @@ async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.edit_message_text("✅ Поменял на " + better["symbol"], reply_markup=kb(nav_btns("start")))
         key = better["symbol"] + ":" + better["signal"].action
         STATE["auto"]["seen_signals"].add(key)
-        await send_signal(ctx.application, better, "новая лучшая", dynamic_conf)
+        await send_signal(ctx.application, better, "новая лучшая", 65.0)
     else:
         await update.callback_query.edit_message_text("Оставил текущую.", reply_markup=kb(nav_btns("start")))
 
