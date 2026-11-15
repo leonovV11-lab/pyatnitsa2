@@ -37,7 +37,7 @@ SLEEP_MIN = 30
 MAX_POSITIONS = 2
 SCAN_INTERVAL = 300
 DAILY_DD_LIMIT = 0.05
-FAST_SCAN_LIMIT = 20
+FAST_SCAN_LIMIT = 40
 
 _EX_CACHE = {}
 _OKX_MARKETS = {"ts": 0, "symbols": set()}
@@ -48,7 +48,7 @@ STATE = {
     "day_started": datetime.date.today().isoformat(),
     "day_pnl_usdt": 0.0, "day_halt": False,
     "auto": {
-        "active": False, "task": None, "exchange": "okx", "tf": "5m",
+        "active": False, "task": None, "exchange": "okx", "tf": "auto",
         "work_hours": 24, "symbols": [], "seen_signals": set(),
         "current_offer": None, "current_chance": 0,
         "bg_scan_done": False, "bg_candidates": [],
@@ -110,7 +110,7 @@ def tf_from_hours(hours):
     return "1h"
 
 def tf_label(tf):
-    return {"1m": "1 минута", "5m": "5 минут", "15m": "15 минут", "1h": "1 час", "4h": "4 часа"}.get(tf, tf)
+    return {"1m": "1 минута", "3m": "3 минуты", "5m": "5 минут", "15m": "15 минут", "30m": "30 минут", "1h": "1 час", "4h": "4 часа"}.get(tf, tf)
 
 def get_exchange_obj(key):
     if key in _EX_CACHE: return _EX_CACHE[key]
@@ -204,13 +204,12 @@ async def check_volume(symbol):
     except Exception: return False
 
 # ---------- СКАН И СИГНАЛЫ ----------
-async def bg_scan_market():
+async def bg_scan_market(deep_scan=False):
     try:
         async with aiohttp.ClientSession() as session:
             raw_tickers = await fetch_binance_tickers(session)
             if not raw_tickers: 
-                STATE["auto"]["bg_scan_done"] = True
-                return
+                return []
 
             allowed_symbols = get_okx_symbols() if STATE["auto"]["exchange"] == "okx" else None
 
@@ -237,40 +236,51 @@ async def bg_scan_market():
             pre_candidates.sort(key=lambda x: x["potential"], reverse=True)
             top_pairs = pre_candidates[:FAST_SCAN_LIMIT]
             
-            tf = STATE["auto"]["tf"]
+            # Если обычный скан - проверяем только 1 ТФ. Если глубокий - все.
+            if deep_scan:
+                tfs_to_check = ["1m", "3m", "5m", "15m", "30m", "1h"]
+            else:
+                tfs_to_check = [STATE["auto"]["tf"]]
             
             sem = asyncio.Semaphore(20)
             async def strict_check(c):
                 async with sem:
-                    try:
-                        df = await fetch_candles(session, c["symbol"], tf, 60)
-                        if df is None or len(df) < 20: return None
+                    best_sig = None
+                    best_tf = None
+                    best_conf = 0
+                    
+                    for tf in tfs_to_check:
+                        try:
+                            df = await fetch_candles(session, c["symbol"], tf, 60)
+                            if df is None or len(df) < 20: continue
+                            
+                            f = Friday(symbol=c["symbol"], exchange_name="binance")
+                            df = f.enrich(df, tf).dropna()
+                            if len(df) < 20: continue
+                            
+                            sig = f.analyze_filtered(tf, tp_mult=3.0)
+                            if sig.confidence > best_conf:
+                                best_conf = sig.confidence
+                                best_sig = sig
+                                best_tf = tf
+                        except Exception: pass
                         
-                        f = Friday(symbol=c["symbol"], exchange_name="binance")
-                        df = f.enrich(df, tf).dropna()
-                        if len(df) < 20: return None
-                        
-                        sig = f.analyze_filtered(tf, tp_mult=3.0)
-                        confidence = sig.confidence * 100
-                        atr_pct = float(df["atr"].iloc[-1]) / sig.price if sig.price else 0
-                        
-                        return {"symbol": c["symbol"], "confidence": confidence, "atr_pct": atr_pct,
-                                "potential": c["potential"], "vol24": c["vol24"], "price": sig.price,
-                                "signal": sig, "tf": tf, "regime": "normal"}
-                    except Exception: return None
+                    if not best_sig: return None
+                    
+                    atr_pct = float(df["atr"].iloc[-1]) / best_sig.price if best_sig.price else 0
+                    
+                    return {"symbol": c["symbol"], "confidence": best_conf * 100, "atr_pct": atr_pct,
+                            "potential": c["potential"], "vol24": c["vol24"], "price": best_sig.price,
+                            "signal": best_sig, "tf": best_tf, "regime": "normal"}
                         
             tasks = [strict_check(c) for c in top_pairs]
             results = await asyncio.gather(*tasks)
-            valid = [r for r in results if r is not None]
-            
-            valid.sort(key=lambda x: x["confidence"], reverse=True)
-            STATE["auto"]["bg_candidates"] = valid
-            STATE["auto"]["bg_scan_done"] = True
+            return [r for r in results if r is not None]
     except Exception as e:
         print("BG Scan error:", e)
-        STATE["auto"]["bg_scan_done"] = True
+        return []
 
-async def send_signal(app, r, reason="", dynamic_conf=55.0):
+async def send_signal(app, r, reason="", dynamic_conf=65.0):
     sig = r["signal"]
     
     if not await check_volume(r["symbol"]): return
@@ -317,22 +327,23 @@ async def _first_scan_then_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
     
     while STATE["auto"]["active"]:
-        await bg_scan_market()
+        # ЭТАП 1: Быстрый скан по одному ТФ
+        candidates = await bg_scan_market(deep_scan=False)
         
-        candidates = STATE["auto"].get("bg_candidates", [])
-        if not candidates:
-            await asyncio.sleep(15)
-            continue
-            
-        # КАСКАД УВЕРЕННОСТИ
         best = None
-        for conf in [65.0, 60.0, 55.0]:
+        for c in candidates:
+            if c["confidence"] >= 65.0:
+                best = c
+                break
+                
+        if not best:
+            # ЭТАП 2: Если не нашли за 15 сек (быстрый скан), перебираем все ТФ (глубокий скан)
+            candidates = await bg_scan_market(deep_scan=True)
             for c in candidates:
-                if c["confidence"] >= conf:
+                if c["confidence"] >= 65.0:
                     best = c
                     break
-            if best: break
-            
+                    
         if best:
             STATE["auto"]["current_offer"] = best["symbol"]
             STATE["auto"]["current_chance"] = best["confidence"]
@@ -352,7 +363,7 @@ async def _first_scan_then_loop(app):
                 await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
             return
             
-        # Если нет даже 55% - просто спим 15 сек и сканируем снова
+        # Если даже глубокий скан не дал 65% - ждем 15 сек и сканируем снова
         await asyncio.sleep(15)
 
 async def scan_loop(app):
@@ -397,12 +408,10 @@ async def forecast_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not checked: return
     
     best = None
-    for conf in [65.0, 60.0, 55.0]:
-        for c in checked:
-            if c["confidence"] >= conf:
-                best = c
-                break
-        if best: break
+    for c in checked:
+        if c["confidence"] >= 65.0:
+            best = c
+            break
             
     if not best:
         await update.callback_query.edit_message_text("Нет монет.", reply_markup=kb(nav_btns("start")))
@@ -414,11 +423,11 @@ async def forecast_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     rows = [
         [btn("Нет", "hascoins_no"), btn("Да", "hascoins_yes")],
-        [btn("⏱ Сменить ТФ (" + tf_label(STATE["auto"]["tf"]) + ")", "tf_bad")],
+        [btn("⏱ Сменить ТФ (" + tf_label(best["tf"]) + ")", "tf_bad")],
         nav_btns("start")[0]
     ]
     await update.callback_query.edit_message_text(
-        "Монета: <b>" + best["symbol"] + "</b>\nТФ: <b>" + tf_label(STATE["auto"]["tf"]) + "</b>\n\nЕсть у тебя " + best["symbol"] + "?", 
+        "Монета: <b>" + best["symbol"] + "</b>\nТФ: <b>" + tf_label(best["tf"]) + "</b>\n\nЕсть у тебя " + best["symbol"] + "?", 
         reply_markup=kb(rows), parse_mode="HTML")
 
 async def forecast_rescan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -561,8 +570,7 @@ async def demo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def demo_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("🔍 Сканирую...")
-    if not STATE["auto"]["bg_scan_done"]: await bg_scan_market()
-    candidates = STATE["auto"].get("bg_candidates", [])
+    candidates = await bg_scan_market(deep_scan=False)
     if not candidates: await update.callback_query.edit_message_text("Не нашёл.", reply_markup=kb(nav_btns("demo"))); return
     best = candidates[0]
     STATE["demo"]["symbol"] = best["symbol"]; STATE["demo"]["buy_price"] = best["price"]
