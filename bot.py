@@ -23,24 +23,27 @@ from chart import build_chart
 from geopy.geocoders import Nominatim
 from timezonefinder import TimezoneFinder
 
-# ---------- КОНСТАНТЫ ----------
 CONF_SIGNAL = 0.85
-CONF_MIN_RELAXED = 0.65  
+CONF_MIN_RELAXED = 0.65
 FEE_MIN_TP = 0.006
 MIN_NET_PCT = 0.2
-VOL_MIN_24H = 1000000.0 
+VOL_MIN_24H = 1000000.0
 VOL_MIN_SIGNAL = 100000.0
 PANIC_DROP = 0.02
 PANIC_INTERVAL = 5
 LOSS_LIMIT = 3
 SLEEP_MIN = 30
 MAX_POSITIONS = 2
-SCAN_INTERVAL = 300
+SCAN_INTERVAL = 30
 DAILY_DD_LIMIT = 0.05
-BATCH_SIZE = 20
+BATCH_SIZE = 40
+FEE_ROUND_PCT = 0.1
+SLIP_PCT = 0.15
+TFS_ALL = ["1m", "5m", "15m", "1h"]
 
 _EX_CACHE = {}
 _OKX_MARKETS = {"ts": 0, "symbols": set()}
+_CANDLE_CACHE = {}
 
 STATE = {
     "balance": 0.0, "daily_budget": 0.0, "city": "", "tz": "UTC",
@@ -53,7 +56,7 @@ STATE = {
         "current_offer": None, "current_chance": 0,
         "bg_scan_done": False, "bg_candidates": [],
         "have_coin": None, "coin_qty": 0.0,
-        "last_found": None,
+        "last_found": None, "tf_choices": {},
     },
     "manual": {"exchange": config.EXCHANGE, "pairs": [], "page": 0, "symbol": None},
     "pending": {},
@@ -113,6 +116,25 @@ def tf_from_hours(hours):
 def tf_label(tf):
     return {"1m": "1 минута", "5m": "5 минут", "15m": "15 минут", "1h": "1 час", "4h": "4 часа"}.get(tf, tf)
 
+def conf_threshold(hours):
+    h = int(hours) if hours else 24
+    if h <= 2: return 0.55
+    if h <= 6: return 0.60
+    if h <= 12: return 0.65
+    return 0.70
+
+def net_threshold(hours):
+    h = int(hours) if hours else 24
+    if h <= 2: return 0.15
+    if h <= 6: return 0.25
+    if h <= 12: return 0.30
+    return 0.40
+
+def net_pct_calc(price, tp, fee_round=FEE_ROUND_PCT, slip=SLIP_PCT):
+    if price <= 0: return 0.0
+    gross = abs(tp - price) / price * 100
+    return gross - fee_round * 2 - slip
+
 def get_exchange_obj(key):
     if key in _EX_CACHE: return _EX_CACHE[key]
     params = {"timeout": 10000, "options": {"defaultType": "spot"}}
@@ -131,20 +153,24 @@ def local_now():
     try: return datetime.datetime.now(ZoneInfo(STATE["tz"]))
     except Exception: return datetime.datetime.utcnow()
 
-# ---------- БЫСТРЫЙ API ЗАПРОС ----------
-async def fetch_candles(session, symbol, tf, limit=60):
+async def fetch_candles(session, symbol, tf, limit=60, cache=True):
+    ck = symbol + "|" + tf + "|" + str(limit)
+    if cache:
+        cached = _CANDLE_CACHE.get(ck)
+        if cached and time.time() - cached["ts"] < 30:
+            return cached["df"]
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol.replace('/', '')}&interval={tf}&limit={limit}"
+        url = "https://api.binance.com/api/v3/klines?symbol=" + symbol.replace("/", "") + "&interval=" + tf + "&limit=" + str(limit)
         async with session.get(url, timeout=3.0) as resp:
             if resp.status != 200: return None
             data = await resp.json()
             if not isinstance(data, list): return None
-            
             import pandas as pd
             df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume", "close_time", "qav", "trades", "taker_base", "taker_quote", "ignore"])
             df = df[["ts", "open", "high", "low", "close", "volume"]]
             for c in ["open", "high", "low", "close", "volume"]: df[c] = df[c].astype(float)
             df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+            if cache: _CANDLE_CACHE[ck] = {"ts": time.time(), "df": df}
             return df
     except Exception:
         return None
@@ -174,262 +200,244 @@ def get_okx_symbols():
     except Exception:
         return _OKX_MARKETS["symbols"]
 
-# ---------- СТРОГИЕ ПРОВЕРКИ ----------
 def strict_signal_check(app, sig, symbol):
-    if sig.confidence < CONF_MIN_RELAXED: return False, "conf < 65%"
+    if sig.confidence < conf_threshold(STATE["auto"]["work_hours"]): return False, "conf"
     if "signal" in STATE["pending"]: return False, "pending"
     if is_sleeping(): return False, "sleep"
-        
-    tp_dist = abs(sig.take_profit - sig.price) / sig.price if sig.price else 0
-    net = (tp_dist - 0.004) * 100
-    
-    if tp_dist < FEE_MIN_TP: return False, "tp < 3x fee"
-    if net < MIN_NET_PCT: return False, "net < 0.2%"
+    net = net_pct_calc(sig.price, sig.take_profit)
+    if net < net_threshold(STATE["auto"]["work_hours"]): return False, "net"
     if not sig.stop_loss or sig.stop_loss <= 0: return False, "no stop"
     if STATE["auto"]["have_coin"] == False and sig.action == "SELL": return False, "sell not allowed"
-        
     qty = calc_qty(sig.price, sig.stop_loss, sig.confidence)
     if qty <= 0: return False, "qty <= 0"
-        
     return True, "ok"
 
-async def check_volume(symbol):
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = f"https://api.binance.com/api/v3/klines?symbol={symbol.replace('/', '')}&interval=15m&limit=96"
-            async with session.get(url, timeout=3.0) as resp:
-                if resp.status != 200: return False
-                data = await resp.json()
-                vol = sum(float(r[5]) * float(r[4]) for r in data)
-                return vol >= VOL_MIN_SIGNAL
-    except Exception: return False
-
-# ---------- СКАН И СИГНАЛЫ ----------
 async def bg_scan_market():
     try:
         async with aiohttp.ClientSession() as session:
             raw_tickers = await fetch_binance_tickers(session)
             if not raw_tickers: return []
-
             allowed_symbols = get_okx_symbols() if STATE["auto"]["exchange"] == "okx" else None
-
             pre_candidates = []
             for t in raw_tickers:
                 sym = t.get("symbol", "")
                 if not sym.endswith("USDT"): continue
                 sym_fmt = sym[:-4] + "/USDT"
-                
                 if allowed_symbols is not None and sym_fmt not in allowed_symbols:
                     continue
-                    
                 price = float(t.get("lastPrice") or 0)
                 qv = float(t.get("quoteVolume") or 0)
                 if qv < VOL_MIN_24H or price <= 0: continue
-                
                 change = abs(float(t.get("priceChangePercent") or 0))
                 if change < 1.5: continue
-                
-                pre_candidates.append({"symbol": sym_fmt, "vol24": qv, "price": price, "potential": change})
-            
-            pre_candidates.sort(key=lambda x: x["potential"], reverse=True)
+                pre_candidates.append({"symbol": sym_fmt, "vol24": qv, "price": price, "potential": change, "vol_factor": min(qv / 5000000.0, 10.0)})
+            pre_candidates.sort(key=lambda x: x["potential"] * (1.0 + x["vol_factor"] * 0.1), reverse=True)
             return pre_candidates
     except Exception as e:
         print("BG Scan error:", e)
         return []
 
 async def process_batch(session, candidates, tf):
-    sem = asyncio.Semaphore(len(candidates))
+    sem = asyncio.Semaphore(len(candidates) if candidates else 1)
     async def strict_check(c):
         async with sem:
             try:
                 df = await fetch_candles(session, c["symbol"], tf, 60)
                 if df is None or len(df) < 20: return None
-                
                 f = Friday(symbol=c["symbol"], exchange_name="binance")
                 df = f.enrich(df, tf).dropna()
                 if len(df) < 20: return None
-                
                 sig = f.analyze_filtered(tf, tp_mult=3.0)
                 confidence = sig.confidence * 100
                 atr_pct = float(df["atr"].iloc[-1]) / sig.price if sig.price else 0
-                
+                net = net_pct_calc(sig.price, sig.take_profit)
                 return {"symbol": c["symbol"], "confidence": confidence, "atr_pct": atr_pct,
                         "potential": c["potential"], "vol24": c["vol24"], "price": sig.price,
-                        "signal": sig, "tf": tf, "regime": "normal"}
+                        "signal": sig, "tf": tf, "regime": "normal", "net_pct": net}
             except Exception: return None
-                
     tasks = [strict_check(c) for c in candidates]
     results = await asyncio.gather(*tasks)
     valid = [r for r in results if r is not None]
-    valid.sort(key=lambda x: x["confidence"], reverse=True)
+    valid.sort(key=lambda x: x["confidence"] * (1.0 + x.get("net_pct", 0) / 100.0), reverse=True)
     return valid
+
+async def pick_best_tf(symbol, hours):
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for tf in TFS_ALL:
+            tasks.append(fetch_candles(session, symbol, tf, 60))
+        dfs = await asyncio.gather(*tasks)
+    results = []
+    for tf, df in zip(TFS_ALL, dfs):
+        if df is None or len(df) < 20: continue
+        try:
+            f = Friday(symbol=symbol, exchange_name="binance")
+            df2 = f.enrich(df.copy(), tf).dropna()
+            if len(df2) < 20: continue
+            sig = f.analyze_filtered(tf, tp_mult=3.0)
+            net = net_pct_calc(sig.price, sig.take_profit)
+            conf_pct = sig.confidence * 100
+            exp_trades = max(1.0, hours * 60.0 / {"1m": 1, "5m": 5, "15m": 15, "1h": 60}[tf])
+            expected = net * conf_pct / 100.0 * min(exp_trades, 30.0)
+            results.append({"tf": tf, "signal": sig, "net": net, "conf": conf_pct, "expected": expected})
+        except Exception: continue
+    if not results: return None
+    results.sort(key=lambda x: x["expected"], reverse=True)
+    return results[0], results
 
 async def send_signal(app, r, reason=""):
     sig = r["signal"]
-    
-    if not await check_volume(r["symbol"]): return
     ok, msg = strict_signal_check(app, sig, r["symbol"])
-    if not ok: return
-
+    if not ok:
+        print("signal rejected:", r["symbol"], msg)
+        return
     budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
     risk_pct = 0.03 if sig.confidence >= 0.85 else (0.02 if sig.confidence >= 0.75 else 0.01)
     sl_diff = abs(sig.price - sig.stop_loss)
-    
     if sig.action == "SELL" and STATE["auto"]["coin_qty"] > 0:
         qty = STATE["auto"]["coin_qty"]
         lot = qty * sig.price
     else:
-        max_loss = budget * risk_pct
         qty = min((budget * risk_pct) / sl_diff, (budget * 0.2) / sig.price)
         lot = qty * sig.price
-        
-    net_pct = (abs(sig.take_profit - sig.price) / sig.price - 0.004) * 100
-    net_usdt = lot * (net_pct / 100.0)
-    
+    net = net_pct_calc(sig.price, sig.take_profit)
+    net_usdt = lot * (net / 100.0)
     STATE["pending"]["signal"] = {"action": sig.action, "symbol": r["symbol"], "price": sig.price, "lot": lot, "qty": qty, "sl": sig.stop_loss, "tp": sig.take_profit}
-    
     text = ("🎯 " + r["symbol"] + " · " + tf_label(r["tf"]) + ("\n" + reason if reason else "") +
             "\n" + sig.action + " @ " + fmt_price(sig.price) +
             "\n🎯 Уверенность: " + str(int(r["confidence"])) + "%" +
             "\n💵 Лот: " + str(round(lot, 2)) + " USDT" +
             "\n🛡 Риск: " + str(round(budget * risk_pct, 2)) + " USDT (" + str(round(risk_pct * 100, 1)) + "%)" +
             "\nСтоп " + fmt_price(sig.stop_loss) + "\nТейк " + fmt_price(sig.take_profit) +
-            "\n💰 Чистая ~" + str(round(net_pct, 2)) + "% (~$" + str(round(net_usdt, 2)) + ")")
-    
+            "\n💰 Чистая ~" + str(round(net, 2)) + "% (~$" + str(round(net_usdt, 2)) + ")")
     rows = [
         [btn("✅ Купил по сигналу", "sig_buy_signal" if sig.action == "BUY" else "sig_sell_signal")],
         [btn("✏️ Своя сумма", "sig_buy_custom" if sig.action == "BUY" else "sig_sell_custom")],
         [btn("❌ Пропустил", "sig_skipped")],
         [btn("🛑 СТОП", "auto_stop_signals")]
     ]
-            
     chat_id = app.bot_data.get("chat_id", 0)
     if chat_id:
         await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
 
 async def _first_scan_then_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
-    
     while STATE["auto"]["active"]:
         async with aiohttp.ClientSession() as session:
             all_candidates = await bg_scan_market()
             if not all_candidates:
                 await asyncio.sleep(5)
                 continue
-                
             tf = STATE["auto"]["tf"]
             found = None
-            
+            collected = []
             for i in range(0, len(all_candidates), BATCH_SIZE):
                 if not STATE["auto"]["active"]: return
-                
                 batch = all_candidates[i:i+BATCH_SIZE]
                 results = await process_batch(session, batch, tf)
-                
+                collected.extend(results)
+                best = None
                 for r in results:
-                    if r["confidence"] >= 65.0:
-                        found = r
-                        break
-                if found: break
-                
+                    if r["confidence"] >= conf_threshold(STATE["auto"]["work_hours"]) * 100 and r["net_pct"] >= net_threshold(STATE["auto"]["work_hours"]):
+                        if best is None or r["confidence"] > best["confidence"]:
+                            best = r
+                if best:
+                    found = best
+                    break
+            STATE["auto"]["bg_candidates"] = collected
             if found:
                 STATE["auto"]["current_offer"] = found["symbol"]
                 STATE["auto"]["current_chance"] = found["confidence"]
                 STATE["auto"]["last_found"] = found
                 hours = STATE["auto"].get("work_hours", 24)
-                
-                est_pct = found["confidence"] * (hours / 1.5) * 0.35
+                est_pct = found["net_pct"]
                 est_usdt = STATE["daily_budget"] * (est_pct / 100.0)
-                
                 text = ("📊 <b>Лучшая монета</b>\n\n"
                         "🪙 <b>" + found["symbol"] + "</b>\n"
                         "⏱ ТФ: <b>" + tf_label(found["tf"]) + "</b>\n"
                         "🎯 Уверенность: <b>" + str(int(found["confidence"])) + "%</b>\n"
-                        "📈 Прогноз: <b>+" + str(round(est_pct, 1)) + "%</b> (~$" + str(round(est_usdt, 2)) + ")")
-                
+                        "💰 Чистая: <b>+" + str(round(est_pct, 2)) + "%</b> (~$" + str(round(est_usdt, 2)) + ")")
                 sym_data = found["symbol"].replace("/", "_")
                 rows = [[btn("✅ Берём", "forecast_go_" + sym_data)], [btn("🔄 Ещё скан", "forecast_rescan")], [btn("🛑 СТОП", "auto_stop_signals")]]
                 if chat_id:
                     await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
                 return
-                
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
 
 async def scan_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
     while STATE["auto"]["active"]:
         try:
             if STATE["day_halt"] or is_sleeping() or "signal" in STATE["pending"] or portfolio.count_open() >= MAX_POSITIONS:
-                await asyncio.sleep(60)
+                await asyncio.sleep(SCAN_INTERVAL)
                 continue
-            
             current_sym = STATE["auto"]["current_offer"]
+            tf = STATE["auto"]["tf"]
             async with aiohttp.ClientSession() as session:
-                all_candidates = await bg_scan_market()
-                tf = STATE["auto"]["tf"]
-                
-                current_batch = [c for c in all_candidates if c["symbol"] == current_sym]
-                current_data = None
-                
-                if current_batch:
-                    res = await process_batch(session, current_batch, tf)
-                    if res: current_data = res[0]
-                    
-                if current_data:
+                current_batch = [{"symbol": current_sym, "potential": 0, "vol24": 0, "price": 0}]
+                res = await process_batch(session, current_batch, tf)
+                if res:
+                    current_data = res[0]
                     key = current_data["symbol"] + ":" + current_data["signal"].action
                     if key not in STATE["auto"]["seen_signals"]:
-                        STATE["auto"]["seen_signals"].add(key)
-                        await send_signal(app, current_data, "по текущей")
-                        continue
-                
-                if not STATE["auto"]["symbols"]:
-                    top_batch = all_candidates[:BATCH_SIZE]
-                    res = await process_batch(session, top_batch, tf)
-                    for c in res:
-                        if c["symbol"] != current_sym and c["confidence"] >= 65.0:
-                            text = ("🔥 <b>Есть лучше!</b>\n\n"
-                                    "Сейчас: " + current_sym + " (" + str(int(STATE["auto"]["current_chance"])) + "%)\n"
-                                    "Новая: <b>" + c["symbol"] + "</b> (" + str(int(c["confidence"])) + "%)")
-                            rows = [[btn("✅ Поменять", "switch_yes")], [btn("❌ Оставить", "switch_no")]]
-                            if chat_id:
-                                await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
-                            break
-                            
-            await asyncio.sleep(60)
+                        ok, _ = strict_signal_check(app, current_data["signal"], current_data["symbol"])
+                        if ok:
+                            STATE["auto"]["seen_signals"].add(key)
+                            await send_signal(app, current_data, "по текущей")
+                            await asyncio.sleep(SCAN_INTERVAL)
+                            continue
+                all_candidates = await bg_scan_market()
+                top_batch = all_candidates[:BATCH_SIZE]
+                res = await process_batch(session, top_batch, tf)
+                STATE["auto"]["bg_candidates"] = res
+                best_alt = None
+                for c in res:
+                    if c["symbol"] != current_sym and c["confidence"] >= conf_threshold(STATE["auto"]["work_hours"]) * 100 and c["net_pct"] >= net_threshold(STATE["auto"]["work_hours"]):
+                        if best_alt is None or c["confidence"] > best_alt["confidence"]:
+                            best_alt = c
+                if best_alt:
+                    text = ("🔥 <b>Есть лучше!</b>\n\n"
+                            "Сейчас: " + str(current_sym) + " (" + str(int(STATE["auto"]["current_chance"])) + "%)\n"
+                            "Новая: <b>" + best_alt["symbol"] + "</b> (" + str(int(best_alt["confidence"])) + "%, чистая +" + str(round(best_alt["net_pct"], 2)) + "%)")
+                    rows = [[btn("✅ Поменять", "switch_yes")], [btn("❌ Оставить", "switch_no")]]
+                    if chat_id:
+                        await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
+                    STATE["auto"]["last_found"] = best_alt
+            await asyncio.sleep(SCAN_INTERVAL)
         except Exception as e:
             print("scan_loop:", e)
-            await asyncio.sleep(60)
+            await asyncio.sleep(SCAN_INTERVAL)
 
 async def forecast_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = update.callback_query.data
     sym = data.replace("forecast_go_", "").replace("_", "/")
-    
     found = STATE["auto"].get("last_found")
     if not found or found["symbol"] != sym:
         await update.callback_query.edit_message_text("Данные устарели. Нажмите 'Ещё скан'.", reply_markup=kb(nav_btns("start")))
         return
-    
     STATE["auto"]["symbols"] = [found["symbol"]]
     STATE["auto"]["current_offer"] = found["symbol"]
     STATE["auto"]["current_chance"] = found["confidence"]
-    
     rows = [
         [btn("Нет", "hascoins_no"), btn("Да", "hascoins_yes")],
         [btn("⏱ Сменить ТФ (" + tf_label(found["tf"]) + ")", "tf_bad")],
         nav_btns("start")[0]
     ]
     await update.callback_query.edit_message_text(
-        "Монета: <b>" + found["symbol"] + "</b>\nТФ: <b>" + tf_label(found["tf"]) + "</b>\n\nЕсть у тебя " + found["symbol"] + "?", 
+        "Монета: <b>" + found["symbol"] + "</b>\nТФ: <b>" + tf_label(found["tf"]) + "</b>\n💰 Чистая: <b>+" + str(round(found["net_pct"], 2)) + "%</b>\n\nЕсть у тебя " + found["symbol"] + "?",
         reply_markup=kb(rows), parse_mode="HTML")
 
 async def forecast_rescan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("🔄 Пересканирую...", reply_markup=kb(nav_btns("start")))
+    STATE["auto"]["bg_scan_done"] = False
+    if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
+        STATE["auto"]["active"] = True
+        STATE["auto"]["task"] = asyncio.create_task(_first_scan_then_loop(ctx.application))
 
 async def hascoins_no(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["have_coin"] = False
     STATE["auto"]["coin_qty"] = 0.0
     await update.callback_query.edit_message_text("Ок. Ждем только BUY.\nСканирую на сигналы...", reply_markup=kb(nav_btns("start")))
-    
     if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
         STATE["auto"]["task"] = asyncio.create_task(scan_loop(ctx.application))
 
@@ -440,16 +448,16 @@ async def hascoins_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     candidates = STATE["auto"].get("bg_candidates", [])
     current_sym = STATE["auto"]["current_offer"]
-    
     better = None
     for c in candidates:
-        if c["symbol"] != current_sym and c["confidence"] >= 65.0:
-            better = c; break
-            
+        if c["symbol"] != current_sym and c["confidence"] >= conf_threshold(STATE["auto"]["work_hours"]) * 100:
+            if better is None or c["confidence"] > better["confidence"]:
+                better = c
     if better:
         STATE["auto"]["symbols"] = [better["symbol"]]
         STATE["auto"]["current_offer"] = better["symbol"]
         STATE["auto"]["current_chance"] = better["confidence"]
+        STATE["auto"]["last_found"] = better
         await update.callback_query.edit_message_text("✅ Поменял на " + better["symbol"], reply_markup=kb(nav_btns("start")))
         key = better["symbol"] + ":" + better["signal"].action
         STATE["auto"]["seen_signals"].add(key)
@@ -460,7 +468,6 @@ async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def switch_no(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("Ок, оставил текущую.", reply_markup=kb(nav_btns("start")))
 
-# ---------- ОСТАЛЬНОЕ (МЕНЮ, РУЧНОЙ И Т.Д.) ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     day_rollover()
     opens = portfolio.load().get("opens", [])
@@ -485,19 +492,21 @@ async def auto_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["coin_qty"] = 0.0
     STATE["auto"]["seen_signals"] = set()
     STATE["pending"]["auto"] = "balance"
-    await update.callback_query.edit_message_text("Баланс (USDT)?", reply_markup=kb(nav_btns("start")))
+    msg = "Баланс (USDT)?"
+    if update.callback_query: await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("start")))
+    else: await update.message.reply_text(msg, reply_markup=kb(nav_btns("start")))
 
 async def auto_after_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["auto"] = "budget"
     msg = "Баланс " + str(STATE["balance"]) + ".\nБюджет на день?"
-    if update.message: await update.message.reply_text(msg, reply_markup=kb(nav_btns("auto_start")))
-    else: await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("auto_start")))
+    if update.message: await update.message.reply_text(msg, reply_markup=kb(nav_btns("start")))
+    else: await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("start")))
 
 async def auto_after_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["pending"]["auto"] = "work_time"
     msg = "Бюджет " + str(STATE["daily_budget"]) + ".\nСколько работаем? ('2 часа', '1 день')"
-    if update.message: await update.message.reply_text(msg, reply_markup=kb(nav_btns("auto_retry_balance")))
-    else: await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("auto_retry_balance")))
+    if update.message: await update.message.reply_text(msg, reply_markup=kb(nav_btns("auto_start")))
+    else: await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("auto_start")))
 
 async def auto_ask_exchange(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = [[btn(name, "auto_ex_set_" + key)] for key, name in exchanges.EXCHANGES.items()]
@@ -517,8 +526,26 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         STATE["auto"]["task"] = asyncio.create_task(_first_scan_then_loop(ctx.application))
 
 async def tf_bad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rows = [[btn("1m", "auto_tf_1m"), btn("5m", "auto_tf_5m"), btn("15m", "auto_tf_15m"), btn("4h", "auto_tf_4h")], [btn("✏️ Своё", "auto_tf_custom")], nav_btns("start")[0]]
-    await update.callback_query.edit_message_text("ТФ:", reply_markup=kb(rows))
+    sym = STATE["auto"]["current_offer"]
+    if sym:
+        await update.callback_query.edit_message_text("⏳ Сравниваю ТФ...")
+        try:
+            best, all_res = await pick_best_tf(sym, STATE["auto"]["work_hours"])
+        except Exception:
+            best, all_res = None, []
+        STATE["auto"]["tf_choices"] = {r["tf"]: r for r in all_res} if all_res else {}
+        rows = []
+        if all_res:
+            for r in all_res:
+                label = tf_label(r["tf"]) + " · +" + str(round(r["net"], 2)) + "% · " + str(int(r["conf"])) + "%"
+                rows.append([btn(label, "auto_tf_" + r["tf"])])
+        rows.append([btn("✏️ Своё", "auto_tf_custom")])
+        rows.append(nav_btns("start")[0])
+        await update.callback_query.edit_message_text("Лучшие ТФ для " + sym + ":", reply_markup=kb(rows))
+        return
+    rows = [[btn("1m", "auto_tf_1m"), btn("5m", "auto_tf_5m"), btn("15m", "auto_tf_15m"), btn("1h", "auto_tf_1h")], [btn("✏️ Своё", "auto_tf_custom")], nav_btns("start")[0]]
+    if update.callback_query: await update.callback_query.edit_message_text("ТФ:", reply_markup=kb(rows))
+    else: await update.message.reply_text("ТФ:", reply_markup=kb(rows))
 
 async def auto_tf_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tf = update.callback_query.data.replace("auto_tf_", "")
@@ -526,31 +553,31 @@ async def auto_tf_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         STATE["pending"]["auto"] = "tf_custom"
         await update.callback_query.edit_message_text("Впиши ТФ (например 3m, 45m):", reply_markup=kb(nav_btns("tf_bad"))); return
     STATE["auto"]["tf"] = tf
-    
     if STATE["auto"]["current_offer"]:
         best_sym = STATE["auto"]["current_offer"]
         f = Friday(symbol=best_sym, exchange_name="binance")
         loop = asyncio.get_event_loop()
-        df = await loop.run_in_executor(None, lambda: f.fetch(tf, 60))
-        df = f.enrich(df, tf).dropna()
-        if len(df) >= 20:
+        try:
+            df = await loop.run_in_executor(None, lambda: f.fetch(tf, 60))
+            df = f.enrich(df, tf).dropna()
+        except Exception:
+            df = None
+        if df is not None and len(df) >= 20:
             sig = f.analyze_filtered(tf, tp_mult=3.0)
-            r = {"symbol": best_sym, "confidence": sig.confidence * 100, "signal": sig, "tf": tf, "regime": "normal", "atr_pct": 0, "vol24": 0, "price": sig.price, "potential": 0}
-            
+            net = net_pct_calc(sig.price, sig.take_profit)
+            r = {"symbol": best_sym, "confidence": sig.confidence * 100, "signal": sig, "tf": tf, "regime": "normal", "atr_pct": 0, "vol24": 0, "price": sig.price, "potential": 0, "net_pct": net}
             STATE["auto"]["bg_candidates"] = [r] + STATE["auto"]["bg_candidates"]
             STATE["auto"]["current_chance"] = r["confidence"]
             STATE["auto"]["last_found"] = r
-            
             rows = [
                 [btn("Нет", "hascoins_no"), btn("Да", "hascoins_yes")],
                 [btn("⏱ Сменить ТФ (" + tf_label(tf) + ")", "tf_bad")],
                 nav_btns("start")[0]
             ]
             await update.callback_query.edit_message_text(
-                "Монета: <b>" + best_sym + "</b>\nТФ: <b>" + tf_label(tf) + "</b>\n\nЕсть у тебя " + best_sym + "?", 
+                "Монета: <b>" + best_sym + "</b>\nТФ: <b>" + tf_label(tf) + "</b>\n💰 Чистая: <b>+" + str(round(net, 2)) + "%</b>\n\nЕсть у тебя " + best_sym + "?",
                 reply_markup=kb(rows), parse_mode="HTML")
             return
-
     await update.callback_query.edit_message_text("Ок, " + tf_label(tf) + ".", reply_markup=kb(nav_btns("start")))
 
 async def tf_ok_15m(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -565,14 +592,12 @@ async def demo_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("🔍 Сканирую...")
     candidates = await bg_scan_market()
     if not candidates: await update.callback_query.edit_message_text("Не нашёл.", reply_markup=kb(nav_btns("demo"))); return
-    
     async with aiohttp.ClientSession() as session:
         res = await process_batch(session, candidates[:5], "5m")
-        
     if not res: await update.callback_query.edit_message_text("Не нашёл.", reply_markup=kb(nav_btns("demo"))); return
     best = res[0]
     STATE["demo"]["symbol"] = best["symbol"]; STATE["demo"]["buy_price"] = best["price"]
-    text = ("🎮 ДЕМО\n" + best["symbol"] + "\nУверенность: " + str(int(best["confidence"])) + "%")
+    text = ("🎮 ДЕМО\n" + best["symbol"] + "\nУверенность: " + str(int(best["confidence"])) + "%\nЧистая: +" + str(round(best["net_pct"], 2)) + "%")
     rows = [[btn("✅ Купил", "demo_buy")], [btn("❌ Пропустил", "demo_skip")], nav_btns("demo")[0]]
     await update.callback_query.edit_message_text(text, reply_markup=kb(rows))
 
@@ -604,12 +629,10 @@ async def _trailing_loop(app, symbol):
             portfolio.update_peak(price, symbol)
             pos2 = portfolio.find_open(symbol)
             if not pos2: break
-            
             pnl_now = portfolio.current_pnl(price, symbol)
             if pnl_now and pnl_now["pnl_pct"] >= 0.5 and not live_pnl_sent and chat_id:
                 live_pnl_sent = True
                 await app.bot.send_message(chat_id=chat_id, text="📈 " + symbol + " сейчас +" + str(round(pnl_now["pnl_pct"], 2)) + "% (~$" + str(round(pnl_now["pnl_abs"], 2)) + ")")
-            
             best = pos2.get("peak", pos["entry"])
             if pos2["side"] == "BUY":
                 gain = (best - pos["entry"]) / pos["entry"]
@@ -786,7 +809,8 @@ async def man_signals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sig = f.analyze_filtered(STATE["auto"]["tf"], tp_mult=3.0)
     except Exception as e: await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("man_pick_back"))); return
     if sig.confidence < CONF_SIGNAL: await update.callback_query.edit_message_text("Уверенность " + str(int(sig.confidence * 100)) + "% < " + str(int(CONF_SIGNAL * 100)) + "%", reply_markup=kb(nav_btns("man_pick_back"))); return
-    text = ("📊 " + symbol + " · СИГНАЛ\n" + sig.action + " @ " + fmt_price(sig.price) + "\nУверенность: " + str(int(sig.confidence * 100)) + "%\nСтоп " + fmt_price(sig.stop_loss) + "\nТейк " + fmt_price(sig.take_profit))
+    net = net_pct_calc(sig.price, sig.take_profit)
+    text = ("📊 " + symbol + " · СИГНАЛ\n" + sig.action + " @ " + fmt_price(sig.price) + "\nУверенность: " + str(int(sig.confidence * 100)) + "%\nЧистая: +" + str(round(net, 2)) + "%\nСтоп " + fmt_price(sig.stop_loss) + "\nТейк " + fmt_price(sig.take_profit))
     try:
         path = build_chart(symbol, STATE["auto"]["tf"], sig)
         with open(path, "rb") as photo: await ctx.bot.send_photo(chat_id=update.callback_query.message.chat_id, photo=photo, caption=text, reply_markup=kb(nav_btns("man_pick_back")))
@@ -882,7 +906,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         STATE["auto"]["have_coin"] = True
         STATE["auto"]["coin_qty"] = qty
         await update.message.reply_text("Ок, у тебя " + str(qty) + " монет.\nЖдем сигнала SELL (для продажи) или BUY (докупить).", reply_markup=kb(nav_btns("start")))
-        
         if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
             STATE["auto"]["task"] = asyncio.create_task(scan_loop(ctx.application))
         return
@@ -941,31 +964,31 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             tf = txt.strip()
             if not re.match(r"^\d+[mhd]$", tf): await update.message.reply_text("5m, 1h.", reply_markup=kb(nav_btns("tf_bad"))); return
             STATE["auto"]["tf"] = tf
-            
             if STATE["auto"]["current_offer"]:
                 best_sym = STATE["auto"]["current_offer"]
                 f = Friday(symbol=best_sym, exchange_name="binance")
                 loop = asyncio.get_event_loop()
-                df = await loop.run_in_executor(None, lambda: f.fetch(tf, 60))
-                df = f.enrich(df, tf).dropna()
-                if len(df) >= 20:
+                try:
+                    df = await loop.run_in_executor(None, lambda: f.fetch(tf, 60))
+                    df = f.enrich(df, tf).dropna()
+                except Exception:
+                    df = None
+                if df is not None and len(df) >= 20:
                     sig = f.analyze_filtered(tf, tp_mult=3.0)
-                    r = {"symbol": best_sym, "confidence": sig.confidence * 100, "signal": sig, "tf": tf, "regime": "normal", "atr_pct": 0, "vol24": 0, "price": sig.price, "potential": 0}
-                    
+                    net = net_pct_calc(sig.price, sig.take_profit)
+                    r = {"symbol": best_sym, "confidence": sig.confidence * 100, "signal": sig, "tf": tf, "regime": "normal", "atr_pct": 0, "vol24": 0, "price": sig.price, "potential": 0, "net_pct": net}
                     STATE["auto"]["bg_candidates"] = [r] + STATE["auto"]["bg_candidates"]
                     STATE["auto"]["current_chance"] = r["confidence"]
                     STATE["auto"]["last_found"] = r
-                    
                     rows = [
                         [btn("Нет", "hascoins_no"), btn("Да", "hascoins_yes")],
                         [btn("⏱ Сменить ТФ (" + tf_label(tf) + ")", "tf_bad")],
                         nav_btns("start")[0]
                     ]
                     await update.message.reply_text(
-                        "Монета: <b>" + best_sym + "</b>\nТФ: <b>" + tf_label(tf) + "</b>\n\nЕсть у тебя " + best_sym + "?", 
+                        "Монета: <b>" + best_sym + "</b>\nТФ: <b>" + tf_label(tf) + "</b>\n💰 Чистая: <b>+" + str(round(net, 2)) + "%</b>\n\nЕсть у тебя " + best_sym + "?",
                         reply_markup=kb(rows), parse_mode="HTML")
                     return
-
             pend.pop("auto"); await update.message.reply_text("Ок, " + tf_label(tf) + ".", reply_markup=kb(nav_btns("start"))); return
 
     if "manual" in pend:
@@ -1005,8 +1028,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     }
 
     if data.startswith("forecast_go_"):
-        await forecast_go(update, ctx)
-        return
+        await forecast_go(update, ctx); return
     if data.startswith("panic_sold_"): await panic_sold(update, ctx); return
     if data in mapping: await mapping[data](update, ctx); return
 
