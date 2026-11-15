@@ -25,7 +25,7 @@ from timezonefinder import TimezoneFinder
 
 # ---------- КОНСТАНТЫ ----------
 CONF_SIGNAL = 0.85
-CONF_MIN_RELAXED = 0.55  
+CONF_MIN_RELAXED = 0.65  
 FEE_MIN_TP = 0.006
 MIN_NET_PCT = 0.2
 VOL_MIN_24H = 1000000.0 
@@ -48,12 +48,12 @@ STATE = {
     "day_started": datetime.date.today().isoformat(),
     "day_pnl_usdt": 0.0, "day_halt": False,
     "auto": {
-        "active": False, "task": None, "exchange": "okx", "tf": "1m", # Дефолт 1m если 2 часа
+        "active": False, "task": None, "exchange": "okx", "tf": "1m",
         "work_hours": 24, "symbols": [], "seen_signals": set(),
         "current_offer": None, "current_chance": 0,
         "bg_scan_done": False, "bg_candidates": [],
         "have_coin": None, "coin_qty": 0.0,
-        "last_found": None, # Запоминаем последнюю найденную
+        "last_found": None,
     },
     "manual": {"exchange": config.EXCHANGE, "pairs": [], "page": 0, "symbol": None},
     "pending": {},
@@ -175,8 +175,8 @@ def get_okx_symbols():
         return _OKX_MARKETS["symbols"]
 
 # ---------- СТРОГИЕ ПРОВЕРКИ ----------
-def strict_signal_check(app, sig, symbol, dynamic_conf):
-    if sig.confidence < dynamic_conf: return False, "conf < dynamic"
+def strict_signal_check(app, sig, symbol):
+    if sig.confidence < CONF_MIN_RELAXED: return False, "conf < 65%"
     if "signal" in STATE["pending"]: return False, "pending"
     if is_sleeping(): return False, "sleep"
         
@@ -264,11 +264,11 @@ async def process_batch(session, candidates, tf):
     valid.sort(key=lambda x: x["confidence"], reverse=True)
     return valid
 
-async def send_signal(app, r, reason="", dynamic_conf=55.0):
+async def send_signal(app, r, reason=""):
     sig = r["signal"]
     
     if not await check_volume(r["symbol"]): return
-    ok, msg = strict_signal_check(app, sig, r["symbol"], dynamic_conf)
+    ok, msg = strict_signal_check(app, sig, r["symbol"])
     if not ok: return
 
     budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
@@ -335,7 +335,7 @@ async def _first_scan_then_loop(app):
             if found:
                 STATE["auto"]["current_offer"] = found["symbol"]
                 STATE["auto"]["current_chance"] = found["confidence"]
-                STATE["auto"]["last_found"] = found # СОХРАНЯЕМ НАЙДЕННУЮ МОНЕТУ
+                STATE["auto"]["last_found"] = found
                 hours = STATE["auto"].get("work_hours", 24)
                 
                 est_pct = found["confidence"] * (hours / 1.5) * 0.35
@@ -347,7 +347,6 @@ async def _first_scan_then_loop(app):
                         "🎯 Уверенность: <b>" + str(int(found["confidence"])) + "%</b>\n"
                         "📈 Прогноз: <b>+" + str(round(est_pct, 1)) + "%</b> (~$" + str(round(est_usdt, 2)) + ")")
                 
-                # ПЕРЕДАЕМ СИМВОЛ В CALLBACK_DATA
                 sym_data = found["symbol"].replace("/", "_")
                 rows = [[btn("✅ Берём", "forecast_go_" + sym_data)], [btn("🔄 Ещё скан", "forecast_rescan")], [btn("🛑 СТОП", "auto_stop_signals")]]
                 if chat_id:
@@ -361,7 +360,7 @@ async def scan_loop(app):
     while STATE["auto"]["active"]:
         try:
             if STATE["day_halt"] or is_sleeping() or "signal" in STATE["pending"] or portfolio.count_open() >= MAX_POSITIONS:
-                await asyncio.sleep(5)
+                await asyncio.sleep(60)
                 continue
             
             current_sym = STATE["auto"]["current_offer"]
@@ -377,12 +376,11 @@ async def scan_loop(app):
                     if res: current_data = res[0]
                     
                 if current_data:
-                    if current_data["confidence"] >= 55.0:
-                        key = current_data["symbol"] + ":" + current_data["signal"].action
-                        if key not in STATE["auto"]["seen_signals"]:
-                            STATE["auto"]["seen_signals"].add(key)
-                            await send_signal(app, current_data, "по текущей", 55.0)
-                            continue
+                    key = current_data["symbol"] + ":" + current_data["signal"].action
+                    if key not in STATE["auto"]["seen_signals"]:
+                        STATE["auto"]["seen_signals"].add(key)
+                        await send_signal(app, current_data, "по текущей")
+                        continue
                 
                 if not STATE["auto"]["symbols"]:
                     top_batch = all_candidates[:BATCH_SIZE]
@@ -397,13 +395,12 @@ async def scan_loop(app):
                                 await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
                             break
                             
-            await asyncio.sleep(5)
+            await asyncio.sleep(60)
         except Exception as e:
             print("scan_loop:", e)
-            await asyncio.sleep(5)
+            await asyncio.sleep(60)
 
 async def forecast_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Получаем символ из callback_data
     data = update.callback_query.data
     sym = data.replace("forecast_go_", "").replace("_", "/")
     
@@ -456,7 +453,7 @@ async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.edit_message_text("✅ Поменял на " + better["symbol"], reply_markup=kb(nav_btns("start")))
         key = better["symbol"] + ":" + better["signal"].action
         STATE["auto"]["seen_signals"].add(key)
-        await send_signal(ctx.application, better, "новая лучшая", 65.0)
+        await send_signal(ctx.application, better, "новая лучшая")
     else:
         await update.callback_query.edit_message_text("Оставил текущую.", reply_markup=kb(nav_btns("start")))
 
