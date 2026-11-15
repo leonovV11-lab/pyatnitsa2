@@ -1,12 +1,12 @@
 # language: Python 3.10+, file: bot.py
 import asyncio
 import datetime
+import json
 import os
 import re
 import time
 from zoneinfo import ZoneInfo
 import aiohttp
-import numpy as np
 import pandas as pd
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -24,7 +24,8 @@ from chart import build_chart
 from geopy.geocoders import Nominatim
 from timezonefinder import TimezoneFinder
 
-CONF_FLOOR = 0.55
+# --- НАСТРОЙКИ АЛГОРИТМА ---
+CONF_FLOOR = 0.65
 FIXED_RISK = 0.015
 KELLY_CAP = 0.02
 KELLY_MIN = 0.005
@@ -33,21 +34,19 @@ KELLY_MIN_TRADES = 50
 
 MIN_NET_PCT = 0.2
 FEE_RT_PCT = 0.004
-SPREAD_MAX_PCT = 0.15
-DEPTH_MIN_USDT = 50000
-VOL_MIN_24H = 1000000.0
-
 LIMIT_OFFSET = 0.002
+LIMIT_TIMEOUT = 90 # Ждем откат 1.5 минуты
+
 PANIC_DROP = 0.02
 PANIC_INTERVAL = 5
-TRAIL_INTERVAL = 30
+TRAIL_INTERVAL = 10
 LOSS_LIMIT = 3
 SLEEP_MIN = 30
 MAX_POSITIONS = 2
-SCAN_INTERVAL = 15
+SCAN_INTERVAL = 20
 DAILY_DD_LIMIT = 0.05
-SYMBOL_COOLDOWN = 600
-TOP_N_SCAN = 20
+TOP_N_SCAN = 15
+VOL_MIN_24H = 1000000.0
 
 _EX_CACHE = {}
 STATE = {
@@ -56,7 +55,7 @@ STATE = {
     "day_started": datetime.date.today().isoformat(),
     "day_pnl_usdt": 0.0, "day_halt": False,
     "metrics": {"trades": 0, "wins": 0, "losses": 0, "gross_win": 0.0, "gross_loss": 0.0, "peak_pnl": 0.0, "current_pnl": 0.0, "max_dd": 0.0, "consecutive_wins": 0, "consecutive_losses": 0},
-    "auto": {"active": False, "task": None, "exchange": "binance", "symbol": None, "have_coin": None, "coin_qty": 0.0, "last_found": None, "symbol_cooldown": {}},
+    "auto": {"active": False, "task": None, "exchange": "binance", "symbol": None, "have_coin": None, "coin_qty": 0.0, "last_found": None, "symbol_cooldown": {}, "btc_trend": "UP"},
     "manual": {"exchange": config.EXCHANGE, "pairs": [], "page": 0, "symbol": None},
     "pending": {},
     "panic": {"tasks": {}, "active": {}},
@@ -67,7 +66,6 @@ STATE = {
 def kb(rows): return InlineKeyboardMarkup(rows)
 def btn(text, data): return InlineKeyboardButton(text, callback_data=data)
 def nav_btns(back_data): return [[btn("⬅️ На шаг назад", back_data), btn("🏠 В меню", "start")]]
-
 def is_sleeping(): return STATE["sleep_until"] and datetime.datetime.utcnow() < STATE["sleep_until"]
 def net_pct(sig): return (abs(sig.take_profit - sig.price) / sig.price - FEE_RT_PCT) * 100 if sig.price > 0 else 0.0
 
@@ -77,7 +75,7 @@ def register_loss(pnl=0.0, symbol=None):
     dd = m["peak_pnl"] - m["current_pnl"]
     if dd > m["max_dd"]: m["max_dd"] = dd
     m["consecutive_wins"] = 0; m["consecutive_losses"] += 1
-    if symbol: STATE["auto"]["symbol_cooldown"][symbol] = time.time() + SYMBOL_COOLDOWN
+    if symbol: STATE["auto"]["symbol_cooldown"][symbol] = time.time() + 600
     if STATE["loss_streak"] >= LOSS_LIMIT: STATE["sleep_until"] = datetime.datetime.utcnow() + datetime.timedelta(minutes=SLEEP_MIN); STATE["loss_streak"] = 0
     budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
     if budget > 0 and STATE["day_pnl_usdt"] <= -budget * DAILY_DD_LIMIT: STATE["day_halt"] = True
@@ -105,16 +103,10 @@ def kelly_size(budget, price, sl, confidence):
     if f <= 0: return 0.0, 0.0, 0.0
     return min((budget * f) / diff, (budget * 0.20) / price), (budget * f), f
 
-def get_exchange_obj(key):
-    if key in _EX_CACHE: return _EX_CACHE[key]
-    ex = getattr(ccxt, key)({"timeout": 10000, "options": {"defaultType": "spot"}})
-    _EX_CACHE[key] = ex
-    return ex
-
-async def fetch_candles(session, symbol, tf, limit=50):
+async def fetch_candles(session, symbol, tf, limit=100):
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol.replace('/', '')}&interval={tf}&limit={limit}"
-        async with session.get(url, timeout=2.0) as resp:
+        async with session.get(url, timeout=3.0) as resp:
             if resp.status != 200: return None
             data = await resp.json()
             df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume", "close_time", "qav", "trades", "taker_base", "taker_quote", "ignore"])
@@ -124,56 +116,58 @@ async def fetch_candles(session, symbol, tf, limit=50):
             return df
     except Exception: return None
 
-async def fetch_orderbook(session, symbol):
-    try:
-        url = f"https://api.binance.com/api/v3/depth?symbol={symbol.replace('/', '')}&limit=50"
-        async with session.get(url, timeout=2.0) as resp:
-            return await resp.json() if resp.status == 200 else None
-    except Exception: return None
+async def check_btc_regime(session):
+    df = await fetch_candles(session, "BTC/USDT", "15m", 50)
+    if df is None or len(df) < 50: return "UP"
+    ema_fast = df["close"].ewm(span=9, adjust=False).mean().iloc[-1]
+    ema_slow = df["close"].ewm(span=21, adjust=False).mean().iloc[-1]
+    return "UP" if ema_fast >= ema_slow else "DOWN"
 
-async def bg_scan_market():
+async def bg_scan_market(session):
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.binance.com/api/v3/ticker/24hr", timeout=3.0) as resp:
-                if resp.status != 200: return []
-                raw = await resp.json()
-            pre = []
-            for t in raw:
-                sym = t.get("symbol", "")
-                if not sym.endswith("USDT"): continue
-                qv = float(t.get("quoteVolume") or 0)
-                price = float(t.get("lastPrice") or 0)
-                change = abs(float(t.get("priceChangePercent") or 0))
-                if qv < VOL_MIN_24H or price <= 0 or change < 1.5: continue
-                pre.append({"symbol": sym[:-4] + "/USDT", "vol": qv, "chg": change})
-            pre.sort(key=lambda x: x["chg"] * (x["vol"] ** 0.5), reverse=True)
-            return pre[:TOP_N_SCAN]
+        async with session.get("https://api.binance.com/api/v3/ticker/24hr", timeout=3.0) as resp:
+            if resp.status != 200: return []
+            raw = await resp.json()
+        pre = []
+        for t in raw:
+            sym = t.get("symbol", "")
+            if not sym.endswith("USDT") or sym == "BTCUSDT": continue
+            qv = float(t.get("quoteVolume") or 0)
+            price = float(t.get("lastPrice") or 0)
+            change = abs(float(t.get("priceChangePercent") or 0))
+            if qv < VOL_MIN_24H or price <= 0 or change < 1.5: continue
+            pre.append({"symbol": sym[:-4] + "/USDT", "vol": qv, "chg": change})
+        pre.sort(key=lambda x: x["chg"] * (x["vol"] ** 0.5), reverse=True)
+        return pre[:TOP_N_SCAN]
     except Exception: return []
 
-async def process_batch(session, candidates):
+async def process_batch(session, candidates, btc_trend):
     loop = asyncio.get_event_loop()
     async def check_one(c):
         try:
-            df = await fetch_candles(session, c["symbol"], "5m", 50)
-            if df is None or len(df) < 20: return None
+            # Качаем 100 свечей 5m (история для индикаторов)
+            df = await fetch_candles(session, c["symbol"], "5m", 100)
+            if df is None or len(df) < 30: return None
             
-            c_close = df["close"].values
-            ema_fast = pd.Series(c_close).ewm(span=9, adjust=False).mean().iloc[-1]
-            ema_slow = pd.Series(c_close).ewm(span=21, adjust=False).mean().iloc[-1]
-            if ema_fast < ema_slow: return None # Быстрый фильтр: ищем только лонги
-                
-            ob = await fetch_orderbook(session, c["symbol"])
-            if not ob or not ob.get("bids") or not ob.get("asks"): return None
-            bids = sum(float(p) * float(q) for p, q in ob["bids"])
-            asks = sum(float(p) * float(q) for p, q in ob["asks"])
-            if bids / (bids + asks) < 0.5: return None
-            if (float(ob["asks"][0][0]) - float(ob["bids"][0][0])) / float(ob["bids"][0][0]) * 100 > SPREAD_MAX_PCT: return None
-            
+            # Проверка старшего тренда (15m EMA)
+            df15 = await fetch_candles(session, c["symbol"], "15m", 30)
+            if df15 is None: return None
+            ema15_f = df15["close"].ewm(span=9, adjust=False).mean().iloc[-1]
+            ema15_s = df15["close"].ewm(span=21, adjust=False).mean().iloc[-1]
+            is_uptrend = ema15_f > ema15_s
+
             f = Friday(symbol=c["symbol"], exchange_name="binance")
             df = await loop.run_in_executor(None, lambda: f.enrich(df, "5m").dropna())
-            if len(df) < 20: return None
+            if len(df) < 30: return None
             sig = await loop.run_in_executor(None, lambda: f.analyze_filtered("5m", tp_mult=3.0))
+            
             if sig.confidence < CONF_FLOOR or net_pct(sig) < MIN_NET_PCT: return None
+            
+            # Проверка направления по BTC и 15m тренду
+            if sig.action == "BUY" and btc_trend == "DOWN": return None
+            if sig.action == "SELL" and btc_trend == "UP": return None
+            if sig.action == "BUY" and not is_uptrend: return None
+            if sig.action == "SELL" and is_uptrend: return None
             
             return {"symbol": c["symbol"], "signal": sig, "net": net_pct(sig)}
         except Exception: return None
@@ -186,26 +180,40 @@ async def process_batch(session, candidates):
 
 async def _first_scan_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
+    scan_count = 0
     while STATE["auto"]["active"]:
         try:
             if STATE["day_halt"] or is_sleeping(): await asyncio.sleep(3); continue
             async with aiohttp.ClientSession() as session:
-                candidates = await bg_scan_market()
-                if not candidates: await asyncio.sleep(1); continue
-                results = await process_batch(session, candidates)
+                STATE["auto"]["btc_trend"] = await check_btc_regime(session)
+                candidates = await bg_scan_market(session)
+                if not candidates: await asyncio.sleep(2); continue
+                
+                results = await process_batch(session, candidates, STATE["auto"]["btc_trend"])
                 found = results[0] if results else None
                 
                 if found:
                     STATE["auto"]["last_found"] = found
                     sym_data = found["symbol"].replace("/", "_")
-                    text = (f"📊 <b>Монета найдена</b>\n\n🪙 <b>{found['symbol']}</b>\n"
-                            f"⏱ ТФ: <b>5м</b>\n🎯 Уверенность: <b>{int(found['signal'].confidence * 100)}%</b>\n"
-                            f"💰 Чистая: <b>+{round(found['net'], 2)}%</b>")
+                    text = (f"📊 <b>Монета найдена (Свечи)</b>\n\n🪙 <b>{found['symbol']}</b>\n"
+                            f"📊 Направление: <b>{found['signal'].action}</b>\n"
+                            f"🎯 Уверенность: <b>{int(found['signal'].confidence * 100)}%</b>\n"
+                            f"💰 Чистая: <b>+{round(found['net'], 2)}%</b>\n"
+                            f"📈 Тренд BTC: <b>{STATE['auto']['btc_trend']}</b>")
                     rows = [[btn("✅ Берём", "forecast_go_" + sym_data)], [btn("🔄 Ещё скан", "forecast_rescan")], [btn("🛑 СТОП", "auto_stop_signals")]]
                     if chat_id: await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
                     return
+                
+                scan_count += 1
+                if scan_count % 5 == 0 and chat_id:
+                    try:
+                        await app.bot.edit_message_text(chat_id=chat_id, message_id=app.bot_data.get("scan_msg_id"),
+                            text=f"⏳ Сканирую рынок по свечам...\nПопытка {scan_count}. BTC: {STATE['auto']['btc_trend']}")
+                    except Exception: pass
                 await asyncio.sleep(1)
-        except Exception: await asyncio.sleep(3)
+        except Exception as e:
+            print("scan err:", e)
+            await asyncio.sleep(3)
 
 async def scan_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
@@ -231,17 +239,19 @@ async def scan_loop(app):
                 if qty <= 0: await asyncio.sleep(SCAN_INTERVAL); continue
 
                 limit_price = sig.price * (1 - LIMIT_OFFSET) if sig.action == "BUY" else sig.price * (1 + LIMIT_OFFSET)
-                STATE["pending"]["signal"] = {"action": sig.action, "symbol": symbol, "price": sig.price, "lot": qty*sig.price, "qty": qty, "sl": sig.stop_loss, "tp": sig.take_profit}
+                STATE["pending"]["signal"] = {"action": sig.action, "symbol": symbol, "price": sig.price, "lot": qty*sig.price, "qty": qty, "sl": sig.stop_loss, "tp": sig.take_profit, "expires": time.time() + LIMIT_TIMEOUT}
                 
                 text = (f"🎯 {symbol} · 5м\n{sig.action} @ {fmt_price(sig.price)}\n🎯 Уверенность: {int(sig.confidence * 100)}%\n"
                         f"💵 Лот: {round(qty*sig.price, 2)} USDT\n🛡 Риск: {round(risk_usdt, 2)} USDT\n"
                         f"Стоп {fmt_price(sig.stop_loss)} / Тейк {fmt_price(sig.take_profit)}\n"
-                        f"🔖 Лимит: {fmt_price(limit_price)}\n\nℹ️ Ордера ставишь сам. Сигнал сгорит через 2 мин.")
+                        f"🔖 Лимит: {fmt_price(limit_price)}\n\nℹ️ Ордера ставишь сам.")
                 
                 rows = [[btn("✅ Исполнил", "sig_buy_signal" if sig.action == "BUY" else "sig_sell_signal")], [btn("❌ Пропустил", "sig_skipped")]]
                 if chat_id: await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
                 await asyncio.sleep(SCAN_INTERVAL)
-        except Exception: await asyncio.sleep(SCAN_INTERVAL)
+        except Exception as e:
+            print("scan err:", e)
+            await asyncio.sleep(SCAN_INTERVAL)
 
 async def _trailing_loop(app, symbol):
     chat_id = app.bot_data.get("chat_id", 0)
@@ -270,7 +280,7 @@ async def _trailing_loop(app, symbol):
                 if R_pct > 0:
                     if profit >= 2.0 * R_pct: new_sl = max(cur_sl, entry + R_abs)
                     elif profit >= 1.5 * R_pct: new_sl = max(cur_sl, entry + 0.5 * R_abs)
-                    elif profit >= 1.0 * R_pct: new_sl = max(cur_sl, entry)
+                    elif profit >= 0.5 * R_pct: new_sl = max(cur_sl, entry) # Безубыток на 0.5R
                 if new_sl >= entry and best > entry:
                     trail = best - 0.3 * atr_v
                     if trail > new_sl: new_sl = trail
@@ -288,7 +298,7 @@ async def _trailing_loop(app, symbol):
                 if R_pct > 0:
                     if profit >= 2.0 * R_pct: new_sl = min(cur_sl if cur_sl else entry * 2, entry - R_abs)
                     elif profit >= 1.5 * R_pct: new_sl = min(cur_sl if cur_sl else entry * 2, entry - 0.5 * R_abs)
-                    elif profit >= 1.0 * R_pct: new_sl = min(cur_sl if cur_sl else entry * 2, entry)
+                    elif profit >= 0.5 * R_pct: new_sl = min(cur_sl if cur_sl else entry * 2, entry)
                 if new_sl <= entry and best < entry:
                     trail = best + 0.3 * atr_v
                     if new_sl == 0 or trail < new_sl: new_sl = trail
@@ -315,15 +325,14 @@ async def _panic_loop(app, symbol):
             df = f.enrich(f.fetch("1m", 60), "1m").dropna().reset_index(drop=True)
             if len(df) < 15: await asyncio.sleep(PANIC_INTERVAL); continue
             price = float(df["close"].iloc[-1])
-            cvd = calc_cvd(df, 5)
             pnl = portfolio.current_pnl(price, symbol)
             
             if pnl and pnl["side"] == "BUY":
                 peak = float(pnl.get("peak", pnl["entry"]))
                 drop = (peak - price) / peak if peak else 0
-                if drop >= PANIC_DROP and cvd < 0 and cvd < calc_cvd(df.iloc[:-5], 5) * 0.5:
+                if drop >= PANIC_DROP:
                     if chat_id:
-                        await app.bot.send_message(chat_id=chat_id, text=f"🔴 ЗАКРЫВАЙ {symbol}! (CVD)\nОткат: -{round(drop*100, 2)}%",
+                        await app.bot.send_message(chat_id=chat_id, text=f"🔴 ЗАКРЫВАЙ {symbol}!\nОткат: -{round(drop*100, 2)}%",
                             reply_markup=kb([[btn(f"🔴 ПРОДАЛ {symbol}", "panic_sold_" + symbol.replace("/", "_"))]]))
         except Exception: pass
         await asyncio.sleep(PANIC_INTERVAL)
@@ -456,7 +465,8 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
     STATE["auto"]["active"] = True
     STATE["pending"] = {}
-    await update.callback_query.edit_message_text(f"Биржа: {exchanges.EXCHANGES.get(key, key)}\n⏳ Ищу монеты...", reply_markup=kb([]))
+    msg = await update.callback_query.edit_message_text(f"Биржа: {exchanges.EXCHANGES.get(key, key)}\n⏳ Ищу монеты по свечам...", reply_markup=kb([]))
+    ctx.application.bot_data["scan_msg_id"] = msg.message_id
     if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
         STATE["auto"]["task"] = asyncio.create_task(_first_scan_loop(ctx.application))
 
@@ -496,9 +506,9 @@ async def demo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def demo_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("🔍 Сканирую...")
     async with aiohttp.ClientSession() as session:
-        candidates = await bg_scan_market()
+        candidates = await bg_scan_market(session)
         if not candidates: await update.callback_query.edit_message_text("Не нашёл.", reply_markup=kb(nav_btns("demo"))); return
-        res = await process_batch(session, candidates[:5])
+        res = await process_batch(session, candidates[:5], "UP")
     if not res: await update.callback_query.edit_message_text("Не нашёл.", reply_markup=kb(nav_btns("demo"))); return
     best = res[0]
     STATE["demo"]["symbol"] = best["symbol"]; STATE["demo"]["buy_price"] = best["signal"].price
