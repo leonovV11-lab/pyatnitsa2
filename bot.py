@@ -1,12 +1,13 @@
 # language: Python 3.10+, file: bot.py
 import asyncio
 import datetime
-import json
 import os
 import re
 import time
 from zoneinfo import ZoneInfo
 import aiohttp
+import numpy as np
+import pandas as pd
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -18,32 +19,25 @@ import ccxt
 import config
 import exchanges
 import portfolio
-from friday import Friday, Mode, MODE_CONFIG, fmt_price
+from friday import Friday, fmt_price
 from chart import build_chart
 from geopy.geocoders import Nominatim
 from timezonefinder import TimezoneFinder
 
-# --- КОНФИГ АВТОПИЛОТА ---
 CONF_FLOOR = 0.55
-SENIOR_PENALTY = 0.10
+FIXED_RISK = 0.015
 KELLY_CAP = 0.02
 KELLY_MIN = 0.005
 KELLY_FRACTION = 0.25
 KELLY_MIN_TRADES = 50
-FIXED_RISK = 0.015 # 1.5% на сделку до 50 сделок
 
 MIN_NET_PCT = 0.2
 FEE_RT_PCT = 0.004
-TP_MIN_DIST = 0.004
 SPREAD_MAX_PCT = 0.15
 DEPTH_MIN_USDT = 50000
-ATR_MIN_PCT = 0.3
-ATR_MAX_PCT = 4.0
 VOL_MIN_24H = 1000000.0
 
-LIMIT_OFFSET = 0.002 # 0.2% откат для лимитки
-LIMIT_TIMEOUT = 120 # 2 минуты на исполнение лимитки
-
+LIMIT_OFFSET = 0.002
 PANIC_DROP = 0.02
 PANIC_INTERVAL = 5
 TRAIL_INTERVAL = 30
@@ -52,32 +46,17 @@ SLEEP_MIN = 30
 MAX_POSITIONS = 2
 SCAN_INTERVAL = 15
 DAILY_DD_LIMIT = 0.05
-SIGNAL_COOLDOWN = 300
 SYMBOL_COOLDOWN = 600
-BATCH_SIZE = 20
-TFS_ALL = ["1m", "5m", "15m", "1h", "4h"]
-TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
+TOP_N_SCAN = 20
 
 _EX_CACHE = {}
-
 STATE = {
-    "balance": 0.0, "daily_budget": 0.0, "city": "", "tz": "UTC",
+    "balance": 0.0, "daily_budget": 0.0, "tz": "UTC",
     "loss_streak": 0, "sleep_until": None,
     "day_started": datetime.date.today().isoformat(),
     "day_pnl_usdt": 0.0, "day_halt": False,
-    "metrics": {
-        "trades": 0, "wins": 0, "losses": 0,
-        "gross_win": 0.0, "gross_loss": 0.0,
-        "peak_pnl": 0.0, "current_pnl": 0.0, "max_dd": 0.0,
-        "consecutive_wins": 0, "consecutive_losses": 0,
-    },
-    "auto": {
-        "active": False, "task": None, "exchange": "binance", "tf": "15m",
-        "work_hours": 24, "multi_day": False,
-        "symbol": None, "have_coin": None, "coin_qty": 0.0,
-        "last_signal_key": None, "last_signal_ts": 0,
-        "symbol_cooldown": {}, "tf_resolved": None, "last_found": None,
-    },
+    "metrics": {"trades": 0, "wins": 0, "losses": 0, "gross_win": 0.0, "gross_loss": 0.0, "peak_pnl": 0.0, "current_pnl": 0.0, "max_dd": 0.0, "consecutive_wins": 0, "consecutive_losses": 0},
+    "auto": {"active": False, "task": None, "exchange": "binance", "symbol": None, "have_coin": None, "coin_qty": 0.0, "last_found": None, "symbol_cooldown": {}},
     "manual": {"exchange": config.EXCHANGE, "pairs": [], "page": 0, "symbol": None},
     "pending": {},
     "panic": {"tasks": {}, "active": {}},
@@ -88,79 +67,56 @@ STATE = {
 def kb(rows): return InlineKeyboardMarkup(rows)
 def btn(text, data): return InlineKeyboardButton(text, callback_data=data)
 def nav_btns(back_data): return [[btn("⬅️ На шаг назад", back_data), btn("🏠 В меню", "start")]]
-def clear_pending(): STATE["pending"] = {}
 
 def is_sleeping(): return STATE["sleep_until"] and datetime.datetime.utcnow() < STATE["sleep_until"]
-def sleep_left_min():
-    if not STATE["sleep_until"]: return 0
-    return max(0, int((STATE["sleep_until"] - datetime.datetime.utcnow()).total_seconds() / 60))
-
-def day_rollover():
-    today = datetime.date.today().isoformat()
-    if STATE["day_started"] != today:
-        STATE["day_started"] = today
-        STATE["day_pnl_usdt"] = 0.0
-        STATE["day_halt"] = False
-        STATE["loss_streak"] = 0
+def net_pct(sig): return (abs(sig.take_profit - sig.price) / sig.price - FEE_RT_PCT) * 100 if sig.price > 0 else 0.0
 
 def register_loss(pnl=0.0, symbol=None):
-    STATE["day_pnl_usdt"] += pnl
-    STATE["loss_streak"] += 1
-    m = STATE["metrics"]
-    m["trades"] += 1; m["losses"] += 1; m["gross_loss"] += abs(pnl); m["current_pnl"] += pnl
+    STATE["day_pnl_usdt"] += pnl; STATE["loss_streak"] += 1
+    m = STATE["metrics"]; m["trades"] += 1; m["losses"] += 1; m["gross_loss"] += abs(pnl); m["current_pnl"] += pnl
     dd = m["peak_pnl"] - m["current_pnl"]
     if dd > m["max_dd"]: m["max_dd"] = dd
     m["consecutive_wins"] = 0; m["consecutive_losses"] += 1
     if symbol: STATE["auto"]["symbol_cooldown"][symbol] = time.time() + SYMBOL_COOLDOWN
-    if STATE["loss_streak"] >= LOSS_LIMIT:
-        STATE["sleep_until"] = datetime.datetime.utcnow() + datetime.timedelta(minutes=SLEEP_MIN)
-        STATE["loss_streak"] = 0
+    if STATE["loss_streak"] >= LOSS_LIMIT: STATE["sleep_until"] = datetime.datetime.utcnow() + datetime.timedelta(minutes=SLEEP_MIN); STATE["loss_streak"] = 0
     budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
     if budget > 0 and STATE["day_pnl_usdt"] <= -budget * DAILY_DD_LIMIT: STATE["day_halt"] = True
 
 def register_win(pnl=0.0, symbol=None):
-    STATE["day_pnl_usdt"] += pnl
-    STATE["loss_streak"] = 0
-    m = STATE["metrics"]
-    m["trades"] += 1; m["wins"] += 1; m["gross_win"] += abs(pnl); m["current_pnl"] += pnl
+    STATE["day_pnl_usdt"] += pnl; STATE["loss_streak"] = 0
+    m = STATE["metrics"]; m["trades"] += 1; m["wins"] += 1; m["gross_win"] += abs(pnl); m["current_pnl"] += pnl
     if m["current_pnl"] > m["peak_pnl"]: m["peak_pnl"] = m["current_pnl"]
     m["consecutive_wins"] += 1; m["consecutive_losses"] = 0
 
 def exposure_multiplier():
     cl = STATE["metrics"].get("consecutive_losses", 0)
-    if cl <= 0: return 1.0
-    if cl == 1: return 0.75
-    if cl == 2: return 0.5
-    return 0.0
+    return 1.0 if cl <= 0 else (0.75 if cl == 1 else (0.5 if cl == 2 else 0.0))
 
 def kelly_size(budget, price, sl, confidence):
-    if budget <= 0 or price <= 0: return 0.0, 0.0, 0.0, 0.0
+    if budget <= 0 or price <= 0: return 0.0, 0.0, 0.0
     diff = abs(price - sl)
-    if diff <= 0: return 0.0, 0.0, 0.0, 0.0
+    if diff <= 0: return 0.0, 0.0, 0.0
     m = STATE["metrics"]
     if m["trades"] >= KELLY_MIN_TRADES and m["gross_loss"] > 0:
-        p = m["wins"] / m["trades"]; q = 1.0 - p
-        avg_w = m["gross_win"] / max(m["wins"], 1); avg_l = m["gross_loss"] / max(m["losses"], 1)
-        b = avg_w / avg_l if avg_l > 0 else 1.0
-        f = (b * p - q) / b if b > 0 else 0.0
-        f = max(KELLY_MIN, min(KELLY_CAP, f * KELLY_FRACTION))
-    else:
-        f = FIXED_RISK
+        p = m["wins"] / m["trades"]; b = (m["gross_win"] / max(m["wins"], 1)) / (m["gross_loss"] / max(m["losses"], 1))
+        f = max(KELLY_MIN, min(KELLY_CAP, ((b * p - (1 - p)) / b) * KELLY_FRACTION))
+    else: f = FIXED_RISK
     f *= exposure_multiplier()
-    if f <= 0: return 0.0, 0.0, 0.0, 0.0
-    qty = min((budget * f) / diff, (budget * 0.20) / price)
-    return qty, qty * price, f, budget
+    if f <= 0: return 0.0, 0.0, 0.0
+    return min((budget * f) / diff, (budget * 0.20) / price), (budget * f), f
 
-def tf_label(tf): return {"1m": "1 минута", "5m": "5 минут", "15m": "15 минут", "1h": "1 час", "4h": "4 часа", "auto": "Авто"}.get(tf, tf)
-def net_pct(sig): return (abs(sig.take_profit - sig.price) / sig.price - FEE_RT_PCT) * 100 if sig.price > 0 else 0.0
+def get_exchange_obj(key):
+    if key in _EX_CACHE: return _EX_CACHE[key]
+    ex = getattr(ccxt, key)({"timeout": 10000, "options": {"defaultType": "spot"}})
+    _EX_CACHE[key] = ex
+    return ex
 
-async def fetch_candles(session, symbol, tf, limit=100):
+async def fetch_candles(session, symbol, tf, limit=50):
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol.replace('/', '')}&interval={tf}&limit={limit}"
-        async with session.get(url, timeout=3.0) as resp:
+        async with session.get(url, timeout=2.0) as resp:
             if resp.status != 200: return None
             data = await resp.json()
-            import pandas as pd
             df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume", "close_time", "qav", "trades", "taker_base", "taker_quote", "ignore"])
             df = df[["ts", "open", "high", "low", "close", "volume", "taker_base"]]
             for c in ["open", "high", "low", "close", "volume", "taker_base"]: df[c] = df[c].astype(float)
@@ -168,34 +124,17 @@ async def fetch_candles(session, symbol, tf, limit=100):
             return df
     except Exception: return None
 
-async def fetch_orderbook(session, symbol, limit=50):
+async def fetch_orderbook(session, symbol):
     try:
-        url = f"https://api.binance.com/api/v3/depth?symbol={symbol.replace('/', '')}&limit={limit}"
-        async with session.get(url, timeout=3.0) as resp:
+        url = f"https://api.binance.com/api/v3/depth?symbol={symbol.replace('/', '')}&limit=50"
+        async with session.get(url, timeout=2.0) as resp:
             return await resp.json() if resp.status == 200 else None
     except Exception: return None
-
-def calc_ofi(orderbook):
-    if not orderbook or not orderbook.get("bids") or not orderbook.get("asks"): return None
-    bids = sum(float(p) * float(q) for p, q in orderbook["bids"])
-    asks = sum(float(p) * float(q) for p, q in orderbook["asks"])
-    best_bid, best_ask = float(orderbook["bids"][0][0]), float(orderbook["asks"][0][0])
-    mid = (best_bid + best_ask) / 2
-    return {"imbalance": bids / (bids + asks), "spread_pct": (best_ask - best_bid) / mid * 100, "mid": mid}
-
-def calc_cvd(df, n=5):
-    if df is None or len(df) < n + 1 or "taker_base" not in df.columns: return 0.0
-    tail = df.tail(n)
-    return float((tail["taker_base"] * tail["close"]).sum()) - float(((tail["volume"] - tail["taker_base"]) * tail["close"]).sum())
-
-def check_atr_band(df, price):
-    if "atr" not in df.columns or price <= 0: return True
-    return ATR_MIN_PCT <= (float(df["atr"].iloc[-1]) / price * 100) <= ATR_MAX_PCT
 
 async def bg_scan_market():
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.binance.com/api/v3/ticker/24hr", timeout=5.0) as resp:
+            async with session.get("https://api.binance.com/api/v3/ticker/24hr", timeout=3.0) as resp:
                 if resp.status != 200: return []
                 raw = await resp.json()
             pre = []
@@ -204,129 +143,105 @@ async def bg_scan_market():
                 if not sym.endswith("USDT"): continue
                 qv = float(t.get("quoteVolume") or 0)
                 price = float(t.get("lastPrice") or 0)
-                if qv < VOL_MIN_24H or price <= 0: continue
-                pre.append({"symbol": sym[:-4] + "/USDT", "vol24": qv, "potential": abs(float(t.get("priceChangePercent") or 0))})
-            pre.sort(key=lambda x: x["vol24"], reverse=True) # Сортируем по ликвидности, не по пампу
-            return pre[:100]
+                change = abs(float(t.get("priceChangePercent") or 0))
+                if qv < VOL_MIN_24H or price <= 0 or change < 1.5: continue
+                pre.append({"symbol": sym[:-4] + "/USDT", "vol": qv, "chg": change})
+            pre.sort(key=lambda x: x["chg"] * (x["vol"] ** 0.5), reverse=True)
+            return pre[:TOP_N_SCAN]
     except Exception: return []
 
-async def process_batch(session, candidates, tf):
+async def process_batch(session, candidates):
+    loop = asyncio.get_event_loop()
     async def check_one(c):
         try:
-            df = await fetch_candles(session, c["symbol"], tf, 100)
-            if df is None or len(df) < 30: return None
-            f = Friday(symbol=c["symbol"], exchange_name="binance")
-            df = f.enrich(df, tf).dropna()
-            if len(df) < 30: return None
+            df = await fetch_candles(session, c["symbol"], "5m", 50)
+            if df is None or len(df) < 20: return None
             
-            # Проверка сжатия пружины: ATR падает последние 5 свечей
-            atr_now = df["atr"].iloc[-1]
-            atr_prev = df["atr"].iloc[-5]
-            if atr_now > atr_prev * 0.9: return None # Ищем затухание
-            
-            sig = f.analyze_filtered(tf, tp_mult=3.0)
-            if net_pct(sig) < MIN_NET_PCT: return None
-            
+            c_close = df["close"].values
+            ema_fast = pd.Series(c_close).ewm(span=9, adjust=False).mean().iloc[-1]
+            ema_slow = pd.Series(c_close).ewm(span=21, adjust=False).mean().iloc[-1]
+            if ema_fast < ema_slow: return None # Быстрый фильтр: ищем только лонги
+                
             ob = await fetch_orderbook(session, c["symbol"])
-            ofi = calc_ofi(ob)
-            if not ofi or ofi["spread_pct"] > SPREAD_MAX_PCT: return None
+            if not ob or not ob.get("bids") or not ob.get("asks"): return None
+            bids = sum(float(p) * float(q) for p, q in ob["bids"])
+            asks = sum(float(p) * float(q) for p, q in ob["asks"])
+            if bids / (bids + asks) < 0.5: return None
+            if (float(ob["asks"][0][0]) - float(ob["bids"][0][0])) / float(ob["bids"][0][0]) * 100 > SPREAD_MAX_PCT: return None
             
-            return {"symbol": c["symbol"], "signal": sig, "net": net_pct(sig), "tf": tf}
+            f = Friday(symbol=c["symbol"], exchange_name="binance")
+            df = await loop.run_in_executor(None, lambda: f.enrich(df, "5m").dropna())
+            if len(df) < 20: return None
+            sig = await loop.run_in_executor(None, lambda: f.analyze_filtered("5m", tp_mult=3.0))
+            if sig.confidence < CONF_FLOOR or net_pct(sig) < MIN_NET_PCT: return None
+            
+            return {"symbol": c["symbol"], "signal": sig, "net": net_pct(sig)}
         except Exception: return None
-    tasks = [check_one(c) for c in candidates[:BATCH_SIZE]]
+        
+    tasks = [check_one(c) for c in candidates]
     res = await asyncio.gather(*tasks)
     valid = [r for r in res if r]
-    valid.sort(key=lambda x: x["signal"].confidence * (1 + x["net"]/100), reverse=True)
+    valid.sort(key=lambda x: x["signal"].confidence, reverse=True)
     return valid
 
 async def _first_scan_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
     while STATE["auto"]["active"]:
         try:
-            if STATE["day_halt"] or is_sleeping():
-                await asyncio.sleep(5); continue
+            if STATE["day_halt"] or is_sleeping(): await asyncio.sleep(3); continue
             async with aiohttp.ClientSession() as session:
                 candidates = await bg_scan_market()
-                if not candidates: await asyncio.sleep(3); continue
-                
-                results = await process_batch(session, candidates, "15m")
-                found = None
-                for r in results:
-                    if r["signal"].confidence >= CONF_FLOOR:
-                        found = r
-                        break
+                if not candidates: await asyncio.sleep(1); continue
+                results = await process_batch(session, candidates)
+                found = results[0] if results else None
                 
                 if found:
                     STATE["auto"]["last_found"] = found
                     sym_data = found["symbol"].replace("/", "_")
-                    text = (f"📊 <b>Пружина сжата</b>\n\n🪙 <b>{found['symbol']}</b>\n"
-                            f"⏱ ТФ: <b>{tf_label(found['tf'])}</b>\n"
-                            f"🎯 Уверенность: <b>{int(found['signal'].confidence * 100)}%</b>\n"
+                    text = (f"📊 <b>Монета найдена</b>\n\n🪙 <b>{found['symbol']}</b>\n"
+                            f"⏱ ТФ: <b>5м</b>\n🎯 Уверенность: <b>{int(found['signal'].confidence * 100)}%</b>\n"
                             f"💰 Чистая: <b>+{round(found['net'], 2)}%</b>")
                     rows = [[btn("✅ Берём", "forecast_go_" + sym_data)], [btn("🔄 Ещё скан", "forecast_rescan")], [btn("🛑 СТОП", "auto_stop_signals")]]
                     if chat_id: await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
                     return
-                await asyncio.sleep(3)
-        except Exception: await asyncio.sleep(5)
+                await asyncio.sleep(1)
+        except Exception: await asyncio.sleep(3)
 
 async def scan_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
+    loop = asyncio.get_event_loop()
     while STATE["auto"]["active"]:
         try:
-            day_rollover()
             if STATE["day_halt"] or is_sleeping() or "signal" in STATE["pending"]: await asyncio.sleep(SCAN_INTERVAL); continue
             symbol = STATE["auto"]["symbol"]
             if not symbol: await asyncio.sleep(SCAN_INTERVAL); continue
 
             async with aiohttp.ClientSession() as session:
-                df = await fetch_candles(session, symbol, "5m", 100) # Триггер на 5m
+                df = await fetch_candles(session, symbol, "5m", 100)
                 if df is None: await asyncio.sleep(SCAN_INTERVAL); continue
                 f = Friday(symbol=symbol, exchange_name="binance")
-                df = f.enrich(df, "5m").dropna()
-                sig = f.analyze_filtered("5m", tp_mult=3.0)
                 
-                floor = CONF_FLOOR + (0.05 if STATE["metrics"]["consecutive_losses"] >= 2 else 0)
-                if sig.confidence < floor or net_pct(sig) < MIN_NET_PCT: await asyncio.sleep(SCAN_INTERVAL); continue
+                df = await loop.run_in_executor(None, lambda: f.enrich(df, "5m").dropna())
+                sig = await loop.run_in_executor(None, lambda: f.analyze_filtered("5m", tp_mult=3.0))
                 
-                ob = await fetch_orderbook(session, symbol)
-                ofi = calc_ofi(ob)
-                cvd = calc_cvd(df, 5)
+                if sig.confidence < CONF_FLOOR or net_pct(sig) < MIN_NET_PCT: await asyncio.sleep(SCAN_INTERVAL); continue
                 
-                if sig.action == "BUY" and (cvd <= 0 or (ofi and ofi["imbalance"] < 0.45)): await asyncio.sleep(SCAN_INTERVAL); continue
-                if sig.action == "SELL" and (cvd >= 0 or (ofi and ofi["imbalance"] > 0.55)): await asyncio.sleep(SCAN_INTERVAL); continue
-
                 budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
-                qty, lot, f_pct, _ = kelly_size(budget, sig.price, sig.stop_loss, sig.confidence)
+                qty, risk_usdt, f_pct = kelly_size(budget, sig.price, sig.stop_loss, sig.confidence)
                 if qty <= 0: await asyncio.sleep(SCAN_INTERVAL); continue
 
                 limit_price = sig.price * (1 - LIMIT_OFFSET) if sig.action == "BUY" else sig.price * (1 + LIMIT_OFFSET)
+                STATE["pending"]["signal"] = {"action": sig.action, "symbol": symbol, "price": sig.price, "lot": qty*sig.price, "qty": qty, "sl": sig.stop_loss, "tp": sig.take_profit}
                 
-                STATE["pending"]["signal"] = {
-                    "action": sig.action, "symbol": symbol, "price": sig.price,
-                    "lot": lot, "qty": qty, "sl": sig.stop_loss, "tp": sig.take_profit,
-                    "limit": limit_price, "expires": time.time() + LIMIT_TIMEOUT
-                }
-                
-                text = (f"🎯 {symbol} · 5м\n{sig.action} @ {fmt_price(sig.price)}\n"
-                        f"🎯 Уверенность: {int(sig.confidence * 100)}%\n"
-                        f"💵 Лот: {round(lot, 2)} USDT\n"
-                        f"🛡 Риск: {round(budget * f_pct, 2)} USDT ({round(f_pct * 100, 1)}%)\n"
+                text = (f"🎯 {symbol} · 5м\n{sig.action} @ {fmt_price(sig.price)}\n🎯 Уверенность: {int(sig.confidence * 100)}%\n"
+                        f"💵 Лот: {round(qty*sig.price, 2)} USDT\n🛡 Риск: {round(risk_usdt, 2)} USDT\n"
                         f"Стоп {fmt_price(sig.stop_loss)} / Тейк {fmt_price(sig.take_profit)}\n"
-                        f"💰 Чистая ~{round(net_pct(sig), 2)}% (~${round(lot * (net_pct(sig) / 100.0), 2)})\n"
-                        f"🔖 Лимит: {fmt_price(limit_price)}\n"
-                        f"📊 OFI: {round(ofi['imbalance'], 3) if ofi else '?'} · CVD ${int(cvd)}\n\n"
-                        f"ℹ️ Сигнал сгорит через 2 мин.")
+                        f"🔖 Лимит: {fmt_price(limit_price)}\n\nℹ️ Ордера ставишь сам. Сигнал сгорит через 2 мин.")
                 
-                rows = [
-                    [btn("✅ Исполнил", "sig_buy_signal" if sig.action == "BUY" else "sig_sell_signal")],
-                    [btn("✏️ Своя сумма", "sig_buy_custom" if sig.action == "BUY" else "sig_sell_custom")],
-                    [btn("❌ Пропустил", "sig_skipped")],
-                ]
+                rows = [[btn("✅ Исполнил", "sig_buy_signal" if sig.action == "BUY" else "sig_sell_signal")], [btn("❌ Пропустил", "sig_skipped")]]
                 if chat_id: await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows))
                 await asyncio.sleep(SCAN_INTERVAL)
-        except Exception as e:
-            print("scan err:", e)
-            await asyncio.sleep(SCAN_INTERVAL)
+        except Exception: await asyncio.sleep(SCAN_INTERVAL)
 
 async def _trailing_loop(app, symbol):
     chat_id = app.bot_data.get("chat_id", 0)
@@ -404,7 +319,8 @@ async def _panic_loop(app, symbol):
             pnl = portfolio.current_pnl(price, symbol)
             
             if pnl and pnl["side"] == "BUY":
-                drop = (float(pnl.get("peak", pnl["entry"])) - price) / float(pnl.get("peak", pnl["entry"]))
+                peak = float(pnl.get("peak", pnl["entry"]))
+                drop = (peak - price) / peak if peak else 0
                 if drop >= PANIC_DROP and cvd < 0 and cvd < calc_cvd(df.iloc[:-5], 5) * 0.5:
                     if chat_id:
                         await app.bot.send_message(chat_id=chat_id, text=f"🔴 ЗАКРЫВАЙ {symbol}! (CVD)\nОткат: -{round(drop*100, 2)}%",
@@ -481,7 +397,6 @@ async def panic_sold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("Закрыто " + sym + ".", reply_markup=kb(nav_btns("start")))
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    day_rollover()
     opens = portfolio.load().get("opens", [])
     pos_txt = ("\n📌 Позиции: " + str(len(opens)) + "/" + str(MAX_POSITIONS)) if opens else ""
     auto_txt = "\n🤖 Авто: " + str(STATE["auto"]["symbol"] or "—") if STATE["auto"]["active"] else ""
@@ -509,8 +424,8 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🛑 Остановлено.", reply_markup=kb([[btn("🏠 В меню", "start")]]))
 
 async def auto_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    clear_pending()
-    STATE["auto"].update({"symbol": None, "have_coin": None, "coin_qty": 0.0, "last_signal_key": None, "last_signal_ts": 0})
+    STATE["pending"] = {}
+    STATE["auto"].update({"symbol": None, "have_coin": None, "coin_qty": 0.0})
     STATE["pending"]["auto"] = "balance"
     msg = "Баланс (USDT)?"
     if update.callback_query: await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("start")))
@@ -540,8 +455,8 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["exchange"] = key
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
     STATE["auto"]["active"] = True
-    clear_pending()
-    await update.callback_query.edit_message_text(f"Биржа: {exchanges.EXCHANGES.get(key, key)}\n⏳ Ищу сжатие пружины...", reply_markup=kb([]))
+    STATE["pending"] = {}
+    await update.callback_query.edit_message_text(f"Биржа: {exchanges.EXCHANGES.get(key, key)}\n⏳ Ищу монеты...", reply_markup=kb([]))
     if STATE["auto"]["task"] is None or STATE["auto"]["task"].done():
         STATE["auto"]["task"] = asyncio.create_task(_first_scan_loop(ctx.application))
 
@@ -552,15 +467,11 @@ async def forecast_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.edit_message_text("Данные устарели. 'Ещё скан'.", reply_markup=kb(nav_btns("start"))); return
     
     STATE["auto"]["symbol"] = sym
-    STATE["auto"]["tf"] = "5m" # Триггер на 5m
-    
     rows = [
         [btn("Нет", "hascoins_no"), btn("Да", "hascoins_yes")],
         nav_btns("start")[0]
     ]
-    await update.callback_query.edit_message_text(
-        f"Монета: <b>{sym}</b>\nТФ: <b>5 минут</b>\n\nЕсть у тебя {sym}?", 
-        reply_markup=kb(rows), parse_mode="HTML")
+    await update.callback_query.edit_message_text(f"Монета: <b>{sym}</b>\n\nЕсть у тебя {sym}?", reply_markup=kb(rows), parse_mode="HTML")
 
 async def forecast_rescan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("🔄 Пересканирую...", reply_markup=kb(nav_btns("start")))
@@ -584,10 +495,10 @@ async def demo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def demo_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("🔍 Сканирую...")
-    candidates = await bg_scan_market()
-    if not candidates: await update.callback_query.edit_message_text("Не нашёл.", reply_markup=kb(nav_btns("demo"))); return
     async with aiohttp.ClientSession() as session:
-        res = await process_batch(session, candidates[:5], "5m")
+        candidates = await bg_scan_market()
+        if not candidates: await update.callback_query.edit_message_text("Не нашёл.", reply_markup=kb(nav_btns("demo"))); return
+        res = await process_batch(session, candidates[:5])
     if not res: await update.callback_query.edit_message_text("Не нашёл.", reply_markup=kb(nav_btns("demo"))); return
     best = res[0]
     STATE["demo"]["symbol"] = best["symbol"]; STATE["demo"]["buy_price"] = best["signal"].price
@@ -688,11 +599,11 @@ async def man_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
         sig = f.analyze_filtered("15m", tp_mult=3.0)
         budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
-        qty, lot, _, _ = kelly_size(budget, sig.price, sig.stop_loss, sig.confidence)
+        qty, lot, f_pct = kelly_size(budget, sig.price, sig.stop_loss, sig.confidence)
         if qty <= 0: await update.callback_query.edit_message_text("Лот 0 (бюджет/риск).", reply_markup=kb(nav_btns("start"))); return
         res = await _open_and_watch(ctx, symbol, "BUY", sig.price, qty, sig.stop_loss, sig.take_profit)
         if "error" in res: await update.callback_query.edit_message_text("Ошибка: " + res["error"], reply_markup=kb(nav_btns("start"))); return
-        await update.callback_query.edit_message_text(f"BUY {symbol} {round(lot, 2)} USDT", reply_markup=kb(nav_btns("start")))
+        await update.callback_query.edit_message_text(f"BUY {symbol} {round(qty*sig.price, 2)} USDT", reply_markup=kb(nav_btns("start")))
     except Exception as e: await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("start")))
 
 async def man_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
