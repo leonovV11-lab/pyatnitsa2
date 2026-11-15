@@ -24,9 +24,9 @@ from geopy.geocoders import Nominatim
 from timezonefinder import TimezoneFinder
 
 CONF_SIGNAL = 0.85
-CONF_MIN_RELAXED = 0.65
-FEE_MIN_TP = 0.006
-MIN_NET_PCT = 0.2
+CONF_MIN_RELAXED = 0.55
+FEE_MIN_TP = 0.005
+MIN_NET_PCT = 0.12
 VOL_MIN_24H = 1000000.0
 VOL_MIN_SIGNAL = 100000.0
 PANIC_DROP = 0.02
@@ -34,12 +34,14 @@ PANIC_INTERVAL = 5
 LOSS_LIMIT = 3
 SLEEP_MIN = 30
 MAX_POSITIONS = 2
-SCAN_INTERVAL = 30
+SCAN_INTERVAL = 20
 DAILY_DD_LIMIT = 0.05
 BATCH_SIZE = 40
 FEE_ROUND_PCT = 0.1
 SLIP_PCT = 0.15
 TFS_ALL = ["1m", "5m", "15m", "1h"]
+ALT_WAIT_SEC = 300
+CONF_FLOOR = 0.55
 
 _EX_CACHE = {}
 _OKX_MARKETS = {"ts": 0, "symbols": set()}
@@ -57,6 +59,7 @@ STATE = {
         "bg_scan_done": False, "bg_candidates": [],
         "have_coin": None, "coin_qty": 0.0,
         "last_found": None, "tf_choices": {},
+        "last_signal_ts": 0,
     },
     "manual": {"exchange": config.EXCHANGE, "pairs": [], "page": 0, "symbol": None},
     "pending": {},
@@ -118,17 +121,18 @@ def tf_label(tf):
 
 def conf_threshold(hours):
     h = int(hours) if hours else 24
-    if h <= 2: return 0.55
-    if h <= 6: return 0.60
-    if h <= 12: return 0.65
-    return 0.70
+    if h <= 2: base = 0.55
+    elif h <= 6: base = 0.60
+    elif h <= 12: base = 0.65
+    else: base = 0.70
+    return max(base, CONF_FLOOR)
 
 def net_threshold(hours):
     h = int(hours) if hours else 24
-    if h <= 2: return 0.15
-    if h <= 6: return 0.25
-    if h <= 12: return 0.30
-    return 0.40
+    if h <= 2: return 0.12
+    if h <= 6: return 0.20
+    if h <= 12: return 0.25
+    return 0.30
 
 def net_pct_calc(price, tp, fee_round=FEE_ROUND_PCT, slip=SLIP_PCT):
     if price <= 0: return 0.0
@@ -229,7 +233,7 @@ async def bg_scan_market():
                 qv = float(t.get("quoteVolume") or 0)
                 if qv < VOL_MIN_24H or price <= 0: continue
                 change = abs(float(t.get("priceChangePercent") or 0))
-                if change < 1.5: continue
+                if change < 1.0: continue
                 pre_candidates.append({"symbol": sym_fmt, "vol24": qv, "price": price, "potential": change, "vol_factor": min(qv / 5000000.0, 10.0)})
             pre_candidates.sort(key=lambda x: x["potential"] * (1.0 + x["vol_factor"] * 0.1), reverse=True)
             return pre_candidates
@@ -258,32 +262,8 @@ async def process_batch(session, candidates, tf):
     tasks = [strict_check(c) for c in candidates]
     results = await asyncio.gather(*tasks)
     valid = [r for r in results if r is not None]
-    valid.sort(key=lambda x: x["confidence"] * (1.0 + x.get("net_pct", 0) / 100.0), reverse=True)
+    valid.sort(key=lambda x: x.get("net_pct", 0), reverse=True)
     return valid
-
-async def pick_best_tf(symbol, hours):
-    async with aiohttp.ClientSession() as session:
-        tasks = []
-        for tf in TFS_ALL:
-            tasks.append(fetch_candles(session, symbol, tf, 60))
-        dfs = await asyncio.gather(*tasks)
-    results = []
-    for tf, df in zip(TFS_ALL, dfs):
-        if df is None or len(df) < 20: continue
-        try:
-            f = Friday(symbol=symbol, exchange_name="binance")
-            df2 = f.enrich(df.copy(), tf).dropna()
-            if len(df2) < 20: continue
-            sig = f.analyze_filtered(tf, tp_mult=3.0)
-            net = net_pct_calc(sig.price, sig.take_profit)
-            conf_pct = sig.confidence * 100
-            exp_trades = max(1.0, hours * 60.0 / {"1m": 1, "5m": 5, "15m": 15, "1h": 60}[tf])
-            expected = net * conf_pct / 100.0 * min(exp_trades, 30.0)
-            results.append({"tf": tf, "signal": sig, "net": net, "conf": conf_pct, "expected": expected})
-        except Exception: continue
-    if not results: return None
-    results.sort(key=lambda x: x["expected"], reverse=True)
-    return results[0], results
 
 async def send_signal(app, r, reason=""):
     sig = r["signal"]
@@ -303,6 +283,7 @@ async def send_signal(app, r, reason=""):
     net = net_pct_calc(sig.price, sig.take_profit)
     net_usdt = lot * (net / 100.0)
     STATE["pending"]["signal"] = {"action": sig.action, "symbol": r["symbol"], "price": sig.price, "lot": lot, "qty": qty, "sl": sig.stop_loss, "tp": sig.take_profit}
+    STATE["auto"]["last_signal_ts"] = time.time()
     text = ("🎯 " + r["symbol"] + " · " + tf_label(r["tf"]) + ("\n" + reason if reason else "") +
             "\n" + sig.action + " @ " + fmt_price(sig.price) +
             "\n🎯 Уверенность: " + str(int(r["confidence"])) + "%" +
@@ -326,9 +307,11 @@ async def _first_scan_then_loop(app):
         async with aiohttp.ClientSession() as session:
             all_candidates = await bg_scan_market()
             if not all_candidates:
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
                 continue
             tf = STATE["auto"]["tf"]
+            conf_min = conf_threshold(STATE["auto"]["work_hours"]) * 100
+            net_min = net_threshold(STATE["auto"]["work_hours"])
             found = None
             collected = []
             for i in range(0, len(all_candidates), BATCH_SIZE):
@@ -336,23 +319,19 @@ async def _first_scan_then_loop(app):
                 batch = all_candidates[i:i+BATCH_SIZE]
                 results = await process_batch(session, batch, tf)
                 collected.extend(results)
-                best = None
                 for r in results:
-                    if r["confidence"] >= conf_threshold(STATE["auto"]["work_hours"]) * 100 and r["net_pct"] >= net_threshold(STATE["auto"]["work_hours"]):
-                        if best is None or r["confidence"] > best["confidence"]:
-                            best = r
-                if best:
-                    found = best
-                    break
+                    if r["confidence"] >= conf_min and r["net_pct"] >= net_min:
+                        found = r
+                        break
+                if found: break
             STATE["auto"]["bg_candidates"] = collected
             if found:
                 STATE["auto"]["current_offer"] = found["symbol"]
                 STATE["auto"]["current_chance"] = found["confidence"]
                 STATE["auto"]["last_found"] = found
-                hours = STATE["auto"].get("work_hours", 24)
                 est_pct = found["net_pct"]
                 est_usdt = STATE["daily_budget"] * (est_pct / 100.0)
-                text = ("📊 <b>Лучшая монета</b>\n\n"
+                text = ("📊 <b>Хорошая монета</b>\n\n"
                         "🪙 <b>" + found["symbol"] + "</b>\n"
                         "⏱ ТФ: <b>" + tf_label(found["tf"]) + "</b>\n"
                         "🎯 Уверенность: <b>" + str(int(found["confidence"])) + "%</b>\n"
@@ -362,7 +341,7 @@ async def _first_scan_then_loop(app):
                 if chat_id:
                     await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
                 return
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
 
 async def scan_loop(app):
     chat_id = app.bot_data.get("chat_id", 0)
@@ -386,17 +365,23 @@ async def scan_loop(app):
                             await send_signal(app, current_data, "по текущей")
                             await asyncio.sleep(SCAN_INTERVAL)
                             continue
+                elapsed = time.time() - STATE["auto"].get("last_signal_ts", 0)
+                if elapsed < ALT_WAIT_SEC:
+                    await asyncio.sleep(SCAN_INTERVAL)
+                    continue
                 all_candidates = await bg_scan_market()
                 top_batch = all_candidates[:BATCH_SIZE]
                 res = await process_batch(session, top_batch, tf)
                 STATE["auto"]["bg_candidates"] = res
+                conf_min = conf_threshold(STATE["auto"]["work_hours"]) * 100
+                net_min = net_threshold(STATE["auto"]["work_hours"])
                 best_alt = None
                 for c in res:
-                    if c["symbol"] != current_sym and c["confidence"] >= conf_threshold(STATE["auto"]["work_hours"]) * 100 and c["net_pct"] >= net_threshold(STATE["auto"]["work_hours"]):
-                        if best_alt is None or c["confidence"] > best_alt["confidence"]:
-                            best_alt = c
+                    if c["symbol"] != current_sym and c["confidence"] >= conf_min and c["net_pct"] >= net_min:
+                        best_alt = c
+                        break
                 if best_alt:
-                    text = ("🔥 <b>Есть лучше!</b>\n\n"
+                    text = ("🔥 <b>Есть замена</b>\n\n"
                             "Сейчас: " + str(current_sym) + " (" + str(int(STATE["auto"]["current_chance"])) + "%)\n"
                             "Новая: <b>" + best_alt["symbol"] + "</b> (" + str(int(best_alt["confidence"])) + "%, чистая +" + str(round(best_alt["net_pct"], 2)) + "%)")
                     rows = [[btn("✅ Поменять", "switch_yes")], [btn("❌ Оставить", "switch_no")]]
@@ -448,11 +433,12 @@ async def hascoins_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     candidates = STATE["auto"].get("bg_candidates", [])
     current_sym = STATE["auto"]["current_offer"]
+    conf_min = conf_threshold(STATE["auto"]["work_hours"]) * 100
     better = None
     for c in candidates:
-        if c["symbol"] != current_sym and c["confidence"] >= conf_threshold(STATE["auto"]["work_hours"]) * 100:
-            if better is None or c["confidence"] > better["confidence"]:
-                better = c
+        if c["symbol"] != current_sym and c["confidence"] >= conf_min:
+            better = c
+            break
     if better:
         STATE["auto"]["symbols"] = [better["symbol"]]
         STATE["auto"]["current_offer"] = better["symbol"]
@@ -461,7 +447,7 @@ async def switch_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.edit_message_text("✅ Поменял на " + better["symbol"], reply_markup=kb(nav_btns("start")))
         key = better["symbol"] + ":" + better["signal"].action
         STATE["auto"]["seen_signals"].add(key)
-        await send_signal(ctx.application, better, "новая лучшая")
+        await send_signal(ctx.application, better, "замена")
     else:
         await update.callback_query.edit_message_text("Оставил текущую.", reply_markup=kb(nav_btns("start")))
 
@@ -491,6 +477,7 @@ async def auto_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["have_coin"] = None
     STATE["auto"]["coin_qty"] = 0.0
     STATE["auto"]["seen_signals"] = set()
+    STATE["auto"]["last_signal_ts"] = 0
     STATE["pending"]["auto"] = "balance"
     msg = "Баланс (USDT)?"
     if update.callback_query: await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("start")))
@@ -547,38 +534,29 @@ async def tf_bad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.callback_query: await update.callback_query.edit_message_text("ТФ:", reply_markup=kb(rows))
     else: await update.message.reply_text("ТФ:", reply_markup=kb(rows))
 
-async def auto_tf_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    tf = update.callback_query.data.replace("auto_tf_", "")
-    if tf == "custom":
-        STATE["pending"]["auto"] = "tf_custom"
-        await update.callback_query.edit_message_text("Впиши ТФ (например 3m, 45m):", reply_markup=kb(nav_btns("tf_bad"))); return
-    STATE["auto"]["tf"] = tf
-    if STATE["auto"]["current_offer"]:
-        best_sym = STATE["auto"]["current_offer"]
-        f = Friday(symbol=best_sym, exchange_name="binance")
-        loop = asyncio.get_event_loop()
+async def pick_best_tf(symbol, hours):
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for tf in TFS_ALL:
+            tasks.append(fetch_candles(session, symbol, tf, 60))
+        dfs = await asyncio.gather(*tasks)
+    results = []
+    for tf, df in zip(TFS_ALL, dfs):
+        if df is None or len(df) < 20: continue
         try:
-            df = await loop.run_in_executor(None, lambda: f.fetch(tf, 60))
-            df = f.enrich(df, tf).dropna()
-        except Exception:
-            df = None
-        if df is not None and len(df) >= 20:
+            f = Friday(symbol=symbol, exchange_name="binance")
+            df2 = f.enrich(df.copy(), tf).dropna()
+            if len(df2) < 20: continue
             sig = f.analyze_filtered(tf, tp_mult=3.0)
             net = net_pct_calc(sig.price, sig.take_profit)
-            r = {"symbol": best_sym, "confidence": sig.confidence * 100, "signal": sig, "tf": tf, "regime": "normal", "atr_pct": 0, "vol24": 0, "price": sig.price, "potential": 0, "net_pct": net}
-            STATE["auto"]["bg_candidates"] = [r] + STATE["auto"]["bg_candidates"]
-            STATE["auto"]["current_chance"] = r["confidence"]
-            STATE["auto"]["last_found"] = r
-            rows = [
-                [btn("Нет", "hascoins_no"), btn("Да", "hascoins_yes")],
-                [btn("⏱ Сменить ТФ (" + tf_label(tf) + ")", "tf_bad")],
-                nav_btns("start")[0]
-            ]
-            await update.callback_query.edit_message_text(
-                "Монета: <b>" + best_sym + "</b>\nТФ: <b>" + tf_label(tf) + "</b>\n💰 Чистая: <b>+" + str(round(net, 2)) + "%</b>\n\nЕсть у тебя " + best_sym + "?",
-                reply_markup=kb(rows), parse_mode="HTML")
-            return
-    await update.callback_query.edit_message_text("Ок, " + tf_label(tf) + ".", reply_markup=kb(nav_btns("start")))
+            conf_pct = sig.confidence * 100
+            exp_trades = max(1.0, hours * 60.0 / {"1m": 1, "5m": 5, "15m": 15, "1h": 60}[tf])
+            expected = net * conf_pct / 100.0 * min(exp_trades, 30.0)
+            results.append({"tf": tf, "signal": sig, "net": net, "conf": conf_pct, "expected": expected})
+        except Exception: continue
+    if not results: return None, []
+    results.sort(key=lambda x: x["expected"], reverse=True)
+    return results[0], results
 
 async def tf_ok_15m(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["tf"] = "15m"
@@ -808,7 +786,6 @@ async def man_signals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
         sig = f.analyze_filtered(STATE["auto"]["tf"], tp_mult=3.0)
     except Exception as e: await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("man_pick_back"))); return
-    if sig.confidence < CONF_SIGNAL: await update.callback_query.edit_message_text("Уверенность " + str(int(sig.confidence * 100)) + "% < " + str(int(CONF_SIGNAL * 100)) + "%", reply_markup=kb(nav_btns("man_pick_back"))); return
     net = net_pct_calc(sig.price, sig.take_profit)
     text = ("📊 " + symbol + " · СИГНАЛ\n" + sig.action + " @ " + fmt_price(sig.price) + "\nУверенность: " + str(int(sig.confidence * 100)) + "%\nЧистая: +" + str(round(net, 2)) + "%\nСтоп " + fmt_price(sig.stop_loss) + "\nТейк " + fmt_price(sig.take_profit))
     try:
