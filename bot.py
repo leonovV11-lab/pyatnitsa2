@@ -25,8 +25,8 @@ from chart import build_chart
 from geopy.geocoders import Nominatim
 from timezonefinder import TimezoneFinder
 
-# --- ИСПРАВЛЕННЫЕ НАСТРОЙКИ ---
-CONF_FLOOR = 0.65  # ЖЕСТКИЙ МИНИМУМ 65%
+# --- НАСТРОЙКИ ---
+CONF_FLOOR = 0.65 
 MIN_ATR_PCT = 0.3
 FEE_RT_PCT = 0.004
 LIMIT_OFFSET = 0.001
@@ -34,13 +34,14 @@ MAX_TRADE_TIME_MIN = 60
 
 PANIC_DROP = 0.015 
 PANIC_INTERVAL = 5
-TRAIL_INTERVAL = 3 
+TRAIL_INTERVAL = 4 
 LOSS_LIMIT = 3
 SLEEP_MIN = 30
-MAX_POSITIONS = 3
+MAX_POSITIONS = 15  # ТЕПЕРЬ ДО 15 ПОЗИЦИЙ
 DAILY_DD_LIMIT = 0.05
-TOP_N_SCAN = 80  # Расширили для поиска качественных сигналов
+TOP_N_SCAN = 80  
 VOL_MIN_24H = 300000.0
+CHUNK_SIZE = 20 # Размер пачки для запросов (чтобы не забанило)
 
 STATE = {
     "balance": 0.0, "daily_budget": 0.0, "tz": "UTC",
@@ -63,13 +64,12 @@ def is_sleeping(): return STATE["sleep_until"] and datetime.datetime.utcnow() < 
 def net_pct(sig): return (abs(sig.take_profit - sig.price) / sig.price - FEE_RT_PCT) * 100 if sig.price > 0 else 0.0
 
 def get_trade_params(work_hours):
-    """Адаптация под время, но порог всегда >= 65%"""
-    if work_hours <= 2:
-        return {"tf": "1m", "conf": 0.65, "tp_mult": 2.0, "sl_mult": 1.0, "risk": 0.03} 
-    elif work_hours <= 6:
-        return {"tf": "5m", "conf": 0.65, "tp_mult": 2.5, "sl_mult": 1.2, "risk": 0.02} 
+    if work_hours <= 4:
+        return {"tf": "5m", "conf": 0.65, "tp_mult": 2.0, "sl_mult": 1.0} 
+    elif work_hours <= 12:
+        return {"tf": "15m", "conf": 0.65, "tp_mult": 2.5, "sl_mult": 1.2} 
     else:
-        return {"tf": "15m", "conf": 0.70, "tp_mult": 3.0, "sl_mult": 1.5, "risk": 0.015}
+        return {"tf": "1h", "conf": 0.70, "tp_mult": 3.0, "sl_mult": 1.5}
 
 def register_loss(pnl=0.0, symbol=None):
     STATE["day_pnl_usdt"] += pnl; STATE["loss_streak"] += 1
@@ -87,15 +87,24 @@ def register_win(pnl=0.0, symbol=None):
     if m["current_pnl"] > m["peak_pnl"]: m["peak_pnl"] = m["current_pnl"]
     m["consecutive_wins"] += 1; m["consecutive_losses"] = 0
 
-def calc_lot(budget, price, sl, params):
+def calc_lot(budget, price, sl, params, open_count):
     if budget <= 0 or price <= 0: return 0.0, 0.0
     diff = abs(price - sl)
     if diff <= 0: return 0.0, 0.0
-    f = params.get("risk", 0.015)
+    
+    # Ступенчатый риск (чем больше позиций, тем меньше риск на каждую)
+    if open_count >= 10:
+        base_risk = 0.005 # 0.5% при 10+ сделках
+    elif open_count >= 4:
+        base_risk = 0.01  # 1.0% при 4-9 сделках
+    else:
+        base_risk = 0.02  # 2.0% при 1-3 сделках
+        
     cl = STATE["metrics"]["consecutive_losses"]
-    f *= (1.0 if cl <= 0 else (0.75 if cl == 1 else (0.5 if cl == 2 else 0.0)))
-    if f <= 0: return 0.0, 0.0
-    qty = min((budget * f) / diff, (budget * 0.30) / price)
+    base_risk *= (1.0 if cl <= 0 else (0.75 if cl == 1 else (0.5 if cl == 2 else 0.0)))
+    if base_risk <= 0: return 0.0, 0.0
+    
+    qty = min((budget * base_risk) / diff, (budget * 0.15) / price) 
     return qty, qty * price
 
 async def fetch_candles(session, symbol, tf, limit=100):
@@ -126,9 +135,17 @@ async def check_setup(session, symbol, params):
         
         sig = await loop.run_in_executor(None, lambda: f.analyze_filtered(tf, tp_mult=params["tp_mult"]))
         
-        # ЖЕСТКИЙ ФИЛЬТР 65%
         if sig.confidence < CONF_FLOOR: return None
-        if net_pct(sig) < 0.15: return None
+        if net_pct(sig) < 0.8: return None 
+        
+        # УЛУЧШЕННЫЙ ПРОСЧЕТ: Проверка старшего тренда (15m / 1h)
+        senior_tf = "15m" if tf in ["1m", "5m"] else "1h"
+        df_sr = await fetch_candles(session, symbol, senior_tf, 50)
+        if df_sr is not None and len(df_sr) >= 50:
+            ema50 = df_sr["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+            close_sr = df_sr["close"].iloc[-1]
+            if sig.action == "BUY" and close_sr < ema50: return None # Не покупаем, если старший тренд вниз
+            if sig.action == "SELL" and close_sr > ema50: return None # Не шортим, если старший тренд вверх
             
         return {"symbol": symbol, "signal": sig, "net": net_pct(sig), "tf": tf}
     except Exception: return None
@@ -162,7 +179,11 @@ async def _first_scan_loop(app):
             if "signal" in STATE["pending"]: await asyncio.sleep(5); continue
 
             open_positions = portfolio.load().get("opens", [])
-            if len(open_positions) >= MAX_POSITIONS: await asyncio.sleep(5); continue
+            if len(open_positions) >= MAX_POSITIONS: 
+                if chat_id:
+                    try: await app.bot.edit_message_text(chat_id=chat_id, message_id=STATE["auto"]["scan_msg_id"], text=f"✋ Лимит {MAX_POSITIONS} сделок. Жду закрытия.")
+                    except: pass
+                await asyncio.sleep(10); continue
             
             my_coins = STATE["auto"].get("my_coins", [])
             params = STATE["auto"]["params"]
@@ -178,15 +199,19 @@ async def _first_scan_loop(app):
                             found = res
                             break
                 
-                # 2. Ищем на рынке (BUY)
+                # 2. Ищем на рынке (BUY) ЧАНКАМИ (чтобы не забанило)
                 if not found:
                     candidates = await bg_scan_market(session, open_symbols=[p["symbol"] for p in open_positions])
-                    tasks = [check_setup(session, c["symbol"], params) for c in candidates]
-                    results = await asyncio.gather(*tasks)
-                    valid = [r for r in results if r and r["signal"].action == "BUY"]
-                    if valid:
-                        valid.sort(key=lambda x: x["signal"].confidence, reverse=True)
-                        found = valid[0]
+                    for i in range(0, len(candidates), CHUNK_SIZE):
+                        chunk = candidates[i:i+CHUNK_SIZE]
+                        tasks = [check_setup(session, c["symbol"], params) for c in chunk]
+                        results = await asyncio.gather(*tasks)
+                        valid = [r for r in results if r and r["signal"].action == "BUY"]
+                        if valid:
+                            valid.sort(key=lambda x: x["signal"].confidence, reverse=True)
+                            found = valid[0]
+                            break
+                        await asyncio.sleep(0.5) # Пауза между пачками
 
                 if found:
                     STATE["auto"]["last_found"] = found
@@ -194,6 +219,7 @@ async def _first_scan_loop(app):
                     action_text = "Купить" if found["signal"].action == "BUY" else "Продать"
                     
                     text = (f"🎯 <b>Точка входа найдена</b>\n\n🪙 <b>{found['symbol']}</b>\n"
+                            f"⏱ ТФ: <b>{found['tf']}</b>\n"
                             f"📊 Направление: <b>{found['signal'].action}</b>\n"
                             f"🎯 Уверенность: <b>{int(found['signal'].confidence * 100)}%</b>\n"
                             f"💰 Чистая: <b>+{round(found['net'], 2)}%</b>")
@@ -202,19 +228,19 @@ async def _first_scan_loop(app):
                     if chat_id: await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
                     
                     budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
-                    qty, lot = calc_lot(budget, found["signal"].price, found["signal"].stop_loss, params)
+                    qty, lot = calc_lot(budget, found["signal"].price, found["signal"].stop_loss, params, len(open_positions))
                     
                     STATE["pending"]["signal"] = {"action": found["signal"].action, "symbol": found["symbol"], "price": found["signal"].price, "lot": lot, "qty": qty, "sl": found["signal"].stop_loss, "tp": found["signal"].take_profit}
                     
-                    for _ in range(60):
+                    for _ in range(30): # Ждем ответа 60 сек
                         if "signal" not in STATE["pending"]: break
                         await asyncio.sleep(2)
                     continue
                 
                 scan_count += 1
-                if scan_count % 3 == 0 and chat_id:
+                if scan_count % 4 == 0 and chat_id:
                     try:
-                        msg_text = f"⏳ Сканирую Топ-{TOP_N_SCAN} монет...\nПопытка {scan_count}. Ищу уверенность >{int(CONF_FLOOR*100)}%."
+                        msg_text = f"⏳ Сканирую Топ-{TOP_N_SCAN} на {params['tf']}...\nПопытка {scan_count}. Ищу качественный вход."
                         if not STATE["auto"]["scan_msg_id"]:
                             msg = await app.bot.send_message(chat_id=chat_id, text=msg_text)
                             STATE["auto"]["scan_msg_id"] = msg.message_id
@@ -223,12 +249,12 @@ async def _first_scan_loop(app):
                     except Exception:
                         STATE["auto"]["scan_msg_id"] = None
                         
-                await asyncio.sleep(2)
+                await asyncio.sleep(4) 
         except Exception as e:
             print("scan err:", e)
             await asyncio.sleep(3)
 
-# --- ТРЕЙЛИНГ И ПАНИКА ---
+# --- УМНЫЙ ТРЕЙЛИНГ ---
 async def _trailing_loop(app, symbol):
     chat_id = app.bot_data.get("chat_id", 0)
     STATE["trailing"]["active"][symbol] = True
@@ -331,7 +357,7 @@ async def _panic_loop(app, symbol):
     STATE["panic"]["active"][symbol] = False
 
 async def _open_and_watch(ctx, symbol, side, price, qty, sl, tp):
-    if portfolio.count_open() >= MAX_POSITIONS: return {"error": "максимум позиций"}
+    if portfolio.count_open() >= MAX_POSITIONS: return {"error": f"максимум {MAX_POSITIONS} позиций"}
     res = portfolio.open_position(symbol, side, price, qty, source="signal", sl=sl, tp=tp)
     if "error" in res: return res
     STATE["trailing"]["current_sl"][symbol] = sl
@@ -436,7 +462,7 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["params"] = params
     
     STATE["pending"]["auto"] = "my_coins"
-    msg = f"Биржа выбрана. ТФ {params['tf']} (Порог 65%).\n\n<b>Какие монеты у тебя есть сейчас?</b>\nВпиши через запятую (например: BTC, ETH, ZRO). Если нет — напиши 'нет'."
+    msg = f"Биржа выбрана. Стратегия: ТФ {params['tf']} (Порог 65%, лимит 15 сделок).\n\n<b>Какие монеты у тебя есть сейчас?</b>\nВпиши через запятую (например: BTC, ETH, ZRO). Если нет — напиши 'нет'."
     await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("start")), parse_mode="HTML")
 
 async def auto_ex_start_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -464,7 +490,7 @@ async def demo_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not valid: await update.callback_query.edit_message_text("Не нашёл.", reply_markup=kb(nav_btns("demo"))); return
     best = valid[0]
     STATE["demo"]["symbol"] = best["symbol"]; STATE["demo"]["buy_price"] = best["signal"].price
-    text = f"🎮 ДЕМО\n{best['symbol']}\n{best['signal'].action}\nУверенность: {int(best['signal'].confidence * 100)}%\nЧистая: +{round(best['net'], 2)}%"
+    text = f"🎮 ДЕМО\n{best['symbol']}\nТФ: {best['tf']}\n{best['signal'].action}\nУверенность: {int(best['signal'].confidence * 100)}%\nЧистая: +{round(best['net'], 2)}%"
     rows = [[btn("✅ Купил", "demo_buy")], [btn("❌ Пропустил", "demo_skip")], nav_btns("demo")[0]]
     await update.callback_query.edit_message_text(text, reply_markup=kb(rows))
 
@@ -534,7 +560,7 @@ async def man_signals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
         sig = f.analyze_filtered("15m", tp_mult=3.0)
     except Exception as e: await update.callback_query.edit_message_text("Ошибка: " + str(e), reply_markup=kb(nav_btns("man_pick_back"))); return
-    text = f"📊 {symbol} · СИГНАЛ\n{sig.action} @ {fmt_price(sig.price)}\nУверенность: {int(sig.confidence * 100)}%\nЧистая: +{round(net_pct(sig), 2)}%\nСтоп {fmt_price(sig.stop_loss)}\nТейк {fmt_price(sig.take_profit)}"
+    text = f"📊 {symbol} · СИГНАЛ\nТФ: 15m\n{sig.action} @ {fmt_price(sig.price)}\nУверенность: {int(sig.confidence * 100)}%\nЧистая: +{round(net_pct(sig), 2)}%\nСтоп {fmt_price(sig.stop_loss)}\nТейк {fmt_price(sig.take_profit)}"
     try:
         path = build_chart(symbol, "15m", sig)
         with open(path, "rb") as photo: await ctx.bot.send_photo(chat_id=update.callback_query.message.chat_id, photo=photo, caption=text, reply_markup=kb(nav_btns("man_pick_back")))
@@ -560,9 +586,8 @@ async def man_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         f = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
         sig = f.analyze_filtered("15m", tp_mult=3.0)
-        params = get_trade_params(24)
         budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
-        qty, lot = calc_lot(budget, sig.price, sig.stop_loss, params)
+        qty, lot = calc_lot(budget, sig.price, sig.stop_loss, get_trade_params(24), portfolio.count_open())
         if qty <= 0: await update.callback_query.edit_message_text("Лот 0 (бюджет/риск).", reply_markup=kb(nav_btns("start"))); return
         res = await _open_and_watch(ctx, symbol, "BUY", sig.price, qty, sig.stop_loss, sig.take_profit)
         if "error" in res: await update.callback_query.edit_message_text("Ошибка: " + res["error"], reply_markup=kb(nav_btns("start"))); return
