@@ -30,18 +30,18 @@ CONF_FLOOR = 0.65
 MIN_ATR_PCT = 0.3
 FEE_RT_PCT = 0.004
 LIMIT_OFFSET = 0.001
-MAX_TRADE_TIME_MIN = 60
+MAX_TRADE_TIME_MIN = 120 # Даем сделке больше времени
 
 PANIC_DROP = 0.015 
 PANIC_INTERVAL = 5
-TRAIL_INTERVAL = 4 
+TRAIL_INTERVAL = 3 
 LOSS_LIMIT = 3
 SLEEP_MIN = 30
-MAX_POSITIONS = 15  # ТЕПЕРЬ ДО 15 ПОЗИЦИЙ
+MAX_POSITIONS = 15 
 DAILY_DD_LIMIT = 0.05
 TOP_N_SCAN = 80  
 VOL_MIN_24H = 300000.0
-CHUNK_SIZE = 20 # Размер пачки для запросов (чтобы не забанило)
+CHUNK_SIZE = 20 
 
 STATE = {
     "balance": 0.0, "daily_budget": 0.0, "tz": "UTC",
@@ -54,7 +54,7 @@ STATE = {
     "pending": {},
     "panic": {"tasks": {}, "active": {}},
     "demo": {"active": False, "symbol": None, "buy_price": 0.0, "amount": 0.0, "action": "BUY"},
-    "trailing": {"tasks": {}, "active": {}, "current_sl": {}},
+    "trailing": {"tasks": {}, "active": {}, "current_sl": {}, "tp1_hit": {}},
 }
 
 def kb(rows): return InlineKeyboardMarkup(rows)
@@ -92,13 +92,9 @@ def calc_lot(budget, price, sl, params, open_count):
     diff = abs(price - sl)
     if diff <= 0: return 0.0, 0.0
     
-    # Ступенчатый риск (чем больше позиций, тем меньше риск на каждую)
-    if open_count >= 10:
-        base_risk = 0.005 # 0.5% при 10+ сделках
-    elif open_count >= 4:
-        base_risk = 0.01  # 1.0% при 4-9 сделках
-    else:
-        base_risk = 0.02  # 2.0% при 1-3 сделках
+    if open_count >= 10: base_risk = 0.005 
+    elif open_count >= 4: base_risk = 0.01  
+    else: base_risk = 0.02  
         
     cl = STATE["metrics"]["consecutive_losses"]
     base_risk *= (1.0 if cl <= 0 else (0.75 if cl == 1 else (0.5 if cl == 2 else 0.0)))
@@ -138,14 +134,13 @@ async def check_setup(session, symbol, params):
         if sig.confidence < CONF_FLOOR: return None
         if net_pct(sig) < 0.8: return None 
         
-        # УЛУЧШЕННЫЙ ПРОСЧЕТ: Проверка старшего тренда (15m / 1h)
         senior_tf = "15m" if tf in ["1m", "5m"] else "1h"
         df_sr = await fetch_candles(session, symbol, senior_tf, 50)
         if df_sr is not None and len(df_sr) >= 50:
             ema50 = df_sr["close"].ewm(span=50, adjust=False).mean().iloc[-1]
             close_sr = df_sr["close"].iloc[-1]
-            if sig.action == "BUY" and close_sr < ema50: return None # Не покупаем, если старший тренд вниз
-            if sig.action == "SELL" and close_sr > ema50: return None # Не шортим, если старший тренд вверх
+            if sig.action == "BUY" and close_sr < ema50: return None 
+            if sig.action == "SELL" and close_sr > ema50: return None 
             
         return {"symbol": symbol, "signal": sig, "net": net_pct(sig), "tf": tf}
     except Exception: return None
@@ -191,7 +186,6 @@ async def _first_scan_loop(app):
             async with aiohttp.ClientSession() as session:
                 found = None
                 
-                # 1. Проверяем монеты пользователя (на продажу)
                 if my_coins:
                     for sym in my_coins:
                         res = await check_setup(session, sym, params)
@@ -199,7 +193,6 @@ async def _first_scan_loop(app):
                             found = res
                             break
                 
-                # 2. Ищем на рынке (BUY) ЧАНКАМИ (чтобы не забанило)
                 if not found:
                     candidates = await bg_scan_market(session, open_symbols=[p["symbol"] for p in open_positions])
                     for i in range(0, len(candidates), CHUNK_SIZE):
@@ -211,7 +204,7 @@ async def _first_scan_loop(app):
                             valid.sort(key=lambda x: x["signal"].confidence, reverse=True)
                             found = valid[0]
                             break
-                        await asyncio.sleep(0.5) # Пауза между пачками
+                        await asyncio.sleep(0.5)
 
                 if found:
                     STATE["auto"]["last_found"] = found
@@ -232,9 +225,11 @@ async def _first_scan_loop(app):
                     
                     STATE["pending"]["signal"] = {"action": found["signal"].action, "symbol": found["symbol"], "price": found["signal"].price, "lot": lot, "qty": qty, "sl": found["signal"].stop_loss, "tp": found["signal"].take_profit}
                     
-                    for _ in range(30): # Ждем ответа 60 сек
+                    # Ждем 30 секунд, если не нажали - идем дальше
+                    for _ in range(15): 
                         if "signal" not in STATE["pending"]: break
                         await asyncio.sleep(2)
+                    if "signal" in STATE["pending"]: del STATE["pending"]["signal"]
                     continue
                 
                 scan_count += 1
@@ -249,15 +244,17 @@ async def _first_scan_loop(app):
                     except Exception:
                         STATE["auto"]["scan_msg_id"] = None
                         
-                await asyncio.sleep(4) 
+                await asyncio.sleep(2) 
         except Exception as e:
             print("scan err:", e)
             await asyncio.sleep(3)
 
-# --- УМНЫЙ ТРЕЙЛИНГ ---
+# --- УМНЫЙ ТРЕЙЛИНГ С ЧАСТИЧНОЙ ФИКСАЦИЕЙ ---
 async def _trailing_loop(app, symbol):
     chat_id = app.bot_data.get("chat_id", 0)
     STATE["trailing"]["active"][symbol] = True
+    STATE["trailing"]["tp1_hit"][symbol] = False
+    
     while STATE["trailing"]["active"].get(symbol):
         await asyncio.sleep(TRAIL_INTERVAL)
         try:
@@ -297,9 +294,19 @@ async def _trailing_loop(app, symbol):
 
             if side == "BUY":
                 profit = (best - entry) / entry if entry else 0
+                
+                # ЧАСТИЧНАЯ ФИКСАЦИЯ ПРИ +1R (Профит равен стопу)
+                if not STATE["trailing"]["tp1_hit"].get(symbol) and profit >= R_pct and R_pct > 0:
+                    partial_qty = pos2["qty"] * 0.5
+                    trade = portfolio.close_position(price, partial_qty, symbol)
+                    if "error" not in trade:
+                        STATE["trailing"]["tp1_hit"][symbol] = True
+                        if chat_id: await app.bot.send_message(chat_id=chat_id, text=f"💰 {symbol} Частичный профит (50%): +{round(trade['pnl_pct'], 2)}%")
+                
                 if R_pct > 0:
                     if profit >= 1.5 * R_pct: new_sl = max(cur_sl, entry + R_abs)
-                    elif profit >= 0.5 * R_pct: new_sl = max(cur_sl, entry)
+                    elif profit >= 0.5 * R_pct: new_sl = max(cur_sl, entry) # Безубыток
+                
                 if new_sl >= entry and best > entry:
                     trail = best - 0.2 * atr_v
                     if trail > new_sl: new_sl = trail
@@ -310,10 +317,19 @@ async def _trailing_loop(app, symbol):
                     if "error" not in trade:
                         if trade["pnl_pct"] < 0: register_loss(trade.get("pnl_abs", 0), symbol)
                         else: register_win(trade.get("pnl_abs", 0), symbol)
-                        if chat_id: await app.bot.send_message(chat_id=chat_id, text=f"🛡 {symbol} PnL: {round(trade['pnl_pct'], 2)}% ({round(trade['pnl_abs'], 2)} USDT)")
+                        if chat_id: await app.bot.send_message(chat_id=chat_id, text=f"🛡 {symbol} Остаток закрыт: {round(trade['pnl_pct'], 2)}%")
                     break
             else:
                 profit = (entry - best) / entry if entry else 0
+                
+                # ЧАСТИЧНАЯ ФИКСАЦИЯ ДЛЯ ШОРТА
+                if not STATE["trailing"]["tp1_hit"].get(symbol) and profit >= R_pct and R_pct > 0:
+                    partial_qty = pos2["qty"] * 0.5
+                    trade = portfolio.close_position(price, partial_qty, symbol)
+                    if "error" not in trade:
+                        STATE["trailing"]["tp1_hit"][symbol] = True
+                        if chat_id: await app.bot.send_message(chat_id=chat_id, text=f"💰 {symbol} Частичный профит (50%): +{round(trade['pnl_pct'], 2)}%")
+
                 if R_pct > 0:
                     if profit >= 1.5 * R_pct: new_sl = min(cur_sl if cur_sl else entry * 2, entry - R_abs)
                     elif profit >= 0.5 * R_pct: new_sl = min(cur_sl if cur_sl else entry * 2, entry)
@@ -327,7 +343,7 @@ async def _trailing_loop(app, symbol):
                     if "error" not in trade:
                         if trade["pnl_pct"] < 0: register_loss(trade.get("pnl_abs", 0), symbol)
                         else: register_win(trade.get("pnl_abs", 0), symbol)
-                        if chat_id: await app.bot.send_message(chat_id=chat_id, text=f"🛡 {symbol} PnL: {round(trade['pnl_pct'], 2)}% ({round(trade['pnl_abs'], 2)} USDT)")
+                        if chat_id: await app.bot.send_message(chat_id=chat_id, text=f"🛡 {symbol} Остаток закрыт: {round(trade['pnl_pct'], 2)}%")
                     break
         except Exception: pass
     STATE["trailing"]["active"][symbol] = False
@@ -361,6 +377,7 @@ async def _open_and_watch(ctx, symbol, side, price, qty, sl, tp):
     res = portfolio.open_position(symbol, side, price, qty, source="signal", sl=sl, tp=tp)
     if "error" in res: return res
     STATE["trailing"]["current_sl"][symbol] = sl
+    STATE["trailing"]["tp1_hit"][symbol] = False
     if symbol not in STATE["trailing"]["tasks"] or STATE["trailing"]["tasks"][symbol].done():
         STATE["trailing"]["tasks"][symbol] = asyncio.create_task(_trailing_loop(ctx.application, symbol))
     if symbol not in STATE["panic"]["tasks"] or STATE["panic"]["tasks"][symbol].done():
