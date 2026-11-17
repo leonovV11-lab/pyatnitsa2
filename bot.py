@@ -25,23 +25,20 @@ from chart import build_chart
 from geopy.geocoders import Nominatim
 from timezonefinder import TimezoneFinder
 
-# --- НАСТРОЙКИ ---
+# --- НАСТРОЙКИ SWEEP & RECLAIM ---
 DAILY_TARGET_PCT = 0.05  
 LOCK_IN_GIVEBACK = 0.015 
-CONF_FLOOR = 0.58        
-MIN_ATR_PCT = 0.2        
 FEE_RT_PCT = 0.004
 LIMIT_OFFSET = 0.001
-MAX_TRADE_TIME_MIN = 120 
 
-PANIC_DROP = 0.02 
-PANIC_INTERVAL = 5
-TRAIL_INTERVAL = 3 
+PANIC_DROP = 0.015 
+PANIC_INTERVAL = 2 
+TRAIL_INTERVAL = 2 
 LOSS_LIMIT = 3
 SLEEP_MIN = 30
-MAX_POSITIONS = 20       
+MAX_POSITIONS = 3  
 DAILY_DD_LIMIT = 0.05    
-TOP_N_SCAN = 30          
+TOP_N_SCAN = 50          
 VOL_MIN_24H = 300000.0
 CHUNK_SIZE = 15          
 
@@ -64,14 +61,6 @@ def btn(text, data): return InlineKeyboardButton(text, callback_data=data)
 def nav_btns(back_data): return [[btn("⬅️ На шаг назад", back_data), btn("🏠 В меню", "start")]]
 def is_sleeping(): return STATE["sleep_until"] and datetime.datetime.utcnow() < STATE["sleep_until"]
 def net_pct(sig): return (abs(sig.take_profit - sig.price) / sig.price - FEE_RT_PCT) * 100 if sig.price > 0 else 0.0
-
-def get_trade_params(work_hours):
-    if work_hours <= 4:
-        return {"tf": "5m", "conf": 0.58, "tp_mult": 2.0, "sl_mult": 1.0} 
-    elif work_hours <= 12:
-        return {"tf": "15m", "conf": 0.58, "tp_mult": 2.5, "sl_mult": 1.2} 
-    else:
-        return {"tf": "1h", "conf": 0.65, "tp_mult": 3.0, "sl_mult": 1.5}
 
 def get_total_pnl():
     opens = portfolio.load().get("opens", [])
@@ -119,25 +108,20 @@ def register_win(pnl=0.0, symbol=None):
     m["consecutive_wins"] += 1; m["consecutive_losses"] = 0
     check_daily_ratchet()
 
-def calc_lot(budget, price, sl, params, open_count):
+def calc_lot(budget, price, sl, open_count):
     if budget <= 0 or price <= 0: return 0.0, 0.0
     diff = abs(price - sl)
     if diff <= 0: return 0.0, 0.0
     
-    if STATE["auto"]["target_hit"]: base_risk = 0.01 
-    else:
-        if open_count >= 12: base_risk = 0.0075 
-        elif open_count >= 6: base_risk = 0.015  
-        else: base_risk = 0.025  
-        
+    base_risk = 0.02 
     cl = STATE["metrics"]["consecutive_losses"]
     base_risk *= (1.0 if cl <= 0 else (0.75 if cl == 1 else (0.5 if cl == 2 else 0.0)))
     if base_risk <= 0: return 0.0, 0.0
     
-    qty = min((budget * base_risk) / diff, (budget * 0.15) / price) 
+    qty = min((budget * base_risk) / diff, (budget * 0.30) / price) 
     return qty, qty * price
 
-async def fetch_candles(session, symbol, tf, limit=100):
+async def fetch_candles(session, symbol, tf, limit=50):
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol.replace('/', '')}&interval={tf}&limit={limit}"
         async with session.get(url, timeout=3.0) as resp:
@@ -150,26 +134,43 @@ async def fetch_candles(session, symbol, tf, limit=100):
             return df
     except Exception: return None
 
-async def check_setup(session, symbol, params):
-    loop = asyncio.get_event_loop()
-    tf = params["tf"]
+async def check_sweep_reclaim(session, symbol):
+    """Ищем фейковый пролив (сбор стопов) и возврат цены"""
     try:
-        df = await fetch_candles(session, symbol, tf, 100)
-        if df is None or len(df) < 30: return None
+        df = await fetch_candles(session, symbol, "1m", 30)
+        if df is None or len(df) < 20: return None
         
-        atr = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
-        if atr / df["close"].iloc[-1] * 100 < MIN_ATR_PCT: return None
+        hist = df.iloc[:-1]
+        last = df.iloc[-1]
+        
+        local_low = hist["low"].min()
+        vol_avg = hist["volume"].mean()
+        
+        sweep_occurred = (last["low"] < local_low) and (last["close"] > local_low)
+        vol_spike = last["volume"] > vol_avg * 1.8
+        
+        if not (sweep_occurred and vol_spike): return None
 
-        f = Friday(symbol=symbol, exchange_name="binance")
-        df = await loop.run_in_executor(None, lambda: f.enrich(df, tf).dropna())
-        if len(df) < 30: return None
+        btc_df = await fetch_candles(session, "BTC/USDT", "5m", 10)
+        if btc_df is not None and len(btc_df) >= 5:
+            btc_ema = btc_df["close"].ewm(span=9, adjust=False).mean().iloc[-1]
+            if btc_df["close"].iloc[-1] < btc_ema: return None
+
+        price = last["close"]
+        sl = last["low"] * 0.999 
         
-        sig = await loop.run_in_executor(None, lambda: f.analyze_filtered(tf, tp_mult=params["tp_mult"]))
+        risk = price - sl
+        if risk <= 0: return None
+        tp = price + (risk * 2.0)
         
-        if sig.confidence < CONF_FLOOR: return None
-        if net_pct(sig) < 0.5: return None
+        if (tp - price) / price < 0.01: return None
+
+        class Sig: pass
+        sig = Sig()
+        sig.price = price; sig.action = "BUY"; sig.stop_loss = sl; sig.take_profit = tp
+        sig.confidence = 0.85
         
-        return {"symbol": symbol, "signal": sig, "net": net_pct(sig), "tf": tf}
+        return {"symbol": symbol, "signal": sig, "net": net_pct(sig), "tf": "1m"}
     except Exception: return None
 
 async def bg_scan_market(session, open_symbols=[]):
@@ -200,70 +201,44 @@ async def _first_scan_loop(app):
     scan_count = 0
     while STATE["auto"]["active"]:
         try:
-            if STATE["day_halt"]:
-                if chat_id and scan_count % 10 == 0:
-                    try: await app.bot.send_message(chat_id=chat_id, text="🛡 Умный храповик зафиксировал прибыль. Торговля остановлена.")
-                    except: pass
-                await asyncio.sleep(10); continue
-            if is_sleeping(): await asyncio.sleep(5); continue
-
+            if STATE["day_halt"] or is_sleeping(): await asyncio.sleep(5); continue
             if "signal" in STATE["pending"]: await asyncio.sleep(5); continue
 
             open_positions = portfolio.load().get("opens", [])
             if len(open_positions) >= MAX_POSITIONS: 
                 await asyncio.sleep(10); continue
             
-            my_coins = STATE["auto"].get("my_coins", [])
-            params = STATE["auto"]["params"]
-            
             async with aiohttp.ClientSession() as session:
+                candidates = await bg_scan_market(session, open_symbols=[p["symbol"] for p in open_positions])
                 found = None
-                
-                if my_coins:
-                    for sym in my_coins:
-                        res = await check_setup(session, sym, params)
-                        if res and res["signal"].action == "SELL":
-                            found = res
-                            break
-                
-                if not found:
-                    candidates = await bg_scan_market(session, open_symbols=[p["symbol"] for p in open_positions])
-                    for i in range(0, len(candidates), CHUNK_SIZE):
-                        chunk = candidates[i:i+CHUNK_SIZE]
-                        tasks = [check_setup(session, c["symbol"], params) for c in chunk]
-                        results = await asyncio.gather(*tasks)
-                        valid = [r for r in results if r and r["signal"].action == "BUY"]
-                        if valid:
-                            valid.sort(key=lambda x: x["signal"].confidence, reverse=True)
-                            found = valid[0]
-                            break
-                        await asyncio.sleep(0.2)
+                for i in range(0, len(candidates), CHUNK_SIZE):
+                    chunk = candidates[i:i+CHUNK_SIZE]
+                    tasks = [check_sweep_reclaim(session, c["symbol"]) for c in chunk]
+                    results = await asyncio.gather(*tasks)
+                    valid = [r for r in results if r]
+                    if valid:
+                        found = valid[0]
+                        break
+                    await asyncio.sleep(0.5)
 
                 if found:
                     STATE["auto"]["last_found"] = found
                     sym_data = found["symbol"].replace("/", "_")
-                    action_text = "Купить" if found["signal"].action == "BUY" else "Продать"
                     
-                    budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
-                    total_pnl = get_total_pnl()
-                    pnl_pct = (total_pnl / budget)*100 if budget > 0 else 0
-                    peak_pct = STATE["metrics"]["peak_day_pnl"]*100
-                    
-                    text = (f"🎯 <b>Точка входа найдена</b>\n\n🪙 <b>{found['symbol']}</b>\n"
-                            f"⏱ ТФ: <b>{found['tf']}</b>\n"
-                            f"📊 Направление: <b>{found['signal'].action}</b>\n"
-                            f"🎯 Уверенность: <b>{int(found['signal'].confidence * 100)}%</b>\n"
+                    text = (f"🩸 <b>Сбор стопов (Sweep)!</b>\n\n🪙 <b>{found['symbol']}</b>\n"
+                            f"📊 Направление: <b>BUY</b>\n"
+                            f"🔖 Цена: <b>{fmt_price(found['signal'].price)}</b>\n"
                             f"💰 Чистая: <b>+{round(found['net'], 2)}%</b>\n"
-                            f"📈 День: {round(pnl_pct, 1)}% (Пик: {round(peak_pct, 1)}%)")
+                            f"⚡️ Возврат после пролива!")
                     
-                    rows = [[btn(f"✅ {action_text}", "sig_go_" + sym_data)], [btn("❌ Пропустил", "sig_skipped")]]
+                    rows = [[btn("✅ Купить", "sig_go_" + sym_data)], [btn("❌ Пропустил", "sig_skipped")]]
                     if chat_id: await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
                     
-                    qty, lot = calc_lot(budget, found["signal"].price, found["signal"].stop_loss, params, len(open_positions))
-                    if qty <= 0:
-                        await asyncio.sleep(5); continue
+                    budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
+                    qty, lot = calc_lot(budget, found["signal"].price, found["signal"].stop_loss, len(open_positions))
+                    if qty <= 0: await asyncio.sleep(5); continue
                     
-                    STATE["pending"]["signal"] = {"action": found["signal"].action, "symbol": found["symbol"], "price": found["signal"].price, "lot": lot, "qty": qty, "sl": found["signal"].stop_loss, "tp": found["signal"].take_profit}
+                    STATE["pending"]["signal"] = {"action": "BUY", "symbol": found["symbol"], "price": found["signal"].price, "lot": lot, "qty": qty, "sl": found["signal"].stop_loss, "tp": found["signal"].take_profit}
                     
                     for _ in range(15): 
                         if "signal" not in STATE["pending"]: break
@@ -274,13 +249,8 @@ async def _first_scan_loop(app):
                 scan_count += 1
                 if scan_count % 4 == 0 and chat_id:
                     try:
-                        budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
-                        total_pnl = get_total_pnl()
-                        pnl_pct = (total_pnl / budget)*100 if budget > 0 else 0
-                        peak_pct = STATE["metrics"]["peak_day_pnl"]*100
                         now_ts = int(time.time())
-                        msg_text = f"⏳ Сканирую Топ-{TOP_N_SCAN} на {params['tf']}...\nДень: {round(pnl_pct, 1)}% (Пик: {round(peak_pct, 1)}%)\nОбновлено: {now_ts}"
-                        
+                        msg_text = f"⏳ Ищу сбор стопов (Sweep & Reclaim)...\nОбновлено: {now_ts}"
                         if not STATE["auto"]["scan_msg_id"]:
                             msg = await app.bot.send_message(chat_id=chat_id, text=msg_text)
                             STATE["auto"]["scan_msg_id"] = msg.message_id
@@ -308,7 +278,7 @@ async def _trailing_loop(app, symbol):
             try:
                 opened_at = datetime.datetime.fromisoformat(pos["opened_at"])
                 held_min = (datetime.datetime.utcnow() - opened_at).total_seconds() / 60
-                if held_min > MAX_TRADE_TIME_MIN:
+                if held_min > 120:
                     async with aiohttp.ClientSession() as session:
                         df = await fetch_candles(session, symbol, "1m", 5)
                         price = float(df["close"].iloc[-1]) if df is not None else pos["entry"]
@@ -329,8 +299,7 @@ async def _trailing_loop(app, symbol):
             pos["current_price"] = price
             data = portfolio.load()
             for p in data.get("opens", []):
-                if p["symbol"] == symbol:
-                    p["current_price"] = price
+                if p["symbol"] == symbol: p["current_price"] = price
             portfolio.save(data)
             
             check_daily_ratchet() 
@@ -348,27 +317,12 @@ async def _trailing_loop(app, symbol):
             if side == "BUY":
                 profit = (best - entry) / entry if entry else 0
                 
-                if STATE["auto"]["target_hit"] and not STATE["trailing"]["tp1_hit"].get(symbol) and profit > 0.001:
-                    partial_qty = pos2["qty"] * 0.5
-                    trade = portfolio.close_position(price, partial_qty, symbol)
-                    if "error" not in trade:
-                        STATE["trailing"]["tp1_hit"][symbol] = True
-                        register_win(trade.get("pnl_abs", 0), symbol)
-                        if chat_id: await app.bot.send_message(chat_id=chat_id, text=f"💰 {symbol} Сверхфиксация 50%: +{round(trade['pnl_pct'], 2)}%")
-                elif not STATE["trailing"]["tp1_hit"].get(symbol) and profit >= R_pct and R_pct > 0:
-                    partial_qty = pos2["qty"] * 0.5
-                    trade = portfolio.close_position(price, partial_qty, symbol)
-                    if "error" not in trade:
-                        STATE["trailing"]["tp1_hit"][symbol] = True
-                        register_win(trade.get("pnl_abs", 0), symbol)
-                        if chat_id: await app.bot.send_message(chat_id=chat_id, text=f"💰 {symbol} Взяли 50% профита: +{round(trade['pnl_pct'], 2)}%")
-                
                 if R_pct > 0:
-                    if profit >= 1.5 * R_pct: new_sl = max(cur_sl, entry + R_abs)
+                    if profit >= 1.0 * R_pct: new_sl = max(cur_sl, entry + R_abs * 0.5)
                     elif profit >= 0.5 * R_pct: new_sl = max(cur_sl, entry) 
                 
                 if new_sl >= entry and best > entry:
-                    trail = best - 0.2 * atr_v
+                    trail = best - 0.2 * atr_v 
                     if trail > new_sl: new_sl = trail
                 STATE["trailing"]["current_sl"][symbol] = new_sl
                 
@@ -377,39 +331,7 @@ async def _trailing_loop(app, symbol):
                     if "error" not in trade:
                         if trade["pnl_pct"] < 0: register_loss(trade.get("pnl_abs", 0), symbol)
                         else: register_win(trade.get("pnl_abs", 0), symbol)
-                        if chat_id: await app.bot.send_message(chat_id=chat_id, text=f"🛡 {symbol} Закрыт остаток: {round(trade['pnl_pct'], 2)}%")
-                    break
-            else:
-                profit = (entry - best) / entry if entry else 0
-                if STATE["auto"]["target_hit"] and not STATE["trailing"]["tp1_hit"].get(symbol) and profit > 0.001:
-                    partial_qty = pos2["qty"] * 0.5
-                    trade = portfolio.close_position(price, partial_qty, symbol)
-                    if "error" not in trade:
-                        STATE["trailing"]["tp1_hit"][symbol] = True
-                        register_win(trade.get("pnl_abs", 0), symbol)
-                        if chat_id: await app.bot.send_message(chat_id=chat_id, text=f"💰 {symbol} Сверхфиксация 50%: +{round(trade['pnl_pct'], 2)}%")
-                elif not STATE["trailing"]["tp1_hit"].get(symbol) and profit >= R_pct and R_pct > 0:
-                    partial_qty = pos2["qty"] * 0.5
-                    trade = portfolio.close_position(price, partial_qty, symbol)
-                    if "error" not in trade:
-                        STATE["trailing"]["tp1_hit"][symbol] = True
-                        register_win(trade.get("pnl_abs", 0), symbol)
-                        if chat_id: await app.bot.send_message(chat_id=chat_id, text=f"💰 {symbol} Взяли 50% профита: +{round(trade['pnl_pct'], 2)}%")
-
-                if R_pct > 0:
-                    if profit >= 1.5 * R_pct: new_sl = min(cur_sl if cur_sl else entry * 2, entry - R_abs)
-                    elif profit >= 0.5 * R_pct: new_sl = min(cur_sl if cur_sl else entry * 2, entry)
-                if new_sl <= entry and best < entry:
-                    trail = best + 0.2 * atr_v
-                    if new_sl == 0 or trail < new_sl: new_sl = trail
-                STATE["trailing"]["current_sl"][symbol] = new_sl
-                
-                if price >= new_sl:
-                    trade = portfolio.close_position(price, pos2["qty"], symbol)
-                    if "error" not in trade:
-                        if trade["pnl_pct"] < 0: register_loss(trade.get("pnl_abs", 0), symbol)
-                        else: register_win(trade.get("pnl_abs", 0), symbol)
-                        if chat_id: await app.bot.send_message(chat_id=chat_id, text=f"🛡 {symbol} Закрыт остаток: {round(trade['pnl_pct'], 2)}%")
+                        if chat_id: await app.bot.send_message(chat_id=chat_id, text=f"🛡 {symbol} PnL: {round(trade['pnl_pct'], 2)}%")
                     break
         except Exception: pass
     STATE["trailing"]["active"][symbol] = False
@@ -421,21 +343,9 @@ async def _panic_loop(app, symbol):
         try:
             pos = portfolio.find_open(symbol)
             if not pos: break
-            
-            if STATE["auto"]["locked"]:
-                async with aiohttp.ClientSession() as session:
-                    df = await fetch_candles(session, symbol, "1m", 5)
-                    price = float(df["close"].iloc[-1]) if df is not None else pos["entry"]
-                trade = portfolio.close_position(price, pos["qty"], symbol)
-                if "error" not in trade:
-                    if trade["pnl_pct"] < 0: register_loss(trade.get("pnl_abs", 0), symbol)
-                    else: register_win(trade.get("pnl_abs", 0), symbol)
-                    if chat_id: await app.bot.send_message(chat_id=chat_id, text=f"🛑 {symbol} Экстренное закрытие по храповику: {round(trade['pnl_pct'], 2)}%")
-                break
-
             async with aiohttp.ClientSession() as session:
-                df = await fetch_candles(session, symbol, "1m", 60)
-                if df is None or len(df) < 15: 
+                df = await fetch_candles(session, symbol, "1m", 5)
+                if df is None: 
                     await asyncio.sleep(PANIC_INTERVAL); continue
                 price = float(df["close"].iloc[-1])
             pnl = portfolio.current_pnl(price, symbol)
@@ -468,8 +378,7 @@ async def sig_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     res = await _open_and_watch(ctx, sig["symbol"], sig["action"], sig["price"], sig["qty"], sig["sl"], sig["tp"])
     del STATE["pending"]["signal"]
     if "error" in res: await update.callback_query.edit_message_text("Ошибка: " + res["error"], reply_markup=kb([[btn("🏠 В меню", "start")]])); return
-    action_word = "Купил" if sig["action"] == "BUY" else "Продал (в шорт)"
-    await update.callback_query.edit_message_text(f"{action_word} {sig['symbol']} на {round(sig['lot'], 2)} USDT.\nИщу следующую...", reply_markup=kb([[btn("🏠 В меню", "start")]]))
+    await update.callback_query.edit_message_text(f"BUY {sig['symbol']} на {round(sig['lot'], 2)} USDT.\nИщу следующую...", reply_markup=kb([[btn("🏠 В меню", "start")]]))
 
 async def sig_skipped(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if "signal" in STATE["pending"]: del STATE["pending"]["signal"]
@@ -497,8 +406,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     opens = portfolio.load().get("opens", [])
     pos_txt = ("\n📌 Позиции: " + str(len(opens)) + "/" + str(MAX_POSITIONS)) if opens else ""
     
-    if STATE["auto"]["locked"]: auto_txt = "\n🛡 Храповик сработал! Прибыль зафиксирована."
-    elif STATE["auto"]["target_hit"]: auto_txt = "\n🎯 Цель 5% взята. Работаем на максимум!"
+    if STATE["auto"]["locked"]: auto_txt = "\n🛡 Храповик сработал!"
     elif STATE["auto"]["active"]: auto_txt = "\n🤖 Авто: Работает"
     else: auto_txt = ""
     
@@ -563,49 +471,21 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["exchange"] = key
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
     
-    params = get_trade_params(STATE["auto"]["work_hours"])
-    STATE["auto"]["params"] = params
-    
     STATE["pending"]["auto"] = "my_coins"
-    msg = f"Биржа выбрана. Стратегия: ТФ {params['tf']} (Цель +5%, лимит 20 сделок).\n\n<b>Какие монеты у тебя есть сейчас?</b>\nВпиши через запятую (например: BTC, ETH, ZRO). Если нет — напиши 'нет'."
+    msg = f"Биржа выбрана. Стратегия: Sweep & Reclaim.\n\n<b>Какие монеты у тебя есть сейчас?</b>\nВпиши через запятую (например: BTC, ETH, ZRO). Если нет — напиши 'нет'."
     await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("start")), parse_mode="HTML")
 
 async def auto_ex_start_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["active"] = True
     STATE["auto"]["scanning"] = False
     STATE["pending"] = {}
-    msg = "⏳ Портфель учтен. Ищу лучшие точки входа..."
+    msg = "⏳ Портфель учтен. Ищу откаты после пампов..."
     if update.message: await update.message.reply_text(msg, reply_markup=kb([]))
     else: await update.callback_query.edit_message_text(msg, reply_markup=kb([]))
     asyncio.create_task(_first_scan_loop(ctx.application))
 
 async def demo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rows = [[btn("🚀 Найти монету", "demo_scan")], nav_btns("start")[0]]
-    await update.callback_query.edit_message_text("🎮 Демо.", reply_markup=kb(rows))
-
-async def demo_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.edit_message_text("🔍 Сканирую...")
-    params = get_trade_params(2)
-    async with aiohttp.ClientSession() as session:
-        candidates = await bg_scan_market(session)
-        if not candidates: await update.callback_query.edit_message_text("Не нашёл.", reply_markup=kb(nav_btns("demo"))); return
-        tasks = [check_setup(session, c["symbol"], params) for c in candidates[:10]]
-        results = await asyncio.gather(*tasks)
-        valid = [r for r in results if r]
-    if not valid: await update.callback_query.edit_message_text("Не нашёл.", reply_markup=kb(nav_btns("demo"))); return
-    best = valid[0]
-    STATE["demo"]["symbol"] = best["symbol"]; STATE["demo"]["buy_price"] = best["signal"].price
-    text = f"🎮 ДЕМО\n{best['symbol']}\nТФ: {best['tf']}\n{best['signal'].action}\nУверенность: {int(best['signal'].confidence * 100)}%\nЧистая: +{round(best['net'], 2)}%"
-    rows = [[btn("✅ Купил", "demo_buy")], [btn("❌ Пропустил", "demo_skip")], nav_btns("demo")[0]]
-    await update.callback_query.edit_message_text(text, reply_markup=kb(rows))
-
-async def demo_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    STATE["demo"]["symbol"] = None
-    await update.callback_query.edit_message_text("Ок.", reply_markup=kb([[btn("🏠 Демо", "demo")]]))
-
-async def demo_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    STATE["pending"]["demo_amount"] = True
-    await update.callback_query.edit_message_text("Сколько купил?", reply_markup=kb(nav_btns("demo")))
+    await update.callback_query.edit_message_text("🎮 Демо недоступно в этой версии.")
 
 async def man_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = [[btn("🏦 " + exchanges.EXCHANGES.get(STATE["manual"]["exchange"], "биржа"), "man_ex")], [btn("📈 Пары", "man_pairs")], [btn("🔍 Поиск", "man_search")], nav_btns("start")[0]]
@@ -692,7 +572,7 @@ async def man_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f = Friday(symbol=symbol, exchange_name=STATE["manual"]["exchange"])
         sig = f.analyze_filtered("15m", tp_mult=3.0)
         budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
-        qty, lot = calc_lot(budget, sig.price, sig.stop_loss, get_trade_params(24), portfolio.count_open())
+        qty, lot = calc_lot(budget, sig.price, sig.stop_loss, portfolio.count_open())
         if qty <= 0: await update.callback_query.edit_message_text("Лот 0 (цель дня / бюджет / риск).", reply_markup=kb(nav_btns("start"))); return
         res = await _open_and_watch(ctx, symbol, "BUY", sig.price, qty, sig.stop_loss, sig.take_profit)
         if "error" in res: await update.callback_query.edit_message_text("Ошибка: " + res["error"], reply_markup=kb(nav_btns("start"))); return
@@ -765,30 +645,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pend = STATE["pending"]
 
     if "demo_amount" in pend:
-        try: amount = float(txt)
-        except Exception: await update.message.reply_text("Число.", reply_markup=kb(nav_btns("demo"))); return
         pend.pop("demo_amount")
-        sym = STATE["demo"]["symbol"]; bp = STATE["demo"]["buy_price"]
-        try:
-            async with aiohttp.ClientSession() as session:
-                df = await fetch_candles(session, sym, "1m", 5)
-                cp = float(df["close"].iloc[-1]) if df is not None else bp
-        except Exception: cp = bp
-        pnl = amount * ((cp - bp) / bp if bp else 0)
-        res = "📈 +" if pnl >= 0 else "📉 "
-        await update.message.reply_text(f"🎮 ДЕМО {sym}\n{res}{round(pnl, 2)} USDT ({round((cp-bp)/bp*100, 2) if bp else 0}%)", reply_markup=kb([[btn("🏠 Демо", "demo")]]))
-        return
-
-    if "wait_custom_amount" in pend:
-        sd = pend["wait_custom_amount"]
-        try: amount = float(txt)
-        except Exception: await update.message.reply_text("Число.", reply_markup=kb(nav_btns("start"))); return
-        pend.pop("wait_custom_amount")
-        if sd["action"] == "BUY":
-            qty = amount / sd["price"] if sd["price"] else 0
-            res = await _open_and_watch(ctx, sd["symbol"], "BUY", sd["price"], qty, sd["sl"], sd["tp"])
-            if "error" in res: await update.message.reply_text("Ошибка: " + res["error"], reply_markup=kb(nav_btns("start"))); return
-            await update.message.reply_text(f"Купил {sd['symbol']} на {amount} USDT.", reply_markup=kb([[btn("🏠 В меню", "start")]]))
+        await update.message.reply_text("Демо отключено в этой версии.")
         return
 
     if "auto" in pend:
@@ -845,9 +703,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.application.bot_data["chat_id"] = q.message.chat_id
 
     mapping = {
-        "demo": demo, "demo_scan": demo_scan, "demo_skip": demo_skip, "demo_buy": demo_buy,
-        "auto_start": auto_start,
-        "sig_skipped": sig_skipped,
+        "demo": demo, "auto_start": auto_start, "sig_skipped": sig_skipped,
         "man_menu": man_menu, "man_ex": man_ex, "man_pairs": man_pairs,
         "man_search": man_search, "man_signals": man_signals, "man_quick": man_quick,
         "man_pick_back": man_pick_back, "man_buy": man_buy, "man_sell": man_sell,
