@@ -25,21 +25,20 @@ from chart import build_chart
 from geopy.geocoders import Nominatim
 from timezonefinder import TimezoneFinder
 
-# --- НАСТРОЙКИ SWEEP & RECLAIM ---
+# --- НАСТРОЙКИ TREND RIDER ---
 DAILY_TARGET_PCT = 0.05  
 LOCK_IN_GIVEBACK = 0.015 
 FEE_RT_PCT = 0.004
-LIMIT_OFFSET = 0.001
 
 PANIC_DROP = 0.015 
-PANIC_INTERVAL = 2 
-TRAIL_INTERVAL = 2 
+PANIC_INTERVAL = 3 
+TRAIL_INTERVAL = 3 
 LOSS_LIMIT = 3
 SLEEP_MIN = 30
-MAX_POSITIONS = 3  
+MAX_POSITIONS = 5  
 DAILY_DD_LIMIT = 0.05    
 TOP_N_SCAN = 50          
-VOL_MIN_24H = 300000.0
+VOL_MIN_24H = 500000.0
 CHUNK_SIZE = 15          
 
 STATE = {
@@ -121,7 +120,7 @@ def calc_lot(budget, price, sl, open_count):
     qty = min((budget * base_risk) / diff, (budget * 0.30) / price) 
     return qty, qty * price
 
-async def fetch_candles(session, symbol, tf, limit=50):
+async def fetch_candles(session, symbol, tf, limit=100):
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol.replace('/', '')}&interval={tf}&limit={limit}"
         async with session.get(url, timeout=3.0) as resp:
@@ -134,43 +133,59 @@ async def fetch_candles(session, symbol, tf, limit=50):
             return df
     except Exception: return None
 
-async def check_sweep_reclaim(session, symbol):
-    """Ищем фейковый пролив (сбор стопов) и возврат цены"""
+async def check_trend_rider(session, symbol):
+    """Ищем тренд на 15m и точку входа на 5m"""
     try:
-        df = await fetch_candles(session, symbol, "1m", 30)
-        if df is None or len(df) < 20: return None
+        # 1. Проверяем тренд на 15-минутке
+        df15 = await fetch_candles(session, symbol, "15m", 100)
+        if df15 is None or len(df15) < 50: return None
         
-        hist = df.iloc[:-1]
-        last = df.iloc[-1]
+        ema9_15 = df15["close"].ewm(span=9, adjust=False).mean().iloc[-1]
+        ema50_15 = df15["close"].ewm(span=50, adjust=False).mean().iloc[-1]
         
-        local_low = hist["low"].min()
-        vol_avg = hist["volume"].mean()
-        
-        sweep_occurred = (last["low"] < local_low) and (last["close"] > local_low)
-        vol_spike = last["volume"] > vol_avg * 1.8
-        
-        if not (sweep_occurred and vol_spike): return None
+        # Глобальный тренд должен быть вверх
+        if ema9_15 < ema50_15: return None
 
-        btc_df = await fetch_candles(session, "BTC/USDT", "5m", 10)
+        # 2. Ищем точку входа на 5-минутке
+        df5 = await fetch_candles(session, symbol, "5m", 50)
+        if df5 is None or len(df5) < 30: return None
+        
+        last = df5.iloc[-1]
+        prev = df5.iloc[-2]
+        
+        ema21_5 = df5["close"].ewm(span=21, adjust=False).mean().iloc[-1]
+        
+        # Условие: цена откатилась к EMA21 (или коснулась её) и идет отскок
+        pulled_back = prev["low"] <= ema21_5 * 1.005
+        bounced = last["close"] > last["open"] and last["close"] > prev["close"]
+        
+        if not (pulled_back and bounced): return None
+
+        # 3. Глобальный фон BTC
+        btc_df = await fetch_candles(session, "BTC/USDT", "15m", 10)
         if btc_df is not None and len(btc_df) >= 5:
             btc_ema = btc_df["close"].ewm(span=9, adjust=False).mean().iloc[-1]
             if btc_df["close"].iloc[-1] < btc_ema: return None
 
         price = last["close"]
-        sl = last["low"] * 0.999 
+        # Стоп ставим под минимум откатной свечи
+        sl = last["low"] * 0.998 
         
         risk = price - sl
         if risk <= 0: return None
+        
+        # Тейк = 2 * Риск
         tp = price + (risk * 2.0)
         
-        if (tp - price) / price < 0.01: return None
+        # Минимальный профит не менее 1.5%
+        if (tp - price) / price < 0.015: return None
 
         class Sig: pass
         sig = Sig()
         sig.price = price; sig.action = "BUY"; sig.stop_loss = sl; sig.take_profit = tp
         sig.confidence = 0.85
         
-        return {"symbol": symbol, "signal": sig, "net": net_pct(sig), "tf": "1m"}
+        return {"symbol": symbol, "signal": sig, "net": net_pct(sig), "tf": "5m"}
     except Exception: return None
 
 async def bg_scan_market(session, open_symbols=[]):
@@ -213,7 +228,7 @@ async def _first_scan_loop(app):
                 found = None
                 for i in range(0, len(candidates), CHUNK_SIZE):
                     chunk = candidates[i:i+CHUNK_SIZE]
-                    tasks = [check_sweep_reclaim(session, c["symbol"]) for c in chunk]
+                    tasks = [check_trend_rider(session, c["symbol"]) for c in chunk]
                     results = await asyncio.gather(*tasks)
                     valid = [r for r in results if r]
                     if valid:
@@ -225,18 +240,22 @@ async def _first_scan_loop(app):
                     STATE["auto"]["last_found"] = found
                     sym_data = found["symbol"].replace("/", "_")
                     
-                    text = (f"🩸 <b>Сбор стопов (Sweep)!</b>\n\n🪙 <b>{found['symbol']}</b>\n"
-                            f"📊 Направление: <b>BUY</b>\n"
-                            f"🔖 Цена: <b>{fmt_price(found['signal'].price)}</b>\n"
-                            f"💰 Чистая: <b>+{round(found['net'], 2)}%</b>\n"
-                            f"⚡️ Возврат после пролива!")
-                    
-                    rows = [[btn("✅ Купить", "sig_go_" + sym_data)], [btn("❌ Пропустил", "sig_skipped")]]
-                    if chat_id: await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
-                    
                     budget = STATE["daily_budget"] if STATE["daily_budget"] > 0 else STATE["balance"]
                     qty, lot = calc_lot(budget, found["signal"].price, found["signal"].stop_loss, len(open_positions))
+                    
                     if qty <= 0: await asyncio.sleep(5); continue
+
+                    text = (f"🚀 <b>Вход по тренду (Откат)</b>\n\n"
+                            f"🪙 <b>{found['symbol']}</b>\n"
+                            f"📊 ТФ: <b>{found['tf']}</b> (Тренд 15m ВВЕРХ)\n"
+                            f"🔖 Вход: <b>{fmt_price(found['signal'].price)}</b>\n"
+                            f"💵 Лот: <b>{round(lot, 2)} USDT</b>\n"
+                            f"🛡 Стоп: <b>{fmt_price(found['signal'].stop_loss)}</b>\n"
+                            f"🎯 Тейк: <b>{fmt_price(found['signal'].take_profit)}</b>\n"
+                            f"💰 Чистая: <b>+{round(found['net'], 2)}%</b>")
+                    
+                    rows = [[btn("✅ Я купил", "sig_go_" + sym_data)], [btn("❌ Пропустил", "sig_skipped")]]
+                    if chat_id: await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
                     
                     STATE["pending"]["signal"] = {"action": "BUY", "symbol": found["symbol"], "price": found["signal"].price, "lot": lot, "qty": qty, "sl": found["signal"].stop_loss, "tp": found["signal"].take_profit}
                     
@@ -249,8 +268,8 @@ async def _first_scan_loop(app):
                 scan_count += 1
                 if scan_count % 4 == 0 and chat_id:
                     try:
-                        now_ts = int(time.time())
-                        msg_text = f"⏳ Ищу сбор стопов (Sweep & Reclaim)...\nОбновлено: {now_ts}"
+                        now_str = datetime.datetime.now().strftime("%H:%M:%S")
+                        msg_text = f"⏳ Ищу откат в тренде на 5m...\nОбновлено: {now_str}"
                         if not STATE["auto"]["scan_msg_id"]:
                             msg = await app.bot.send_message(chat_id=chat_id, text=msg_text)
                             STATE["auto"]["scan_msg_id"] = msg.message_id
@@ -259,10 +278,13 @@ async def _first_scan_loop(app):
                     except Exception:
                         STATE["auto"]["scan_msg_id"] = None
                         
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
         except Exception as e:
             print("scan err:", e)
             await asyncio.sleep(3)
+
+# ... (ФУНКЦИИ ТРЕЙЛИНГА, ПАНИКИ, МЕНЮ, ИСТОРИИ - БЕЗ ИЗМЕНЕНИЙ, БЕРЕМ ИЗ ПРЕДЫДУЩЕГО КОДА)
+# ВСТАВЬ ИХ СЮДА, ОНИ РАБОЧИЕ. Я ДАМ ТЕБЕ ПОЛНЫЙ ФАЙЛ НИЖЕ В СЛЕДУЮЩЕМ СООБЩЕНИИ, ЧТОБЫ НЕ ОБРЕЗАТЬ.
 
 async def _trailing_loop(app, symbol):
     chat_id = app.bot_data.get("chat_id", 0)
@@ -472,14 +494,14 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
     
     STATE["pending"]["auto"] = "my_coins"
-    msg = f"Биржа выбрана. Стратегия: Sweep & Reclaim.\n\n<b>Какие монеты у тебя есть сейчас?</b>\nВпиши через запятую (например: BTC, ETH, ZRO). Если нет — напиши 'нет'."
+    msg = f"Биржа выбрана. Стратегия: Trend Rider (Откат на 5m).\n\n<b>Какие монеты у тебя есть сейчас?</b>\nВпиши через запятую (например: BTC, ETH, ZRO). Если нет — напиши 'нет'."
     await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("start")), parse_mode="HTML")
 
 async def auto_ex_start_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["active"] = True
     STATE["auto"]["scanning"] = False
     STATE["pending"] = {}
-    msg = "⏳ Портфель учтен. Ищу откаты после пампов..."
+    msg = "⏳ Портфель учтен. Ищу лучшие откаты в тренде..."
     if update.message: await update.message.reply_text(msg, reply_markup=kb([]))
     else: await update.callback_query.edit_message_text(msg, reply_markup=kb([]))
     asyncio.create_task(_first_scan_loop(ctx.application))
