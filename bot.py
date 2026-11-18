@@ -25,7 +25,7 @@ from chart import build_chart
 from geopy.geocoders import Nominatim
 from timezonefinder import TimezoneFinder
 
-# --- НАСТРОЙКИ HYBRID SCANNER ---
+# --- НАСТРОЙКИ MAX PROFIT SCORING ---
 DAILY_TARGET_PCT = 0.05  
 LOCK_IN_GIVEBACK = 0.015 
 FEE_RT_PCT = 0.004
@@ -35,11 +35,11 @@ PANIC_INTERVAL = 2
 TRAIL_INTERVAL = 2 
 LOSS_LIMIT = 3
 SLEEP_MIN = 30
-MAX_POSITIONS = 5  
+MAX_POSITIONS = 3  # Максимум 3 позиции, чтобы не слить при падении рынка
 DAILY_DD_LIMIT = 0.05    
-TOP_N_SCAN = 50          
+TOP_N_SCAN = 100  # Сканируем Топ-100!
 VOL_MIN_24H = 500000.0
-CHUNK_SIZE = 15          
+CHUNK_SIZE = 20          
 
 STATE = {
     "balance": 0.0, "daily_budget": 0.0, "tz": "UTC",
@@ -133,103 +133,99 @@ async def fetch_candles(session, symbol, tf, limit=100):
             return df
     except Exception: return None
 
-# --- СТРАТЕГИЯ 1: ОТСКОК (Trend Retest) ---
-async def check_trend_retest(session, symbol):
-    try:
-        df15 = await fetch_candles(session, symbol, "15m", 50)
-        if df15 is None or len(df15) < 50: return None
-        ema9_15 = df15["close"].ewm(span=9, adjust=False).mean().iloc[-1]
-        ema50_15 = df15["close"].ewm(span=50, adjust=False).mean().iloc[-1]
-        if ema9_15 < ema50_15: return None
-
-        df5 = await fetch_candles(session, symbol, "5m", 50)
-        if df5 is None or len(df5) < 30: return None
-        
-        last = df5.iloc[-1]; prev = df5.iloc[-2]
-        ema21_5 = df5["close"].ewm(span=21, adjust=False).mean().iloc[-1]
-        
-        pulled_back = prev["low"] <= ema21_5 * 1.005
-        bounced = last["close"] > last["open"] and last["close"] > prev["close"]
-        
-        if not (pulled_back and bounced): return None
-
-        btc_df = await fetch_candles(session, "BTC/USDT", "15m", 10)
-        if btc_df is not None and len(btc_df) >= 5:
-            btc_ema = btc_df["close"].ewm(span=9, adjust=False).mean().iloc[-1]
-            if btc_df["close"].iloc[-1] < btc_ema: return None
-
-        price = last["close"]
-        sl = last["low"] * 0.998 
-        risk = price - sl
-        if risk <= 0: return None
-        tp = price + (risk * 2.0)
-        if (tp - price) / price < 0.015: return None
-
-        class Sig: pass
-        sig = Sig()
-        sig.price = price; sig.action = "BUY"; sig.stop_loss = sl; sig.take_profit = tp
-        sig.confidence = 0.70 # Вероятность успеха 70%
-        
-        # EV = (P * TP) - (1-P * SL)
-        net = net_pct(sig)
-        ev = (0.70 * net) - (0.30 * (abs(price - sl)/price * 100))
-        
-        return {"symbol": symbol, "signal": sig, "net": net, "tf": "5m", "strategy": "Отскок (Trend Retest)", "ev": ev}
-    except Exception: return None
-
-# --- СТРАТЕГИЯ 2: СЖАТИЕ (Volatility Squeeze) ---
-async def check_squeeze_breakout(session, symbol):
+async def check_max_profit(session, symbol):
+    """Считаем Индекс Силы (Score) от 0 до 100"""
     try:
         df = await fetch_candles(session, symbol, "5m", 100)
-        if df is None or len(df) < 50: return None
-        
-        ma = df["close"].rolling(20).mean()
-        sd = df["close"].rolling(20).std()
-        upper = ma + (sd * 2)
-        lower = ma - (sd * 2)
-        width = (upper - lower) / ma
-        
-        prev_width = width.iloc[-2]
-        avg_width = width.rolling(20).mean().iloc[-2]
-        is_squeeze = prev_width < avg_width * 0.7
-        if not is_squeeze: return None
+        if df is None or len(df) < 30: return None
 
-        last = df.iloc[-1]; prev_close = df["close"].iloc[-2]
-        breakout = last["close"] > upper.iloc[-1] and prev_close <= upper.iloc[-1]
-        vol_avg = df["volume"].iloc[-22:-2].mean()
-        vol_spike = last["volume"] > vol_avg * 1.8
+        # Считаем индикаторы
+        ema9 = df["close"].ewm(span=9, adjust=False).mean()
+        ema21 = df["close"].ewm(span=21, adjust=False).mean()
         
+        # MACD
+        exp1 = df["close"].ewm(span=12, adjust=False).mean()
+        exp2 = df["close"].ewm(span=26, adjust=False).mean()
+        macd = exp1 - exp2
+        macd_sig = macd.ewm(span=9, adjust=False).mean()
+
+        # RSI
         delta = df["close"].diff()
         gain = delta.where(delta > 0, 0).rolling(14).mean()
         loss = -delta.where(delta < 0, 0).rolling(14).mean()
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
-        rsi_rising = rsi.iloc[-1] > rsi.iloc[-2] and rsi.iloc[-1] > 50
 
-        if not (breakout and vol_spike and rsi_rising): return None
+        # Bollinger Bands
+        ma20 = df["close"].rolling(20).mean()
+        sd20 = df["close"].rolling(20).std()
+        bb_upper = ma20 + (sd20 * 2)
 
-        btc_df = await fetch_candles(session, "BTC/USDT", "15m", 20)
-        if btc_df is not None and len(btc_df) >= 10:
+        # Объем
+        vol_avg = df["volume"].rolling(20).mean()
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        score = 0
+        reasons = []
+
+        # 1. Тренд EMA
+        if last["close"] > ema9.iloc[-1] > ema21.iloc[-1]:
+            score += 20; reasons.append("EMA Тренд")
+        elif last["close"] > ema9.iloc[-1]:
+            score += 10
+
+        # 2. MACD
+        if macd.iloc[-1] > macd_sig.iloc[-1] and prev["close"] < prev["open"] and last["close"] > last["open"]:
+            score += 20; reasons.append("MACD Импульс")
+
+        # 3. RSI
+        if 50 < rsi.iloc[-1] < 75:
+            score += 15; reasons.append("RSI Рост")
+
+        # 4. Bollinger
+        if last["close"] > bb_upper.iloc[-1]:
+            score += 15; reasons.append("Пробой BB")
+
+        # 5. Объем
+        if last["volume"] > vol_avg.iloc[-1] * 1.5:
+            score += 15; reasons.append("Объем x1.5")
+
+        # 6. Паттерны свечей
+        body = abs(last["close"] - last["open"])
+        rng = last["high"] - last["low"]
+        if rng > 0 and body / rng > 0.7 and last["close"] > last["open"]:
+            score += 15; reasons.append("Сильная свеча")
+
+        # 7. Штраф за BTC
+        btc_df = await fetch_candles(session, "BTC/USDT", "5m", 10)
+        if btc_df is not None and len(btc_df) >= 5:
             btc_ema = btc_df["close"].ewm(span=9, adjust=False).mean().iloc[-1]
-            if btc_df["close"].iloc[-1] < btc_ema: return None
+            if btc_df["close"].iloc[-1] < btc_ema: 
+                score -= 15
+                reasons.append("BTC Штраф")
+
+        if score < 60: return None # Порог отсева
 
         price = last["close"]
-        sl = lower.iloc[-1] * 0.998 
-        risk = price - sl
-        if risk <= 0: return None
-        tp = price + (risk * 2.5)
-        if (tp - price) / price < 0.02: return None
+        atr = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
+        
+        sl = price - atr * 1.5
+        tp = price + atr * 3.0
+        
+        net = (abs(tp - price) / price - 0.004) * 100
+        if net < 1.0: return None # Минимум 1% чистыми
 
         class Sig: pass
         sig = Sig()
         sig.price = price; sig.action = "BUY"; sig.stop_loss = sl; sig.take_profit = tp
-        sig.confidence = 0.65 # Вероятность успеха 65%
+        sig.confidence = score / 100.0
         
-        # EV = (P * TP) - (1-P * SL)
-        net = net_pct(sig)
-        ev = (0.65 * net) - (0.35 * (abs(price - sl)/price * 100))
+        # Считаем итоговый рейтинг: Очки * Потенциальная прибыль
+        final_rating = score * net
         
-        return {"symbol": symbol, "signal": sig, "net": net, "tf": "5m", "strategy": "Сжатие (Squeeze)", "ev": ev}
+        return {"symbol": symbol, "signal": sig, "net": net, "tf": "5m", "score": score, "rating": final_rating, "reasons": reasons}
     except Exception: return None
 
 async def bg_scan_market(session, open_symbols=[]):
@@ -273,24 +269,15 @@ async def _first_scan_loop(app):
                 
                 for i in range(0, len(candidates), CHUNK_SIZE):
                     chunk = candidates[i:i+CHUNK_SIZE]
-                    
-                    # ПАРАЛЛЕЛЬНО ЗАПУСКАЕМ ОБЕ СТРАТЕГИИ ДЛЯ КАЖДОЙ МОНЕТЫ
-                    tasks_retest = [check_trend_retest(session, c["symbol"]) for c in chunk]
-                    tasks_squeeze = [check_squeeze_breakout(session, c["symbol"]) for c in chunk]
-                    
-                    res_retest = await asyncio.gather(*tasks_retest)
-                    res_squeeze = await asyncio.gather(*tasks_squeeze)
-                    
-                    for r in res_retest:
+                    tasks = [check_max_profit(session, c["symbol"]) for c in chunk]
+                    results = await asyncio.gather(*tasks)
+                    for r in results:
                         if r: all_valid_results.append(r)
-                    for s in res_squeeze:
-                        if s: all_valid_results.append(s)
-                        
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
 
                 if all_valid_results:
-                    # СОРТИРУЕМ ПО МАТЕМАТИЧЕСКОМУ ОЖИДАНИЮ (EV)
-                    all_valid_results.sort(key=lambda x: x["ev"], reverse=True)
+                    # СОРТИРУЕМ ПО РЕЙТИНГУ (Очки * Прибыль)
+                    all_valid_results.sort(key=lambda x: x["rating"], reverse=True)
                     found = all_valid_results[0] # Берем абсолютно лучший
                     
                     STATE["auto"]["last_found"] = found
@@ -301,15 +288,17 @@ async def _first_scan_loop(app):
                     
                     if qty <= 0: await asyncio.sleep(5); continue
 
-                    text = (f"🎯 <b>Лучший вход (по EV)</b>\n\n"
+                    reasons_str = ", ".join(found["reasons"][:3])
+                    
+                    text = (f"🔥 <b>Лучший сигнал (MAX PROFIT)</b>\n\n"
                             f"🪙 <b>{found['symbol']}</b>\n"
-                            f"🧠 Стратегия: <b>{found['strategy']}</b>\n"
+                            f"📊 Рейтинг: <b>{int(found['score'])}/100</b>\n"
+                            f"🧠 Факторы: <i>{reasons_str}</i>\n"
                             f"🔖 Вход: <b>{fmt_price(found['signal'].price)}</b>\n"
                             f"💵 Лот: <b>{round(lot, 2)} USDT</b>\n"
                             f"🛡 Стоп: <b>{fmt_price(found['signal'].stop_loss)}</b>\n"
                             f"🎯 Тейк: <b>{fmt_price(found['signal'].take_profit)}</b>\n"
-                            f"💰 Чистая: <b>+{round(found['net'], 2)}%</b>\n"
-                            f"📊 EV: <b>{round(found['ev'], 2)}</b>")
+                            f"💰 Чистая: <b>+{round(found['net'], 2)}%</b>")
                     
                     rows = [[btn("✅ Я купил", "sig_go_" + sym_data)], [btn("❌ Пропустил", "sig_skipped")]]
                     if chat_id: await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb(rows), parse_mode="HTML")
@@ -326,7 +315,7 @@ async def _first_scan_loop(app):
                 if scan_count % 2 == 0 and chat_id:
                     try:
                         now_str = datetime.datetime.now().strftime("%H:%M:%S")
-                        msg_text = f"⏳ Сканирую (Отскок + Пружина)...\nОбновлено: {now_str}"
+                        msg_text = f"⏳ Сканирую Топ-100 (по очкам)...\nОбновлено: {now_str}"
                         if not STATE["auto"]["scan_msg_id"]:
                             msg = await app.bot.send_message(chat_id=chat_id, text=msg_text)
                             STATE["auto"]["scan_msg_id"] = msg.message_id
@@ -549,14 +538,14 @@ async def auto_ex_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.bot_data["chat_id"] = update.callback_query.message.chat_id
     
     STATE["pending"]["auto"] = "my_coins"
-    msg = f"Биржа выбрана. Стратегия: Hybrid Scanner (Отскок + Сжатие).\n\n<b>Какие монеты у тебя есть сейчас?</b>\nВпиши через запятую (например: BTC, ETH, ZRO). Если нет — напиши 'нет'."
+    msg = f"Биржа выбрана. Стратегия: MAX PROFIT (Скоринг).\n\n<b>Какие монеты у тебя есть сейчас?</b>\nВпиши через запятую (например: BTC, ETH, ZRO). Если нет — напиши 'нет'."
     await update.callback_query.edit_message_text(msg, reply_markup=kb(nav_btns("start")), parse_mode="HTML")
 
 async def auto_ex_start_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"]["active"] = True
     STATE["auto"]["scanning"] = False
     STATE["pending"] = {}
-    msg = "⏳ Портфель учтен. Ищу лучшие точки входа (Гибрид)..."
+    msg = "⏳ Портфель учтен. Ищу лучшие точки входа (MAX PROFIT)..."
     if update.message: await update.message.reply_text(msg, reply_markup=kb([]))
     else: await update.callback_query.edit_message_text(msg, reply_markup=kb([]))
     asyncio.create_task(_first_scan_loop(ctx.application))
