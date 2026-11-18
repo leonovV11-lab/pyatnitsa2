@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 from config import PORTFOLIO_FILE, FEE_ROUND
 
-MAX_POSITIONS = 5
+MAX_POSITIONS = 3
 
 def _empty():
     return {"opens": [], "history": []}
