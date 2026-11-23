@@ -1,0 +1,8 @@
+{
+  "lsp": {
+    "python": {
+      "command": ["pyright-langserver", "--stdio"],
+      "extensions": [".py"]
+    }
+  }
+}

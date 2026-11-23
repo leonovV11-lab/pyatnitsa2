@@ -1,0 +1,4 @@
+-r requirements.txt
+ccxt>=4.2.0
+matplotlib>=3.8.0
+mplfinance>=0.12.10b0
