@@ -1,5 +1,16 @@
 {
-  "include": ["bot.py", "market.py", "paper_ledger.py", "research.py", "strategies.py", "trade_reviewer.py"],
+  "include": [
+    "bot.py",
+    "market.py",
+    "paper_ledger.py",
+    "research.py",
+    "strategies.py",
+    "trade_reviewer.py",
+    "official_news.py",
+    "news_agent_team.py",
+    "news_quant.py",
+    "news_paper.py"
+  ],
   "typeCheckingMode": "basic",
   "pythonVersion": "3.13"
 }

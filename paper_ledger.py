@@ -371,11 +371,14 @@ class PaperLedger:
                 "symbol": position["symbol"], "qty": qty, "price": bid, "fee": fee, "pnl": pnl,
                 "reason": reason, "at": now, "remaining": remaining, "mode": "paper"}
 
-    def mark(self, position_id, bid, *, now=None, max_age_seconds=7200, trailing_fraction=None, fillable=True):
+    def mark(self, position_id, bid, *, now=None, max_age_seconds=7200, trailing_fraction=None,
+             fillable=True, available_qty=None):
         """Mark a fresh bid and keep triggered exits pending until a fill is available."""
         bid = _number(bid, "Цена продажи")
         now = _timestamp(now)
         max_age_seconds = _number(max_age_seconds, "Тайм-аут позиции")
+        if available_qty is not None:
+            available_qty = _number(available_qty, "Доступный объём", allow_zero=True)
         if trailing_fraction is not None:
             trailing_fraction = _number(trailing_fraction, "Доля трейлинга")
             if trailing_fraction >= 1:
@@ -399,7 +402,8 @@ class PaperLedger:
                 elif not tp1_hit and bid >= position["tp1"]:
                     pending = "tp1"
 
-            if fillable and pending:
+            required_qty = position['qty'] / 2 if pending == 'tp1' else position['qty']
+            if fillable and pending and (available_qty is None or available_qty >= required_qty):
                 if not tp1_hit and pending in {"tp1", "tp2"}:
                     fills.append(self._sell(db, position, position["qty"] / 2, bid, "tp1", now))
                     tp1_hit = True
