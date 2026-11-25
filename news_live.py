@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import logging
 import math
 import re
 import time
@@ -11,10 +12,14 @@ from contextlib import closing
 from pathlib import Path
 
 import aiohttp
+from telegram import Bot
+from telegram.error import InvalidToken, TelegramError
 
 import config
+from live_delivery import TelegramOutbox, TelegramPublisher
 from live_evidence import assess_recorded_history, read_recorded_history
 from live_market_check import inspect_market, observe_reaction, refresh_plan
+from live_telegram import parse_chat_id, verify_chat
 from market import DEFAULT_QUOTE_MAX_AGE, SUPPORTED_EXCHANGES, Market
 from news_agent_team import ROLE_GROUPS, analyze_team
 from news_journal import (
@@ -101,6 +106,7 @@ class LiveJournal(HeadlineJournal):
                     event_id TEXT PRIMARY KEY, published_at REAL NOT NULL, payload TEXT NOT NULL
                 );
             """)
+        self.telegram = TelegramOutbox(self.connect)
 
     def record_discoveries(self, items, as_of):
         start = as_of - DISCOVERY_WINDOW
@@ -144,7 +150,8 @@ class LiveJournal(HeadlineJournal):
         """, (event_id, as_of)).fetchone()
         return row["revision"] if row is not None else None
 
-    def issue(self, event, venue, symbol, plan, *, cap, as_of, details=None, review_result=None):
+    def issue(self, event, venue, symbol, plan, *, cap, as_of, details=None, review_result=None,
+              telegram_route=None):
         risk = plan.get("stressed_loss_usdt", plan["loss"])
         quote_time = plan.get("quote_observed_at", as_of)
         if not (math.isfinite(risk) and 0 < risk <= cap and math.isfinite(cap)
@@ -184,6 +191,8 @@ class LiveJournal(HeadlineJournal):
             if review_result is not None:
                 self.write_review(db, payload["evidence"]["review_id"],
                                   {**review_result, "reason": "", "signal_id": signal_id})
+            if telegram_route:
+                self.telegram.enqueue(db, signal_id, telegram_route, as_of)
             return payload
 
     def invalidate(self, health, as_of, listed=None):
@@ -243,7 +252,8 @@ class LiveJournal(HeadlineJournal):
             }
         return {"type": "report", **dict(summary), "signals": counts, "active": active,
                 "latest_review": last_review, "recent_reactions": latest_reactions,
-                "recent_headlines": self.current_news(now)[:10], "discovery_candidates": discoveries}
+                "recent_headlines": self.current_news(now)[:10], "discovery_candidates": discoveries,
+                "telegram_deliveries": self.telegram.counts()}
 
 
 def review_verdict(results):
@@ -279,11 +289,12 @@ class ScanMarket:
 
 
 class LiveMonitor:
-    def __init__(self, public_session, private_session, journal, options):
+    def __init__(self, public_session, private_session, journal, options, publisher=None):
         self.public_session = public_session
         self.private_session = private_session
         self.journal = journal
         self.options = options
+        self.publisher = publisher
         self.market = Market(public_session, options.venue)
         self.last_decisions = {}
 
@@ -328,14 +339,18 @@ class LiveMonitor:
                 plan, reason = await refresh_plan(self.market, check["setup"], options.budget, options.fee_rate)
                 if plan is not None:
                     plan["stressed_loss_usdt"] = stressed_loss(plan)
+                    details = {"review_id": review_id, "pnl": stats, "completed_agents": len(results),
+                               "reaction_pct": check["market"].get("reaction_pct"),
+                               "btc_reaction_pct": check["market"].get("btc_reaction_pct")}
                     alert = self.journal.issue(event, options.venue, symbol, plan, cap=options.risk_cap,
-                                               as_of=time.time(), details={"review_id": review_id, "pnl": stats,
-                                                                          "completed_agents": len(results)},
-                                               review_result=review_result)
+                                               as_of=time.time(), details=details, review_result=review_result,
+                                               telegram_route=self.publisher.route if self.publisher else None)
                     if alert is None:
                         reason = "alert_expired_duplicate_or_risk_limit"
         if alert:
             emit(alert)
+            if self.publisher is not None:
+                await self.publisher.flush()
         else:
             self.journal.finish_review(review_id, {**review_result, "reason": reason, "signal_id": None})
             self.watch(event, symbol, reason, pnl=stats)
@@ -406,21 +421,55 @@ class LiveMonitor:
                     return
 
 
-async def run(options, journal):
+async def run_monitor(options, journal, publisher=None):
     async with aiohttp.ClientSession(trust_env=True) as public, aiohttp.ClientSession() as private:
-        monitor = LiveMonitor(public, private, journal, options)
-        while True:
+        monitor = LiveMonitor(public, private, journal, options, publisher=publisher)
+        if options.once:
             await monitor.scan_once()
-            if options.once:
-                return
-            await asyncio.sleep(options.interval)
+            if publisher is not None:
+                await publisher.flush()
+            return
+        async with asyncio.TaskGroup() as tasks:
+            if publisher is not None:
+                tasks.create_task(publisher.run())
+            while True:
+                await monitor.scan_once()
+                await asyncio.sleep(options.interval)
+
+
+async def run(options, journal):
+    if not (options.telegram or options.telegram_check):
+        await run_monitor(options, journal)
+        return True
+
+    # HTTPX logs full Bot API URLs at INFO level, including the token.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    try:
+        async with Bot(config.TELEGRAM_TOKEN) as bot:
+            status = await verify_chat(bot, options.telegram_chat_id)
+            emit({"type": "telegram_check", "status": status})
+            if status != "ready":
+                return False
+            if not options.telegram_check:
+                route = key("telegram", bot.id, options.telegram_chat_id)
+                publisher = TelegramPublisher(bot, options.telegram_chat_id, route, journal.telegram)
+                await run_monitor(options, journal, publisher)
+    except InvalidToken:
+        emit({"type": "telegram_check", "status": "token_invalid"})
+        return False
+    except TelegramError:
+        emit({"type": "telegram_check", "status": "telegram_unavailable"})
+        return False
+    return True
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Сигналы по живым новостям и котировкам без Telegram")
+    parser = argparse.ArgumentParser(description="Сигналы по живым новостям и котировкам")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="Выполнить один цикл")
     mode.add_argument("--report", action="store_true", help="Показать журнал без сетевых запросов")
+    mode.add_argument("--telegram-check", action="store_true", help="Проверить доступ к личному чату без отправки")
     parser.add_argument("--venue", choices=SUPPORTED_EXCHANGES, default="okx")
     parser.add_argument("--symbols", nargs="+", default=["BTC/USDT"], metavar="PAIR")
     parser.add_argument("--data-dir", type=Path, default=Path("data/live"))
@@ -429,10 +478,18 @@ def main():
     parser.add_argument("--fee-rate", type=float, help="Комиссия биржи за одну сторону, доля")
     parser.add_argument("--risk-cap", type=float, help="Лимит суммы сценарного риска активных сигналов, USDT")
     parser.add_argument("--team", action="store_true", help="Подключить 50 агентов к финальной проверке")
+    parser.add_argument("--telegram", action="store_true", help="Отправлять сигналы в личный чат BOT_OWNER_ID")
     parser.add_argument("--concurrency", type=int, choices=range(1, 51), default=10, metavar="N")
     parser.add_argument("--interval", type=int, default=60, help="Интервал между циклами в секундах")
     options = parser.parse_args()
-    if not options.report:
+    if options.telegram_check or (options.telegram and not options.report):
+        if not config.TELEGRAM_TOKEN.strip():
+            parser.error("Для Telegram задайте TELEGRAM_TOKEN.")
+        try:
+            options.telegram_chat_id = parse_chat_id(config.BOT_OWNER_ID)
+        except ValueError:
+            parser.error("Для Telegram задайте числовой BOT_OWNER_ID личного чата.")
+    if not (options.report or options.telegram_check):
         if (len(options.symbols) > 4 or len(set(options.symbols)) != len(options.symbols)
                 or any(not re.fullmatch(r"[A-Z0-9]{1,16}/USDT", pair) for pair in options.symbols)):
             parser.error("Укажите от одной до четырёх разных спотовых пар формата BTC/USDT.")
@@ -450,14 +507,15 @@ def main():
                 parser.error("Для команды нужны настроенные параметры риска.")
             if not (config.TRADE_REVIEW_KEY and config.TRADE_REVIEW_URL and config.TRADE_REVIEW_MODEL):
                 parser.error("Для команды нужны TRADE_REVIEW_KEY, TRADE_REVIEW_URL и TRADE_REVIEW_MODEL.")
-    journal = LiveJournal(options.data_dir / "news-live.sqlite3")
     if options.report:
-        emit(journal.report())
-    else:
-        try:
-            asyncio.run(run(options, journal))
-        except KeyboardInterrupt:
-            pass
+        emit(LiveJournal(options.data_dir / "news-live.sqlite3").report())
+        return
+    journal = None if options.telegram_check else LiveJournal(options.data_dir / "news-live.sqlite3")
+    try:
+        if not asyncio.run(run(options, journal)):
+            raise SystemExit(1)
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

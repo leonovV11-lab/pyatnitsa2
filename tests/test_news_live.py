@@ -7,6 +7,8 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from live_delivery import TelegramPublisher
+from live_telegram import DeliveryResult
 from news_agent_team import ROLE_GROUPS
 from news_live import LiveJournal, LiveMonitor, classify_live_event, review_verdict
 from official_news import NewsItem
@@ -89,7 +91,7 @@ def reaction(direction="up"):
 
 
 class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
-    async def verify_flow(self, *, history_supported=True, revised=False, team_complete=True):
+    async def verify_flow(self, *, history_supported=True, revised=False, team_complete=True, telegram=False):
         now = time.time()
         initial = release(now)
         updated = release(now + 1800, "r2")
@@ -131,7 +133,8 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
             db = LiveJournal(Path(root) / "live.sqlite3")
             options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"], budget=300.0, fee_rate=0.001,
                                       risk_cap=2.0, team=True, concurrency=50, history_file=None)
-            monitor = LiveMonitor(None, None, db, options)
+            publisher = TelegramPublisher(object(), 1234, "owner", db.telegram) if telegram else None
+            monitor = LiveMonitor(None, None, db, options, publisher=publisher)
             with (
                 patch("news_live.fetch_official_news", new=AsyncMock(side_effect=sources)),
                 patch("news_live.fetch_discovery_news", new=AsyncMock(return_value=([], {}))),
@@ -140,13 +143,22 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
                 patch("news_live.assess_recorded_history", side_effect=assess),
                 patch("news_live.analyze_team", new=AsyncMock(side_effect=review)),
                 patch("news_live.refresh_plan", new=AsyncMock(side_effect=refresh)),
+                patch("live_delivery.send_signal",
+                      new=AsyncMock(return_value=DeliveryResult("sent", message_id=42))) as send,
+                patch("live_delivery.emit"),
                 patch("news_live.emit") as output,
             ):
                 await monitor.scan_once()
+            if telegram and history_supported and not revised and team_complete:
+                send.assert_awaited_once()
+                self.assertEqual(send.await_args.args[1], 1234)
+            else:
+                send.assert_not_awaited()
             with closing(db.connect()) as connection:
                 tables = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 self.assertEqual(tables, {
                     "official_headlines", "news_reviews", "live_signals", "market_reactions", "discovery_headlines",
+                    "telegram_deliveries",
                 })
             return steps, [call.args[0] for call in output.call_args_list], db.report()
 
@@ -164,11 +176,16 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(steps, ["source", "chart", "math"])
         self.assertEqual(output[-1]["type"], "watch")
 
+    async def test_reviewed_signal_is_delivered_to_telegram(self):
+        _, _, report = await self.verify_flow(telegram=True)
+        self.assertEqual(report["telegram_deliveries"], {"sent": 1})
+
     async def test_release_correction_after_agents_suppresses_signal(self):
-        steps, output, report = await self.verify_flow(revised=True)
+        steps, output, report = await self.verify_flow(revised=True, telegram=True)
         self.assertEqual(steps, ["source", "chart", "math", "agents", "source"])
         self.assertEqual(output[-1]["reason"], "release_changed_during_review")
         self.assertEqual(report["signals"], {})
+        self.assertEqual(report["telegram_deliveries"], {})
 
     async def test_incomplete_team_suppresses_signal(self):
         steps, output, report = await self.verify_flow(team_complete=False)
