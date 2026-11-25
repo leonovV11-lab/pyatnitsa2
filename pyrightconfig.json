@@ -16,6 +16,7 @@
     "live_portfolio.py",
     "live_reply_worker.py",
     "live_slots.py",
+    "market_evidence.py",
     "live_telegram.py",
     "live_delivery.py",
     "news_live.py"

@@ -25,6 +25,7 @@ from live_reply_worker import check_reply_transport, run_replies
 from live_slots import SlotJournal
 from live_telegram import parse_chat_id, verify_chat
 from market import DEFAULT_QUOTE_MAX_AGE, SUPPORTED_EXCHANGES, Market, MarketError
+from market_evidence import MarketSampler, QuoteEvidenceJournal
 from news_agent_team import ROLE_GROUPS, analyze_team
 from news_journal import (
     DISCOVERY_WINDOW,
@@ -118,6 +119,7 @@ class LiveJournal(HeadlineJournal):
             """)
         self.telegram = TelegramOutbox(self.connect)
         self.slots = SlotJournal(self.connect)
+        self.market_evidence = QuoteEvidenceJournal(self.connect)
 
     def record_discoveries(self, items, as_of):
         start = as_of - DISCOVERY_WINDOW
@@ -325,7 +327,8 @@ class LiveJournal(HeadlineJournal):
         return {"type": "report", **dict(summary), "signals": counts, "active": active,
                 "latest_review": last_review, "recent_reactions": latest_reactions,
                 "recent_headlines": self.current_news(now)[:10], "discovery_candidates": discoveries,
-                "telegram_deliveries": self.telegram.counts(), "manual_slots": self.slots.report()}
+                "telegram_deliveries": self.telegram.counts(), "manual_slots": self.slots.report(),
+                "market_quote_evidence": self.market_evidence.report()}
 
 
 def review_verdict(results):
@@ -396,7 +399,7 @@ class ScanMarket:
 
 class LiveMonitor:
     def __init__(self, public_session, private_session, journal, options, publisher=None, *,
-                 all_pairs=False, manual_replies=False):
+                 all_pairs=False, manual_replies=False, collect_market_evidence=False):
         self.public_session = public_session
         self.private_session = private_session
         self.journal = journal
@@ -405,6 +408,7 @@ class LiveMonitor:
         if manual_replies and publisher is None:
             raise ValueError("Режиму ручных ответов нужен отправитель Telegram.")
         self.market = Market(public_session, options.venue, all_spot=all_pairs)
+        self.sampler = MarketSampler(self.market, journal.market_evidence) if collect_market_evidence else None
         self.all_pairs = all_pairs
         self.manual_replies = manual_replies
         self.market_cursor = 0
@@ -541,6 +545,7 @@ class LiveMonitor:
             observe_reaction(market, symbol, event["known_at"]) for symbol in symbols
         ))
         candidates = []
+        evidence_symbols = []
         for symbol, (observation, reason) in zip(symbols, observations, strict=True):
             if observation is None:
                 self.watch(event, symbol, reason, family=family)
@@ -552,12 +557,17 @@ class LiveMonitor:
                 reason = "topic_unclassified" if family == "uncatalogued" else "market_link_unvalidated"
                 self.watch(event, symbol, reason, family=family)
                 continue
-            if options.budget is None:
+            if options.budget is None and self.sampler is None:
                 self.watch(event, symbol, "sizing_parameters_required", family=family)
                 continue
             draft, reason = await prepare_candidate(market, symbol, event["known_at"])
             if draft is None:
                 self.watch(event, symbol, reason)
+                continue
+            if self.sampler is not None:
+                evidence_symbols.append(symbol)
+            if options.budget is None:
+                self.watch(event, symbol, "sizing_parameters_required", family=family)
                 continue
             stats = assess_recorded_history(history, family=family, venue=options.venue, symbol=symbol,
                                             strategy=BASELINE, as_of=time.time(), before=event["known_at"])
@@ -565,6 +575,8 @@ class LiveMonitor:
                 self.watch(event, symbol, stats["reason"], pnl=stats)
                 continue
             candidates.append({"event": event, "symbol": symbol, "draft": draft, "stats": stats})
+        if evidence_symbols and self.sampler is not None:
+            await self.sampler.collect(event, family, evidence_symbols)
         return candidates
 
     async def review_ranked(self, candidates):
@@ -631,7 +643,8 @@ class LiveMonitor:
         emit({"type": "scan", "source_health": health, "received": len(items), "recent": len(events),
               "discovery_health": discovery_health, "discovery_candidates": discovered,
               "history_rows": len(history), "sizing_configured": options.budget is not None,
-              "team_enabled": options.team, "symbols": len(symbols), "catalog_size": self.catalog_size})
+              "team_enabled": options.team, "symbols": len(symbols), "catalog_size": self.catalog_size,
+              "collecting_market_evidence": self.sampler is not None})
         market = ScanMarket(self.market)
         candidates = []
         for event in events:
@@ -665,14 +678,19 @@ class LiveMonitor:
 async def run_monitor(options, journal, publisher=None):
     async with aiohttp.ClientSession(trust_env=True) as public, aiohttp.ClientSession() as private:
         monitor = LiveMonitor(public, private, journal, options, publisher=publisher,
-                              all_pairs=options.all_pairs, manual_replies=options.manual_replies)
+                              all_pairs=options.all_pairs, manual_replies=options.manual_replies,
+                              collect_market_evidence=options.collect_market_evidence)
         if options.once:
             await monitor.scan_once()
+            if monitor.sampler is not None:
+                await monitor.sampler.sample_due()
             if publisher is not None:
                 await publisher.flush()
             return
         async with asyncio.TaskGroup() as tasks:
             wake = asyncio.Event()
+            if monitor.sampler is not None:
+                tasks.create_task(monitor.sampler.run())
             if publisher is not None:
                 tasks.create_task(publisher.run())
                 if options.manual_replies:
@@ -744,6 +762,8 @@ def main():
     parser.add_argument("--telegram", action="store_true", help="Отправлять сигналы в личный чат BOT_OWNER_ID")
     parser.add_argument("--manual-replies", action="store_true",
                         help="Ждать ответа в Telegram и вести до 16 открытых позиций")
+    parser.add_argument("--collect-market-evidence", action="store_true",
+                        help="Собирать публичные котировки кандидатов для последующей оценки")
     parser.add_argument("--concurrency", type=int, choices=range(1, 51), default=10, metavar="N")
     parser.add_argument("--max-reviews-per-scan", type=int, choices=range(1, MAX_REVIEWS_PER_SCAN + 1), default=1,
                         help="Сколько кандидатов можно передать команде за цикл")

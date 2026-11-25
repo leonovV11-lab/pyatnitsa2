@@ -206,6 +206,7 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(tables, {
                     "official_headlines", "news_reviews", "live_signals", "market_reactions", "discovery_headlines",
                     "telegram_deliveries", "live_manual_slots",
+                    "market_quote_samples", "market_quote_checks",
                 })
             return steps, [call.args[0] for call in output.call_args_list], db.report()
 
@@ -297,6 +298,28 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(report["news"], 2)
             self.assertEqual(report["discovery_candidates"][0]["event_id"], "media")
             self.assertFalse(report["discovery_candidates"][0]["confirmed"])
+
+    async def test_quote_evidence_collects_candidates_without_spending_or_ordering(self):
+        now = time.time()
+        with TemporaryDirectory() as root:
+            journal = LiveJournal(Path(root) / "signals.sqlite3")
+            event = journal.observe(release(now))
+            options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"], budget=None)
+            monitor = LiveMonitor(None, None, journal, options, collect_market_evidence=True)
+            collector = AsyncMock(return_value=1)
+            with (
+                patch("news_live.observe_reaction", new=AsyncMock(return_value=(reaction(), ""))),
+                patch("news_live.prepare_candidate", new=AsyncMock(return_value=({"setup": {}}, ""))),
+                patch("news_live.assess_recorded_history") as fills,
+                patch.object(monitor.sampler, "collect", collector),
+                patch("news_live.emit"),
+            ):
+                candidates = await monitor.scan_event(monitor.market, event, [], options.symbols)
+            self.assertEqual(candidates, [])
+            fills.assert_not_called()
+            collector.assert_awaited_once_with(event, "us_monetary_policy", ["BTC/USDT"])
+            self.assertEqual(journal.report()["signals"], {})
+            self.assertEqual(journal.report()["market_quote_evidence"]["samples"], 0)
 
     def test_veto_and_majority_are_enforced(self):
         rows = team_results()
