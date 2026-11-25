@@ -78,6 +78,45 @@ class LiveSignalTests(unittest.TestCase):
             for plan in ({"loss": 1, "quote_observed_at": now - 6}, {"loss": 1, "valid_until": now - 1}):
                 self.assertIsNone(db.issue(event, "okx", "BTC/USDT", plan, cap=10, as_of=now))
 
+    def test_risk_remains_reserved_after_telegram_card_expires(self):
+        now = time.time()
+        with TemporaryDirectory() as root:
+            db = LiveJournal(Path(root) / "live.sqlite3")
+            event = db.observe(release(now))
+            self.assertIsNotNone(db.issue(event, "okx", "BTC/USDT", {"loss": 7.0}, cap=10, as_of=now))
+            self.assertIsNone(db.issue(event, "okx", "ETH/USDT", {"loss": 4.0}, cap=10, as_of=now + 10))
+            self.assertIsNotNone(db.issue(event, "okx", "ETH/USDT", {"loss": 4.0}, cap=10, as_of=now + 301))
+
+    def test_open_positions_and_unallocated_cash_apply_before_issuance(self):
+        now = time.time()
+        with TemporaryDirectory() as root:
+            db = LiveJournal(Path(root) / "live.sqlite3")
+            event = db.observe(release(now))
+            portfolio = SimpleNamespace(observed_at=now - 10, open_symbols={"BTC/USDT"},
+                                        stressed_risk_usdt=6.0, available_cash_usdt=40.0)
+            plan = {"loss": 1.0, "qty": 0.5, "price": 100.0}
+            for symbol, candidate in (
+                ("BTC/USDT", plan),
+                ("ETH/USDT", plan),
+                ("ETH/USDT", {**plan, "qty": 0.25, "loss": 5.0}),
+            ):
+                self.assertIsNone(db.issue(event, "okx", symbol, candidate, cap=10, as_of=now, portfolio=portfolio))
+            self.assertIsNotNone(db.issue(event, "okx", "ETH/USDT", {**plan, "qty": 0.25},
+                                          cap=10, as_of=now, portfolio=portfolio))
+
+    def test_uses_open_portfolio_as_of_latest_snapshot_without_double_counting_older_alerts(self):
+        now = time.time()
+        with TemporaryDirectory() as root:
+            db = LiveJournal(Path(root) / "live.sqlite3")
+            event = db.observe(release(now))
+            plan = {"loss": 5.0, "qty": 1.0, "price": 45.0}
+            self.assertIsNotNone(db.issue(event, "okx", "BTC/USDT", plan, cap=10, budget=80, as_of=now))
+            self.assertIsNone(db.issue(event, "okx", "ETH/USDT", plan, cap=10, budget=80, as_of=now + 1))
+            portfolio = SimpleNamespace(observed_at=now + 2, open_symbols=set(),
+                                        stressed_risk_usdt=0.0, available_cash_usdt=80.0)
+            self.assertIsNotNone(db.issue(event, "okx", "ETH/USDT", plan,
+                                          cap=10, budget=80, as_of=now + 3, portfolio=portfolio))
+
 
 def team_results():
     return [{"agent": name, "group": group, "decision": "support", "reason": "fixture", "pnl": "fixture"}
@@ -91,14 +130,16 @@ def reaction(direction="up"):
 
 
 class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
-    async def verify_flow(self, *, history_supported=True, revised=False, team_complete=True, telegram=False):
+    async def verify_flow(self, *, history_supported=True, revised=False, team_complete=True, telegram=False,
+                          symbols=("BTC/USDT",), stale_symbol=None):
         now = time.time()
         initial = release(now)
         updated = release(now + 1800, "r2")
         rows = team_results()
         if not team_complete:
             rows.pop()
-        stats = {"status": "supported" if history_supported else "watch", "reason": "outcome_statistics"}
+        stats = {"status": "supported" if history_supported else "watch", "reason": "outcome_statistics",
+                 "recent_mean_stressed_net_r": 0.1, "day_count": 20}
         plan = {
             "strategy": "trend_v1", "price": 101.0, "stop": 90.0, "tp1": 112.0, "tp2": 123.0,
             "ratio": 1.4, "entry_min": 98.0, "entry_max": 103.0, "quote_observed_at": now,
@@ -110,14 +151,14 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
             steps.append("source")
             return [updated if revised and steps.count("source") > 1 else initial], {"fed": "ok"}
 
-        async def inspect(*_args):
+        async def prepare(_market, symbol, _event_known_at):
             steps.append("chart")
-            return {"setup": {}, "plan": plan, "market": {"move": 0.025}}, ""
+            return {"setup": {"symbol": symbol}, "market": {"move": 0.025, "symbol": symbol}}, ""
 
         def assess(*_args, **kwargs):
             self.assertLessEqual(kwargs["before"], kwargs["as_of"])
             steps.append("math")
-            return stats
+            return {**stats, "lower_stressed_net_r": 0.1 + 0.01 * symbols.index(kwargs["symbol"])}
 
         async def review(_session, evidence, **_kwargs):
             self.assertEqual(evidence["mode"], "live")
@@ -125,21 +166,24 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
             steps.append("agents")
             return rows
 
-        async def refresh(*_args):
+        async def refresh(_market, setup, _budget, _fee_rate):
             steps.append("quote")
+            if setup["symbol"] == stale_symbol:
+                return None, "quote_stale"
             return {**plan, "quote_observed_at": time.time()}, ""
 
         with TemporaryDirectory() as root:
             db = LiveJournal(Path(root) / "live.sqlite3")
-            options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"], budget=300.0, fee_rate=0.001,
-                                      risk_cap=2.0, team=True, concurrency=50, history_file=None)
+            options = SimpleNamespace(venue="okx", symbols=symbols, budget=300.0, fee_rate=0.001, risk_cap=2.0,
+                                      team=True, concurrency=50, history_file=None, portfolio_file=None,
+                                      max_reviews_per_scan=1, allocation_slots=len(symbols))
             publisher = TelegramPublisher(object(), 1234, "owner", db.telegram) if telegram else None
             monitor = LiveMonitor(None, None, db, options, publisher=publisher)
             with (
                 patch("news_live.fetch_official_news", new=AsyncMock(side_effect=sources)),
                 patch("news_live.fetch_discovery_news", new=AsyncMock(return_value=([], {}))),
                 patch("news_live.observe_reaction", new=AsyncMock(return_value=(reaction(), ""))),
-                patch("news_live.inspect_market", new=AsyncMock(side_effect=inspect)),
+                patch("news_live.prepare_candidate", new=AsyncMock(side_effect=prepare)),
                 patch("news_live.assess_recorded_history", side_effect=assess),
                 patch("news_live.analyze_team", new=AsyncMock(side_effect=review)),
                 patch("news_live.refresh_plan", new=AsyncMock(side_effect=refresh)),
@@ -164,7 +208,7 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_signal_requires_ordered_chain_and_keeps_no_paper_positions(self):
         steps, output, report = await self.verify_flow()
-        self.assertEqual(steps, ["source", "chart", "math", "agents", "source", "quote"])
+        self.assertEqual(steps, ["source", "chart", "math", "quote", "agents", "source", "quote"])
         signal = next(item for item in output if item["type"] == "live_signal")
         self.assertEqual(signal["evidence"]["completed_agents"], 50)
         self.assertGreater(signal["plan"]["stressed_loss_usdt"], signal["plan"]["loss"])
@@ -180,16 +224,27 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
         _, _, report = await self.verify_flow(telegram=True)
         self.assertEqual(report["telegram_deliveries"], {"sent": 1})
 
+    async def test_ranks_all_sixteen_pairs_before_requesting_quotes_or_agents(self):
+        symbols = tuple(f"ASSET{index}/USDT" for index in range(16))
+        steps, output, _ = await self.verify_flow(symbols=symbols, stale_symbol=symbols[-1])
+        self.assertEqual(steps[:33], ["source", *(["chart", "math"] * 16)])
+        self.assertEqual(steps[33:], ["quote", "quote", "agents", "source", "quote"])
+        ranking = next(item for item in output if item["type"] == "candidate_ranking")
+        self.assertEqual(ranking["ranked"], 16)
+        self.assertEqual(ranking["top"][0]["symbol"], symbols[-1])
+        alert = next(item for item in output if item["type"] == "live_signal")
+        self.assertEqual(alert["symbol"], symbols[-2])
+
     async def test_release_correction_after_agents_suppresses_signal(self):
         steps, output, report = await self.verify_flow(revised=True, telegram=True)
-        self.assertEqual(steps, ["source", "chart", "math", "agents", "source"])
+        self.assertEqual(steps, ["source", "chart", "math", "quote", "agents", "source"])
         self.assertEqual(output[-1]["reason"], "release_changed_during_review")
         self.assertEqual(report["signals"], {})
         self.assertEqual(report["telegram_deliveries"], {})
 
     async def test_incomplete_team_suppresses_signal(self):
         steps, output, report = await self.verify_flow(team_complete=False)
-        self.assertEqual(steps, ["source", "chart", "math", "agents"])
+        self.assertEqual(steps, ["source", "chart", "math", "quote", "agents"])
         self.assertEqual(output[-1]["reason"], "agent_team_incomplete")
         self.assertEqual(report["signals"], {})
 
@@ -209,7 +264,7 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
                 patch("news_live.fetch_discovery_news",
                       new=AsyncMock(return_value=([media_report], {"bbc_world": "ok"}))),
                 patch("news_live.observe_reaction", new=AsyncMock(return_value=(reaction("down"), ""))),
-                patch("news_live.inspect_market", new=AsyncMock()) as trade_candidate,
+                patch("news_live.prepare_candidate", new=AsyncMock()) as trade_candidate,
                 patch("news_live.emit") as output,
             ):
                 await monitor.scan_once()

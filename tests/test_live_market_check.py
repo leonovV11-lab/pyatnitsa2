@@ -6,7 +6,12 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from live_market_check import inspect_market, observe_reaction, refresh_plan
+from live_market_check import (
+    inspect_market,
+    observe_reaction,
+    prepare_candidate,
+    refresh_plan,
+)
 from market import MarketError, Quote
 
 SYMBOL = "ETH/USDT"
@@ -70,6 +75,30 @@ class LiveMarketTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(plan["ratio"], 1)
         self.assertEqual(plan["valid_until"], NOW + 5)
         json.dumps(result, allow_nan=False)
+
+    async def test_prepare_candidate_returns_closed_candle_evidence_without_requesting_book(self):
+        draft, reason = await prepare_candidate(self.market, SYMBOL, NOW - 500)
+        self.assertEqual(reason, "")
+        assert draft is not None
+        self.assertEqual(set(draft), {"setup", "market"})
+        self.assertEqual(draft["setup"]["snapshot_5m_close"], draft["market"]["latest_closed_at"])
+        self.assertEqual(draft["market"]["direction"], "up")
+        self.assertNotIn("book", draft["market"])
+        self.assertEqual(self.market.quote_calls, 0)
+        json.dumps(draft, allow_nan=False)
+
+        plan, reason = await refresh_plan(self.market, draft["setup"], BUDGET, FEE)
+        self.assertEqual(reason, "")
+        self.assertIsNotNone(plan)
+        self.assertEqual(self.market.quote_calls, 1)
+
+    async def test_prepare_candidate_rejects_decline_without_requesting_book(self):
+        frame = self.market.frames[SYMBOL, "5m"]
+        frame.loc[frame.index[-1], "open"] = frame["close"].iloc[-1] + 0.05
+        draft, reason = await prepare_candidate(self.market, SYMBOL, NOW - 500)
+        self.assertIsNone(draft)
+        self.assertIn("рост", reason)
+        self.assertEqual(self.market.quote_calls, 0)
 
     async def test_requires_a_full_candle_after_knowledge_time(self):
         result, reason = await self.inspect(NOW - 300)

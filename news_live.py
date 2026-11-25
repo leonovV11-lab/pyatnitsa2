@@ -18,7 +18,8 @@ from telegram.error import InvalidToken, TelegramError
 import config
 from live_delivery import TelegramOutbox, TelegramPublisher
 from live_evidence import assess_recorded_history, read_recorded_history
-from live_market_check import inspect_market, observe_reaction, refresh_plan
+from live_market_check import observe_reaction, prepare_candidate, refresh_plan
+from live_portfolio import MAX_PORTFOLIO_AGE_SECONDS, read_portfolio
 from live_telegram import parse_chat_id, verify_chat
 from market import DEFAULT_QUOTE_MAX_AGE, SUPPORTED_EXCHANGES, Market
 from news_agent_team import ROLE_GROUPS, analyze_team
@@ -31,9 +32,12 @@ from news_journal import (
     key,
 )
 from official_news import NewsSource, fetch_official_news
-from strategies import BASELINE
+from strategies import BASELINE, MAX_POSITION_FRACTION
 
 SIGNAL_TTL = 5
+RISK_RESERVATION_SECONDS = 300
+MAX_SYMBOLS = 16
+MAX_REVIEWS_PER_SCAN = 4
 EXTRA_COST_PER_SIDE = 0.001
 DISCOVERY_SOURCES = (
     NewsSource("bbc_world", "BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml",
@@ -97,6 +101,7 @@ class LiveJournal(HeadlineJournal):
                     UNIQUE(event_id, venue, symbol)
                 );
                 CREATE INDEX IF NOT EXISTS live_signals_active ON live_signals(status, expires_at);
+                CREATE INDEX IF NOT EXISTS live_signals_issued ON live_signals(issued_at);
                 CREATE TABLE IF NOT EXISTS market_reactions (
                     event_id TEXT NOT NULL, revision TEXT NOT NULL, venue TEXT NOT NULL, symbol TEXT NOT NULL,
                     closed_at REAL NOT NULL, payload TEXT NOT NULL,
@@ -150,8 +155,46 @@ class LiveJournal(HeadlineJournal):
         """, (event_id, as_of)).fetchone()
         return row["revision"] if row is not None else None
 
+    @staticmethod
+    def capacity_reason(db, symbol, plan, cap, budget, as_of, portfolio):
+        risk = plan.get("stressed_loss_usdt", plan["loss"])
+        cash_needed = plan.get("qty", 0) * plan.get("price", 0) * (1 + plan.get("fee_rate", 0))
+        since = as_of - RISK_RESERVATION_SECONDS
+        open_risk = 0.0
+        cash_available = math.inf if budget is None else budget
+        if portfolio is not None:
+            if not 0 <= as_of - portfolio.observed_at <= MAX_PORTFOLIO_AGE_SECONDS:
+                return "portfolio_snapshot_expired"
+            if symbol in portfolio.open_symbols:
+                return "symbol_already_held"
+            since = max(since, portfolio.observed_at)
+            open_risk = portfolio.stressed_risk_usdt
+            cash_available = min(cash_available, portfolio.available_cash_usdt)
+        reserved = db.execute("""
+            SELECT COALESCE(SUM(risk), 0) AS risk,
+                COALESCE(MAX(symbol=?), 0) AS occupied,
+                COALESCE(SUM(json_extract(payload,'$.plan.qty') * json_extract(payload,'$.plan.price')
+                    * (1 + COALESCE(json_extract(payload,'$.plan.fee_rate'), 0))), 0) AS cash
+            FROM live_signals WHERE issued_at>? AND issued_at<=?
+        """, (symbol, since, as_of)).fetchone()
+        if reserved["occupied"]:
+            return "symbol_already_reserved"
+        if open_risk + reserved["risk"] + risk > cap:
+            return "portfolio_stressed_risk_limit"
+        if reserved["cash"] + cash_needed > cash_available:
+            return "insufficient_unreserved_cash"
+        return ""
+
+    def check_capacity(self, symbol, plan, *, cap, budget, as_of, portfolio):
+        with closing(self.connect()) as db:
+            return self.capacity_reason(db, symbol, plan, cap, budget, as_of, portfolio)
+
+    def has_review(self, review_id):
+        with closing(self.connect()) as db:
+            return db.execute("SELECT 1 FROM news_reviews WHERE review_id=?", (review_id,)).fetchone() is not None
+
     def issue(self, event, venue, symbol, plan, *, cap, as_of, details=None, review_result=None,
-              telegram_route=None):
+              telegram_route=None, budget=None, portfolio=None):
         risk = plan.get("stressed_loss_usdt", plan["loss"])
         quote_time = plan.get("quote_observed_at", as_of)
         if not (math.isfinite(risk) and 0 < risk <= cap and math.isfinite(cap)
@@ -173,12 +216,7 @@ class LiveJournal(HeadlineJournal):
             db.execute("BEGIN IMMEDIATE")
             if self.current_revision(db, event["id"], as_of) != event["revision"]:
                 return None
-            exposure = db.execute("""
-                SELECT COALESCE(SUM(risk), 0) AS risk,
-                    COALESCE(MAX(CASE WHEN venue=? AND symbol=? THEN 1 ELSE 0 END), 0) AS occupied
-                FROM live_signals WHERE status='active' AND expires_at>?
-            """, (venue, symbol, as_of)).fetchone()
-            if exposure["occupied"] or exposure["risk"] + risk > cap:
+            if self.capacity_reason(db, symbol, plan, cap, budget, as_of, portfolio):
                 return None
             result = db.execute("""
                 INSERT OR IGNORE INTO live_signals
@@ -272,6 +310,12 @@ def stressed_loss(plan):
     return plan["loss"] + EXTRA_COST_PER_SIDE * plan["qty"] * (plan["price"] + plan["stop"])
 
 
+def ranking_key(candidate):
+    stats = candidate["stats"]
+    return (-stats["lower_stressed_net_r"], -stats["recent_mean_stressed_net_r"],
+            -stats["day_count"], candidate["symbol"], candidate["event"]["id"])
+
+
 class ScanMarket:
     """Reuse each public candle response within one scan."""
 
@@ -297,6 +341,7 @@ class LiveMonitor:
         self.publisher = publisher
         self.market = Market(public_session, options.venue)
         self.last_decisions = {}
+        self.listed_news = set()
 
     def watch(self, event, symbol, reason, **details):
         identity = event["id"], symbol
@@ -312,15 +357,41 @@ class LiveMonitor:
         for item in items:
             self.journal.observe(item)
         listed = {(item.id, item.revision) for item in items if health.get(item.source) == "ok"}
+        self.listed_news = listed
         for change in self.journal.invalidate(health, time.time(), listed):
             emit(change)
         return items, health, listed
 
+    def portfolio(self):
+        path = self.options.portfolio_file
+        if path is None:
+            return None, ""
+        try:
+            return read_portfolio(path, as_of=time.time()), ""
+        except ValueError:
+            return None, "portfolio_snapshot_unavailable"
+
+    async def current_plan(self, draft, symbol):
+        options = self.options
+        sizing_budget = options.budget * min(1.0, 1.0 / (MAX_POSITION_FRACTION * options.allocation_slots))
+        plan, reason = await refresh_plan(self.market, draft["setup"], sizing_budget, options.fee_rate)
+        if plan is None:
+            return None, None, reason
+        portfolio, reason = self.portfolio()
+        if reason:
+            return None, None, reason
+        plan["stressed_loss_usdt"] = stressed_loss(plan)
+        reason = self.journal.check_capacity(symbol, plan, cap=options.risk_cap, budget=options.budget,
+                                             as_of=time.time(), portfolio=portfolio)
+        return (None, None, reason) if reason else (plan, portfolio, "")
+
     async def review(self, event, symbol, check, stats, review_id):
         options = self.options
+        plan = check["plan"]
+        book = {field: plan.get(field) for field in ("price", "bid", "ask_size", "bid_size", "quote_observed_at")}
         snapshot = {
             "mode": "live", "event": event,
-            "market": {**check["market"], "plan": {field: check["plan"][field] for field in _PUBLIC_PLAN_FIELDS}},
+            "market": {**check["market"], "book": book, "plan": {field: plan[field] for field in _PUBLIC_PLAN_FIELDS}},
             "recorded_results": stats,
         }
         results = await analyze_team(
@@ -336,14 +407,14 @@ class LiveMonitor:
             if (event["id"], event["revision"]) not in still_listed:
                 reason = "release_changed_during_review"
             else:
-                plan, reason = await refresh_plan(self.market, check["setup"], options.budget, options.fee_rate)
+                plan, portfolio, reason = await self.current_plan(check, symbol)
                 if plan is not None:
-                    plan["stressed_loss_usdt"] = stressed_loss(plan)
                     details = {"review_id": review_id, "pnl": stats, "completed_agents": len(results),
                                "reaction_pct": check["market"].get("reaction_pct"),
                                "btc_reaction_pct": check["market"].get("btc_reaction_pct")}
                     alert = self.journal.issue(event, options.venue, symbol, plan, cap=options.risk_cap,
                                                as_of=time.time(), details=details, review_result=review_result,
+                                               budget=options.budget, portfolio=portfolio,
                                                telegram_route=self.publisher.route if self.publisher else None)
                     if alert is None:
                         reason = "alert_expired_duplicate_or_risk_limit"
@@ -354,6 +425,66 @@ class LiveMonitor:
         else:
             self.journal.finish_review(review_id, {**review_result, "reason": reason, "signal_id": None})
             self.watch(event, symbol, reason, pnl=stats)
+
+    async def scan_event(self, market, event, history):
+        options = self.options
+        family, eligible = classify_live_event(event["source"], event["title"])
+        observations = await asyncio.gather(*(
+            observe_reaction(market, symbol, event["known_at"]) for symbol in options.symbols
+        ))
+        candidates = []
+        for symbol, (observation, reason) in zip(options.symbols, observations, strict=True):
+            if observation is None:
+                self.watch(event, symbol, reason, family=family)
+                continue
+            reaction = self.journal.record_reaction(event, options.venue, symbol, family, observation)
+            if reaction:
+                emit(reaction)
+            if not eligible:
+                reason = "topic_unclassified" if family == "uncatalogued" else "market_link_unvalidated"
+                self.watch(event, symbol, reason, family=family)
+                continue
+            if options.budget is None:
+                self.watch(event, symbol, "sizing_parameters_required", family=family)
+                continue
+            draft, reason = await prepare_candidate(market, symbol, event["known_at"])
+            if draft is None:
+                self.watch(event, symbol, reason)
+                continue
+            stats = assess_recorded_history(history, family=family, venue=options.venue, symbol=symbol,
+                                            strategy=BASELINE, as_of=time.time(), before=event["known_at"])
+            if stats["status"] != "supported":
+                self.watch(event, symbol, stats["reason"], pnl=stats)
+                continue
+            candidates.append({"event": event, "symbol": symbol, "draft": draft, "stats": stats})
+        return candidates
+
+    async def review_ranked(self, candidates):
+        options = self.options
+        reviews = 0
+        for candidate in candidates:
+            event, symbol, draft, stats = (
+                candidate[field] for field in ("event", "symbol", "draft", "stats")
+            )
+            if not options.team:
+                self.watch(event, symbol, "agent_team_disabled", pnl=stats)
+                continue
+            if reviews >= options.max_reviews_per_scan:
+                break
+            if (event["id"], event["revision"]) not in self.listed_news:
+                self.watch(event, symbol, "official_release_unavailable")
+                continue
+            review_id = key("live-review", event["id"], event["revision"], options.venue, symbol,
+                            BASELINE, config.TRADE_REVIEW_MODEL)
+            if self.journal.has_review(review_id):
+                continue
+            plan, _, reason = await self.current_plan(draft, symbol)
+            if plan is None:
+                self.watch(event, symbol, reason, pnl=stats)
+                continue
+            if self.journal.claim_review(review_id, event, time.time()):
+                await self.review(event, symbol, {**draft, "plan": plan}, stats, review_id)
+                reviews += 1
 
     async def scan_once(self):
         (items, health, listed), (discovery, discovery_health) = await asyncio.gather(
@@ -375,50 +506,22 @@ class LiveMonitor:
         emit({"type": "scan", "source_health": health, "received": len(items), "recent": len(events),
               "discovery_health": discovery_health, "discovery_candidates": discovered,
               "history_rows": len(history), "sizing_configured": options.budget is not None,
-              "team_enabled": options.team})
+              "team_enabled": options.team, "symbols": len(options.symbols)})
         market = ScanMarket(self.market)
+        candidates = []
         for event in events:
-            family, eligible = classify_live_event(event["source"], event["title"])
             if (event["id"], event["revision"]) not in listed:
                 self.watch(event, None, "official_release_unavailable")
                 continue
-            for symbol in options.symbols:
-                observation, reason = await observe_reaction(market, symbol, event["known_at"])
-                if observation is None:
-                    self.watch(event, symbol, reason, family=family)
-                    continue
-                reaction = self.journal.record_reaction(event, options.venue, symbol, family, observation)
-                if reaction:
-                    emit(reaction)
-                if not eligible:
-                    reason = "topic_unclassified" if family == "uncatalogued" else "market_link_unvalidated"
-                    self.watch(event, symbol, reason, family=family)
-                    continue
-                if options.budget is None:
-                    self.watch(event, symbol, "sizing_parameters_required", family=family)
-                    continue
-                check, reason = await inspect_market(market, symbol, event["known_at"],
-                                                     options.budget, options.fee_rate)
-                if check is None:
-                    self.watch(event, symbol, reason)
-                    continue
-                if stressed_loss(check["plan"]) > options.risk_cap:
-                    self.watch(event, symbol, "scenario_loss_exceeds_alert_limit")
-                    continue
-                stats = assess_recorded_history(history, family=family, venue=options.venue, symbol=symbol,
-                                                strategy=BASELINE, as_of=time.time(), before=event["known_at"])
-                if stats["status"] != "supported":
-                    self.watch(event, symbol, stats["reason"], pnl=stats)
-                    continue
-                if not options.team:
-                    self.watch(event, symbol, "agent_team_disabled", pnl=stats)
-                    continue
-                review_id = key("live-review", event["id"], event["revision"], options.venue, symbol,
-                                BASELINE, config.TRADE_REVIEW_MODEL)
-                if self.journal.claim_review(review_id, event, time.time()):
-                    await self.review(event, symbol, check, stats, review_id)
-                    # Another candidate must use the refreshed source state in the next scan.
-                    return
+            candidates.extend(await self.scan_event(market, event, history))
+        candidates.sort(key=ranking_key)
+        if candidates:
+            emit({"type": "candidate_ranking", "ranked": len(candidates), "top": [
+                {"symbol": row["symbol"], "event_id": row["event"]["id"],
+                 "lower_stressed_net_r": row["stats"]["lower_stressed_net_r"]}
+                for row in candidates[:MAX_SYMBOLS]
+            ]})
+            await self.review_ranked(candidates)
 
 
 async def run_monitor(options, journal, publisher=None):
@@ -474,12 +577,17 @@ def main():
     parser.add_argument("--symbols", nargs="+", default=["BTC/USDT"], metavar="PAIR")
     parser.add_argument("--data-dir", type=Path, default=Path("data/live"))
     parser.add_argument("--history-file", type=Path)
+    parser.add_argument("--portfolio-file", type=Path, help="Снимок свободных USDT и открытых позиций")
     parser.add_argument("--budget", type=float, help="Капитал для расчёта позиции, USDT")
+    parser.add_argument("--allocation-slots", type=int, choices=range(1, MAX_SYMBOLS + 1), default=1, metavar="1..16",
+                        help="На сколько позиций разделить предел капитала при расчёте размера")
     parser.add_argument("--fee-rate", type=float, help="Комиссия биржи за одну сторону, доля")
-    parser.add_argument("--risk-cap", type=float, help="Лимит суммы сценарного риска активных сигналов, USDT")
+    parser.add_argument("--risk-cap", type=float, help="Лимит суммарного сценарного риска, USDT")
     parser.add_argument("--team", action="store_true", help="Подключить 50 агентов к финальной проверке")
     parser.add_argument("--telegram", action="store_true", help="Отправлять сигналы в личный чат BOT_OWNER_ID")
     parser.add_argument("--concurrency", type=int, choices=range(1, 51), default=10, metavar="N")
+    parser.add_argument("--max-reviews-per-scan", type=int, choices=range(1, MAX_REVIEWS_PER_SCAN + 1), default=1,
+                        help="Сколько кандидатов можно передать команде за цикл")
     parser.add_argument("--interval", type=int, default=60, help="Интервал между циклами в секундах")
     options = parser.parse_args()
     if options.telegram_check or (options.telegram and not options.report):
@@ -490,9 +598,9 @@ def main():
         except ValueError:
             parser.error("Для Telegram задайте числовой BOT_OWNER_ID личного чата.")
     if not (options.report or options.telegram_check):
-        if (len(options.symbols) > 4 or len(set(options.symbols)) != len(options.symbols)
+        if (len(options.symbols) > MAX_SYMBOLS or len(set(options.symbols)) != len(options.symbols)
                 or any(not re.fullmatch(r"[A-Z0-9]{1,16}/USDT", pair) for pair in options.symbols)):
-            parser.error("Укажите от одной до четырёх разных спотовых пар формата BTC/USDT.")
+            parser.error(f"Укажите от 1 до {MAX_SYMBOLS} разных спотовых пар формата BTC/USDT.")
         if options.interval < 60:
             parser.error("Интервал должен быть не меньше 60 секунд.")
         sizing = (options.budget, options.fee_rate, options.risk_cap)
@@ -507,6 +615,8 @@ def main():
                 parser.error("Для команды нужны настроенные параметры риска.")
             if not (config.TRADE_REVIEW_KEY and config.TRADE_REVIEW_URL and config.TRADE_REVIEW_MODEL):
                 parser.error("Для команды нужны TRADE_REVIEW_KEY, TRADE_REVIEW_URL и TRADE_REVIEW_MODEL.")
+            if (len(options.symbols) > 4 or options.max_reviews_per_scan > 1) and options.portfolio_file is None:
+                parser.error("Для нескольких сигналов за цикл или более четырёх пар укажите --portfolio-file.")
     if options.report:
         emit(LiveJournal(options.data_dir / "news-live.sqlite3").report())
         return

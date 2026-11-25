@@ -158,8 +158,8 @@ async def observe_reaction(market, symbol, event_known_at) -> tuple[dict | None,
     return (prepared[0], "") if prepared is not None else (None, reason)
 
 
-async def inspect_market(market, symbol, event_known_at, budget, fee_rate) -> tuple[dict | None, str]:
-    """Build a spot entry plan only when the closed-candle evidence supports it."""
+async def prepare_candidate(market, symbol, event_known_at) -> tuple[dict | None, str]:
+    """Filter a candidate using closed candles before sizing it against the book."""
     prepared, reason = await _prepare_reaction(market, symbol, event_known_at)
     if prepared is None:
         return None, reason
@@ -172,11 +172,19 @@ async def inspect_market(market, symbol, event_known_at, budget, fee_rate) -> tu
         return None, "Тренд, режим BTC или оценка стратегии не подтверждают спотовый вход"
 
     setup = {**candidate, "event_known_at": event_known_at, "snapshot_5m_close": observation["latest_closed_at"]}
-    plan, reason = await refresh_plan(market, setup, budget, fee_rate)
+    return {"setup": setup, "market": observation}, ""
+
+
+async def inspect_market(market, symbol, event_known_at, budget, fee_rate) -> tuple[dict | None, str]:
+    """Build a spot entry plan from closed-candle evidence and a fresh order book."""
+    draft, reason = await prepare_candidate(market, symbol, event_known_at)
+    if draft is None:
+        return None, reason
+    plan, reason = await refresh_plan(market, draft["setup"], budget, fee_rate)
     if plan is None:
         return None, reason
     evidence = {
-        **observation,
+        **draft["market"],
         "book": {key: plan[key] for key in ("price", "bid", "ask_size", "bid_size", "quote_observed_at")},
     }
-    return {"setup": setup, "plan": plan, "market": evidence}, ""
+    return {"setup": draft["setup"], "plan": plan, "market": evidence}, ""

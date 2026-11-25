@@ -13,6 +13,7 @@
     "news_journal.py",
     "live_evidence.py",
     "live_market_check.py",
+    "live_portfolio.py",
     "live_telegram.py",
     "live_delivery.py",
     "news_live.py"
