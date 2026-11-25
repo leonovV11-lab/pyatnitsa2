@@ -2,6 +2,7 @@ import time
 import unittest
 from contextlib import closing
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -86,6 +87,68 @@ class LiveSignalTests(unittest.TestCase):
             self.assertIsNotNone(db.issue(event, "okx", "BTC/USDT", {"loss": 7.0}, cap=10, as_of=now))
             self.assertIsNone(db.issue(event, "okx", "ETH/USDT", {"loss": 4.0}, cap=10, as_of=now + 10))
             self.assertIsNotNone(db.issue(event, "okx", "ETH/USDT", {"loss": 4.0}, cap=10, as_of=now + 301))
+
+    def test_daily_risk_charges_confirmed_entry_day_and_survives_closure(self):
+        midnight = datetime(2026, 11, 25, 21, tzinfo=UTC).timestamp()
+        options = {"cap": 1.0, "daily_risk_cap": 0.25, "budget": 100,
+                   "telegram_route": "owner", "reply_required": True}
+        with TemporaryDirectory() as root:
+            db = LiveJournal(Path(root) / "live.sqlite3")
+            event = db.observe(release(midnight - 2))
+            plan = {"loss": 0.20, "qty": 0.1, "price": 30}
+            card = db.issue(event, "okx", "BTC/USDT", plan, as_of=midnight - 2, **options)
+            self.assertIsNotNone(card)
+            self.assertIsNotNone(db.telegram.claim_send("owner", midnight - 2))
+            db.telegram.finish_send(card["id"], DeliveryResult("sent", message_id=50), midnight - 2)
+
+            db = LiveJournal(Path(root) / "live.sqlite3")
+            with patch("live_slots.time.time", return_value=midnight):
+                self.assertEqual(db.slots.respond(card["id"], "enter", route="owner", message_id=50), "entered")
+            with patch("live_slots.time.time", return_value=midnight + 86_400):
+                self.assertEqual(db.slots.respond(card["id"], "enter", route="owner", message_id=50), "unchanged")
+            with patch("live_slots.time.time", return_value=midnight + 1):
+                self.assertEqual(db.slots.respond(card["id"], "close", route="owner", message_id=50), "closed")
+
+            candidate = {**plan, "loss": 0.10}
+            self.assertIsNone(db.issue(event, "okx", "ETH/USDT", candidate, as_of=midnight + 1, **options))
+            reason = db.check_capacity("ETH/USDT", candidate, cap=1.0, budget=100, as_of=midnight + 1,
+                                       portfolio=None, daily_risk_cap=0.25, telegram_route="owner")
+            self.assertEqual(reason, "daily_planned_risk_limit")
+            second_day = midnight + 86_400
+            later = db.observe(replace(release(second_day), id="later-event"))
+            self.assertIsNotNone(db.issue(later, "okx", "ETH/USDT", candidate, as_of=second_day, **options))
+
+    def test_daily_risk_keeps_carried_position_booked_after_closing_today(self):
+        midnight = datetime(2026, 11, 25, 21, tzinfo=UTC).timestamp()
+        options = {"cap": 1.0, "daily_risk_cap": 0.25, "budget": 100,
+                   "telegram_route": "owner", "reply_required": True}
+        with TemporaryDirectory() as root:
+            db = LiveJournal(Path(root) / "live.sqlite3")
+            event = db.observe(release(midnight - 3))
+            plan = {"loss": 0.20, "qty": 0.1, "price": 30}
+            card = db.issue(event, "okx", "BTC/USDT", plan, as_of=midnight - 3, **options)
+            db.telegram.claim_send("owner", midnight - 3)
+            db.telegram.finish_send(card["id"], DeliveryResult("sent", message_id=50), midnight - 3)
+            with patch("live_slots.time.time", return_value=midnight - 2):
+                self.assertEqual(db.slots.respond(card["id"], "enter", route="owner", message_id=50), "entered")
+            with patch("live_slots.time.time", return_value=midnight + 5):
+                self.assertEqual(db.slots.respond(card["id"], "close", route="owner", message_id=50), "closed")
+            self.assertIsNone(db.issue(event, "okx", "ETH/USDT", plan, as_of=midnight + 6, **options))
+
+    def test_daily_risk_releases_a_skipped_card_without_charging_it(self):
+        now = time.time()
+        options = {"cap": 1.0, "daily_risk_cap": 0.25, "budget": 100,
+                   "telegram_route": "owner", "reply_required": True}
+        with TemporaryDirectory() as root:
+            db = LiveJournal(Path(root) / "live.sqlite3")
+            event = db.observe(release(now))
+            plan = {"loss": 0.20, "qty": 0.1, "price": 30}
+            card = db.issue(event, "okx", "BTC/USDT", plan, as_of=now, **options)
+            self.assertIsNotNone(card)
+            db.telegram.claim_send("owner", now)
+            db.telegram.finish_send(card["id"], DeliveryResult("sent", message_id=50), now)
+            self.assertEqual(db.slots.respond(card["id"], "skip", route="owner", message_id=50), "skipped")
+            self.assertIsNotNone(db.issue(event, "okx", "ETH/USDT", plan, as_of=now + 1, **options))
 
     def test_open_positions_and_unallocated_cash_apply_before_issuance(self):
         now = time.time()

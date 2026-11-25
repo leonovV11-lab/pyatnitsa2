@@ -2,6 +2,7 @@
 
 import math
 import sqlite3
+import time
 from collections import Counter
 from collections.abc import Callable
 from contextlib import closing, nullcontext
@@ -56,13 +57,41 @@ class SlotJournal:
                     signal_id TEXT PRIMARY KEY,
                     route TEXT NOT NULL,
                     symbol TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK (state IN ('waiting','entered','skipped','closed'))
+                    state TEXT NOT NULL CHECK (state IN ('waiting','entered','skipped','closed')),
+                    risk_booked_at REAL,
+                    closed_at REAL
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS live_manual_slots_waiting
                     ON live_manual_slots(route) WHERE state='waiting';
                 CREATE UNIQUE INDEX IF NOT EXISTS live_manual_slots_entered
                     ON live_manual_slots(route,symbol) WHERE state='entered';
             """)
+            db.execute("BEGIN IMMEDIATE")
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(live_manual_slots)")}
+            if "risk_booked_at" not in columns:
+                db.execute("ALTER TABLE live_manual_slots ADD COLUMN risk_booked_at REAL")
+                db.execute("ALTER TABLE live_manual_slots ADD COLUMN closed_at REAL")
+                now = time.time()
+                # Legacy acknowledgements did not have dates. Charge them on the migration day.
+                db.execute("""
+                    UPDATE live_manual_slots
+                    SET risk_booked_at=?, closed_at=CASE WHEN state='closed' THEN ? END
+                    WHERE state IN ('entered','closed')
+                """, (now, now))
+            db.execute("""
+                CREATE INDEX IF NOT EXISTS live_manual_slots_day
+                    ON live_manual_slots(route, closed_at, risk_booked_at)
+            """)
+
+    @staticmethod
+    def risk_during_day(db: sqlite3.Connection, route: str, midnight: float) -> float:
+        """Sum planned risk for confirmed positions exposed at any time during the day."""
+        rows = db.execute("""
+            SELECT s.risk FROM live_manual_slots sl JOIN live_signals s ON s.id=sl.signal_id
+            WHERE sl.route=? AND sl.state IN ('entered','closed') AND sl.risk_booked_at IS NOT NULL
+              AND (sl.closed_at IS NULL OR sl.closed_at>=?)
+        """, (route, midnight))
+        return math.fsum(row["risk"] for row in rows)
 
     @staticmethod
     def _waiting(db: sqlite3.Connection, route: str):
@@ -133,7 +162,14 @@ class SlotJournal:
                 return "unchanged"
             if row["state"] != expected:
                 return "invalid"
-            db.execute("UPDATE live_manual_slots SET state=? WHERE signal_id=?", (target, signal_id))
+            now = time.time()
+            db.execute("""
+                UPDATE live_manual_slots
+                SET state=?,
+                    risk_booked_at=CASE WHEN ?='entered' THEN ? ELSE risk_booked_at END,
+                    closed_at=CASE WHEN ?='closed' THEN ? ELSE closed_at END
+                WHERE signal_id=?
+            """, (target, target, now, target, now, signal_id))
             return target
 
     def skip_pending(self, route: str) -> str:

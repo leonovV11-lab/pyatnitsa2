@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from live_slots import SlotJournal
 
@@ -80,6 +81,25 @@ class LiveSlotTests(unittest.TestCase):
         self.assertEqual(self.slots.state("btc", route=OWNER), "entered")
         self.assertFalse(self.queue("other-btc"))
         self.assertTrue(self.queue("eth", "ETH/USDT"))
+
+    def test_migration_books_legacy_entered_and_closed_slots_once(self):
+        for signal_id, symbol in (("one", "BTC/USDT"), ("two", "ETH/USDT")):
+            self.assertTrue(self.queue(signal_id, symbol))
+            self.delivery(signal_id, "sent", message_id=10)
+            self.assertEqual(self.reply(signal_id, "enter"), "entered")
+        self.assertEqual(self.reply("two", "close"), "closed")
+        with closing(self.connect()) as db, db:
+            db.execute("DROP INDEX live_manual_slots_day")
+            db.execute("ALTER TABLE live_manual_slots DROP COLUMN risk_booked_at")
+            db.execute("ALTER TABLE live_manual_slots DROP COLUMN closed_at")
+
+        with patch("live_slots.time.time", return_value=NOW):
+            SlotJournal(self.connect)
+        with patch("live_slots.time.time", return_value=NOW + 86_400):
+            SlotJournal(self.connect)
+        with closing(self.connect()) as db:
+            self.assertEqual(self.slots.risk_during_day(db, OWNER, NOW), 6.5)
+            self.assertEqual(self.slots.risk_during_day(db, OWNER, NOW + 86_400), 3.25)
 
     def test_response_binds_to_real_sent_delivery_route_and_message(self):
         self.assertTrue(self.queue("one"))

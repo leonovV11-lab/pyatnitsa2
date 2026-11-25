@@ -10,6 +10,7 @@ import time
 from collections import Counter
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import aiohttp
@@ -21,9 +22,10 @@ from live_delivery import TelegramOutbox, TelegramPublisher
 from live_evidence import assess_recorded_history, read_recorded_history
 from live_market_check import observe_reaction, prepare_candidate, refresh_plan
 from live_portfolio import MAX_PORTFOLIO_AGE_SECONDS, read_portfolio
+from live_readiness import readiness_report
 from live_reply_worker import check_reply_transport, run_replies
 from live_slots import SlotJournal
-from live_telegram import parse_chat_id, verify_chat
+from live_telegram import MOSCOW_TIME, parse_chat_id, verify_chat
 from market import DEFAULT_QUOTE_MAX_AGE, SUPPORTED_EXCHANGES, Market, MarketError
 from market_evidence import MarketSampler, QuoteEvidenceJournal
 from news_agent_team import ROLE_GROUPS, analyze_team
@@ -164,8 +166,18 @@ class LiveJournal(HeadlineJournal):
         return row["revision"] if row is not None else None
 
     @staticmethod
-    def capacity_reason(db, symbol, plan, cap, budget, as_of, portfolio):
+    def capacity_reason(db, symbol, plan, cap, budget, as_of, portfolio, *,
+                        daily_risk_cap=None, telegram_route=None):
         risk = plan.get("stressed_loss_usdt", plan["loss"])
+        if daily_risk_cap is not None:
+            if telegram_route is None or not math.isfinite(daily_risk_cap) or daily_risk_cap <= 0:
+                return "daily_planned_risk_not_configured"
+            midnight = datetime.fromtimestamp(as_of, MOSCOW_TIME).replace(
+                hour=0, minute=0, second=0, microsecond=0,
+            ).timestamp()
+            used = SlotJournal.risk_during_day(db, telegram_route, midnight)
+            if not math.isfinite(risk) or math.fsum((used, risk)) > daily_risk_cap:
+                return "daily_planned_risk_limit"
         cash_native, cash_usdt = plan_cost(plan)
         quote_asset = symbol.split("/", 1)[1]
         since = as_of - RISK_RESERVATION_SECONDS
@@ -210,18 +222,22 @@ class LiveJournal(HeadlineJournal):
             return "insufficient_unreserved_cash"
         return ""
 
-    def check_capacity(self, symbol, plan, *, cap, budget, as_of, portfolio):
+    def check_capacity(self, symbol, plan, *, cap, budget, as_of, portfolio,
+                       daily_risk_cap=None, telegram_route=None):
         with closing(self.connect()) as db:
-            return self.capacity_reason(db, symbol, plan, cap, budget, as_of, portfolio)
+            return self.capacity_reason(db, symbol, plan, cap, budget, as_of, portfolio,
+                                        daily_risk_cap=daily_risk_cap, telegram_route=telegram_route)
 
     def has_review(self, review_id):
         with closing(self.connect()) as db:
             return db.execute("SELECT 1 FROM news_reviews WHERE review_id=?", (review_id,)).fetchone() is not None
 
     def issue(self, event, venue, symbol, plan, *, cap, as_of, details=None, review_result=None,
-              telegram_route=None, budget=None, portfolio=None, reply_required=False):
+              telegram_route=None, budget=None, portfolio=None, reply_required=False, daily_risk_cap=None):
         risk = plan.get("stressed_loss_usdt", plan["loss"])
         quote_time = plan.get("quote_observed_at", as_of)
+        if daily_risk_cap is not None and not reply_required:
+            return None
         if not (math.isfinite(risk) and 0 < risk <= cap and math.isfinite(cap)
                 and 0 <= as_of - quote_time <= DEFAULT_QUOTE_MAX_AGE):
             return None
@@ -245,7 +261,8 @@ class LiveJournal(HeadlineJournal):
             db.execute("BEGIN IMMEDIATE")
             if self.current_revision(db, event["id"], as_of) != event["revision"]:
                 return None
-            if self.capacity_reason(db, symbol, plan, cap, budget, as_of, portfolio):
+            if self.capacity_reason(db, symbol, plan, cap, budget, as_of, portfolio,
+                                    daily_risk_cap=daily_risk_cap, telegram_route=telegram_route):
                 return None
             result = db.execute("""
                 INSERT OR IGNORE INTO live_signals
@@ -399,7 +416,7 @@ class ScanMarket:
 
 class LiveMonitor:
     def __init__(self, public_session, private_session, journal, options, publisher=None, *,
-                 all_pairs=False, manual_replies=False, collect_market_evidence=False):
+                 all_pairs=False, manual_replies=False, collect_market_evidence=False, daily_risk_cap=None):
         self.public_session = public_session
         self.private_session = private_session
         self.journal = journal
@@ -411,6 +428,7 @@ class LiveMonitor:
         self.sampler = MarketSampler(self.market, journal.market_evidence) if collect_market_evidence else None
         self.all_pairs = all_pairs
         self.manual_replies = manual_replies
+        self.daily_risk_cap = daily_risk_cap
         self.market_cursor = 0
         self.catalog_size = len(options.symbols)
         self.candidate_cache = {}
@@ -491,8 +509,11 @@ class LiveMonitor:
             plan["valid_until"] = min(plan.get("valid_until", math.inf), rate.valid_until)
             if plan["ratio"] < MIN_NET_PAYOFF:
                 return None, None, "quote_conversion_reduces_net_payoff"
-        reason = self.journal.check_capacity(symbol, plan, cap=options.risk_cap, budget=options.budget,
-                                             as_of=time.time(), portfolio=portfolio)
+        reason = self.journal.check_capacity(
+            symbol, plan, cap=options.risk_cap, budget=options.budget, as_of=time.time(), portfolio=portfolio,
+            daily_risk_cap=self.daily_risk_cap,
+            telegram_route=self.publisher.route if self.publisher else None,
+        )
         return (None, None, reason) if reason else (plan, portfolio, "")
 
     async def review(self, event, symbol, check, stats, review_id):
@@ -527,6 +548,7 @@ class LiveMonitor:
                                                as_of=time.time(), details=details, review_result=review_result,
                                                budget=options.budget, portfolio=portfolio,
                                                reply_required=self.manual_replies,
+                                               daily_risk_cap=self.daily_risk_cap,
                                                telegram_route=self.publisher.route if self.publisher else None)
                     if alert is None:
                         reason = "alert_expired_duplicate_or_risk_limit"
@@ -644,7 +666,8 @@ class LiveMonitor:
               "discovery_health": discovery_health, "discovery_candidates": discovered,
               "history_rows": len(history), "sizing_configured": options.budget is not None,
               "team_enabled": options.team, "symbols": len(symbols), "catalog_size": self.catalog_size,
-              "collecting_market_evidence": self.sampler is not None})
+              "collecting_market_evidence": self.sampler is not None,
+              "daily_risk_configured": self.daily_risk_cap is not None})
         market = ScanMarket(self.market)
         candidates = []
         for event in events:
@@ -679,7 +702,8 @@ async def run_monitor(options, journal, publisher=None):
     async with aiohttp.ClientSession(trust_env=True) as public, aiohttp.ClientSession() as private:
         monitor = LiveMonitor(public, private, journal, options, publisher=publisher,
                               all_pairs=options.all_pairs, manual_replies=options.manual_replies,
-                              collect_market_evidence=options.collect_market_evidence)
+                              collect_market_evidence=options.collect_market_evidence,
+                              daily_risk_cap=options.daily_risk_cap)
         if options.once:
             await monitor.scan_once()
             if monitor.sampler is not None:
@@ -758,6 +782,8 @@ def main():
                         help="На сколько позиций разделить предел капитала при расчёте размера")
     parser.add_argument("--fee-rate", type=float, help="Комиссия биржи за одну сторону, доля")
     parser.add_argument("--risk-cap", type=float, help="Лимит суммарного сценарного риска, USDT")
+    parser.add_argument("--daily-risk-cap", type=float,
+                        help="Дневной лимит расчётного риска ручных сделок, по умолчанию --risk-cap")
     parser.add_argument("--team", action="store_true", help="Подключить 50 агентов к финальной проверке")
     parser.add_argument("--telegram", action="store_true", help="Отправлять сигналы в личный чат BOT_OWNER_ID")
     parser.add_argument("--manual-replies", action="store_true",
@@ -769,6 +795,8 @@ def main():
                         help="Сколько кандидатов можно передать команде за цикл")
     parser.add_argument("--interval", type=int, default=60, help="Интервал между циклами в секундах")
     options = parser.parse_args()
+    if options.manual_replies and options.daily_risk_cap is None:
+        options.daily_risk_cap = options.risk_cap
     if options.telegram_check or (options.telegram and not options.report):
         if not config.TELEGRAM_TOKEN.strip():
             parser.error("Для Telegram задайте TELEGRAM_TOKEN.")
@@ -791,6 +819,11 @@ def main():
             and 0 < options.risk_cap <= options.budget
         ):
             parser.error("Укажите капитал, комиссию за сторону и лимит риска одновременно.")
+        if options.daily_risk_cap is not None and not (
+            options.manual_replies and options.budget is not None and math.isfinite(options.daily_risk_cap)
+            and 0 < options.daily_risk_cap <= options.budget
+        ):
+            parser.error("Для дневного лимита нужны ручные ответы и положительный лимит в пределах капитала.")
         if options.team:
             if options.budget is None:
                 parser.error("Для команды нужны настроенные параметры риска.")
@@ -800,7 +833,9 @@ def main():
                     or options.max_reviews_per_scan > 1) and options.portfolio_file is None:
                 parser.error("Для каталога, очереди подтверждений или нескольких сигналов укажите --portfolio-file.")
     if options.report:
-        emit(LiveJournal(options.data_dir / "news-live.sqlite3").report())
+        report = LiveJournal(options.data_dir / "news-live.sqlite3").report()
+        report["trade_readiness"] = readiness_report(options, as_of=time.time())
+        emit(report)
         return
     journal = None if options.telegram_check else LiveJournal(options.data_dir / "news-live.sqlite3")
     try:
