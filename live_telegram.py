@@ -222,8 +222,11 @@ def _render(signal: dict, reason: str | None = None) -> tuple[str, float]:
     if stress < loss:
         raise ValueError("Invalid stressed risk")
     market_label = f"{symbol} · {venue.upper()}"
+    evidence = signal.get("evidence")
+    first_trade = isinstance(evidence, dict) and evidence.get("mode") == "first_trade"
     if reason is None:
-        lines = [f"Пятница 2 · Покупка на споте · {market_label}"]
+        mode = "Первые сделки · Спот" if first_trade else "Покупка на споте"
+        lines = [f"Пятница 2 · {mode} · {market_label}"]
     else:
         status = UPDATE_TEXT.get(reason, "ОТМЕНЁН. Сигнал больше не действует.")
         lines = [
@@ -231,27 +234,52 @@ def _render(signal: dict, reason: str | None = None) -> tuple[str, float]:
             f"Статус: {status}",
             "Историческая котировка и параметры на момент публикации.",
         ]
-    lines += ["", f"Вход по снимку рынка: {_decimal_text(entry)} {quote_asset}"]
+    entry_label = "Цена лимитной покупки, максимум" if first_trade else "Вход по снимку рынка"
+    lines += ["", f"{entry_label}: {_decimal_text(entry)} {quote_asset}"]
     if "entry_min" in plan or "entry_max" in plan:
         entry_min = _positive(plan.get("entry_min"))
         entry_max = _positive(plan.get("entry_max"))
         if not entry_min <= entry <= entry_max <= tp1:
             raise ValueError("Invalid entry range")
         lines.append(f"Диапазон входа: {_decimal_text(entry_min)}–{_decimal_text(entry_max)} {quote_asset}")
+    lines.append(f"Стоп: {_decimal_text(stop)} {quote_asset}")
+    if first_trade:
+        exit_qty = _positive(plan.get("exit_qty"))
+        fee = _positive(plan.get("fee_rate")) if plan.get("fee_rate") != 0 else 0.0
+        if exit_qty > qty or fee >= 0.05 or tp1 != tp2:
+            raise ValueError("Invalid first trade plan")
+        cash = qty * entry * (1 + fee)
+        lines += [
+            f"Цель: {_decimal_text(tp1)} {quote_asset} для всей позиции",
+            f"Покупка: {_decimal_text(qty)} {asset} · До {_decimal_text(cash, 6)} USDT с комиссией",
+            f"Расчётный объём выхода: {_decimal_text(exit_qty)} {asset} при полном исполнении",
+            f"Комиссия в расчёте: {fee:.2%} за сторону.",
+        ]
+    else:
+        lines += [
+            f"Цель 1: {_decimal_text(tp1)} {quote_asset} · Цель 2: {_decimal_text(tp2)} {quote_asset}",
+            f"Объём: {_decimal_text(qty)} {asset}",
+        ]
+    reward_label = "Расчёт при достижении цели" if first_trade else "Расчёт при обеих целях"
     lines += [
-        f"Стоп: {_decimal_text(stop)} {quote_asset}",
-        f"Цель 1: {_decimal_text(tp1)} {quote_asset} · Цель 2: {_decimal_text(tp2)} {quote_asset}",
-        f"Объём: {_decimal_text(qty)} {asset}",
         f"Риск по плану: {_decimal_text(loss, 6)} USDT · При росте издержек: {_decimal_text(stress, 6)} USDT",
-        f"Расчёт при обеих целях: {_decimal_text(reward, 6)} USDT · {_decimal_text(ratio, 4)} R",
+        f"{reward_label}: {_decimal_text(reward, 6)} USDT · {_decimal_text(ratio, 4)} R",
     ]
-    if evidence := _evidence_lines(signal.get("evidence")):
-        lines += ["", *evidence]
+    if evidence_lines := _evidence_lines(evidence):
+        lines += ["", *evidence_lines]
     if reason is None:
         lines += [
             "", f"Действует до {local_expiry} МСК.",
-            "Если цена изменилась или срок истёк, котировка историческая и сигнал устарел.",
         ]
+        if first_trade:
+            lines += [
+                "Доходность стратегии пока не подтверждена.",
+                ("Проверь свободные USDT, стакан и комиссию OKX. Пропусти вход, если цена покупки вышла из "
+                 "диапазона, цена продажи достигла стопа, комиссия выше расчётной или время истекло."),
+                "Входи лимитной заявкой FOK. После исполнения поставь стоп на купленный объём.",
+            ]
+        else:
+            lines.append("Если цена изменилась или срок истёк, котировка историческая и сигнал устарел.")
     else:
         lines += ["", f"Срок действия сигнала: до {local_expiry} МСК."]
     if signal.get("reply_required") is True:

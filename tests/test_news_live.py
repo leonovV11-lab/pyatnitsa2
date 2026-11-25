@@ -87,6 +87,26 @@ class LiveSignalTests(unittest.TestCase):
             self.assertIsNone(db.issue(event, "okx", "ETH/USDT", {"loss": 4.0}, cap=10, as_of=now + 10))
             self.assertIsNotNone(db.issue(event, "okx", "ETH/USDT", {"loss": 4.0}, cap=10, as_of=now + 301))
 
+    def test_first_trade_reserves_one_position_atomically_and_requires_time_to_reply(self):
+        now = time.time()
+        options = {"cap": 0.6, "budget": 60, "telegram_route": "owner", "reply_required": True, "first_trade": True}
+        plan = {"loss": 0.2, "qty": 0.1, "price": 100, "valid_until": now + 4,
+                "quote_observed_at": now, "entry_deadline": now + 59}
+        with TemporaryDirectory() as root:
+            db = LiveJournal(Path(root) / "live.sqlite3")
+            event = db.observe(release(now))
+            self.assertIsNone(db.issue(event, "okx", "BTC/USDT", {**plan, "entry_deadline": now + 10},
+                                       as_of=now, **options))
+            self.assertIsNone(db.issue(event, "okx", "BTC/USDT", plan, as_of=now + 5, **options))
+            alert = db.issue(event, "okx", "BTC/USDT", plan, as_of=now, **options)
+            self.assertIsNotNone(alert)
+            self.assertIsNotNone(db.telegram.claim_send("owner", now))
+            db.telegram.finish_send(alert["id"], DeliveryResult("sent", message_id=35), now)
+            self.assertEqual(db.slots.respond(alert["id"], "enter", route="owner", message_id=35), "entered")
+            self.assertIsNone(db.issue(event, "okx", "ETH/USDT", plan, as_of=now, **options))
+            self.assertEqual(db.slots.respond(alert["id"], "close", route="owner", message_id=35), "closed")
+            self.assertIsNotNone(db.issue(event, "okx", "ETH/USDT", plan, as_of=now, **options))
+
     def test_open_positions_and_unallocated_cash_apply_before_issuance(self):
         now = time.time()
         with TemporaryDirectory() as root:
@@ -131,14 +151,15 @@ def reaction(direction="up"):
 
 class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
     async def verify_flow(self, *, history_supported=True, revised=False, team_complete=True, telegram=False,
-                          symbols=("BTC/USDT",), stale_symbol=None, manual_replies=False):
+                          symbols=("BTC/USDT",), stale_symbol=None, manual_replies=False, first_trade=False):
         now = time.time()
         initial = release(now)
         updated = release(now + 1800, "r2")
         rows = team_results()
         if not team_complete:
             rows.pop()
-        stats = {"status": "supported" if history_supported else "watch", "reason": "outcome_statistics",
+        stats = {"status": "supported" if history_supported else "watch",
+                 "reason": "insufficient_history" if first_trade else "outcome_statistics",
                  "recent_mean_stressed_net_r": 0.1, "day_count": 20}
         plan = {
             "strategy": "trend_v1", "price": 101.0, "stop": 90.0, "tp1": 112.0, "tp2": 123.0,
@@ -170,16 +191,23 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
             steps.append("quote")
             if setup["symbol"] == stale_symbol:
                 return None, "quote_stale"
-            return {**plan, "quote_observed_at": time.time()}, ""
+            quote_time = time.time()
+            return {**plan, "quote_observed_at": quote_time, "valid_until": quote_time + 5,
+                    "entry_deadline": quote_time + 60}, ""
+
+        async def refresh_first(_market, setup, budget, fee_rate, _risk_cap):
+            return await refresh(_market, setup, budget, fee_rate)
 
         with TemporaryDirectory() as root:
             db = LiveJournal(Path(root) / "live.sqlite3")
-            options = SimpleNamespace(venue="okx", symbols=symbols, budget=300.0, fee_rate=0.001, risk_cap=2.0,
-                                      team=True, concurrency=50, history_file=None, portfolio_file=None,
+            options = SimpleNamespace(venue="okx", symbols=symbols, budget=60.0 if first_trade else 300.0,
+                                      fee_rate=0.001, risk_cap=2.0, team=not first_trade, concurrency=50,
+                                      history_file=None, portfolio_file=None,
                                       max_reviews_per_scan=2 if manual_replies else 1, allocation_slots=len(symbols))
             publisher = TelegramPublisher(object(), 1234, "owner", db.telegram,
                                           slots=db.slots if manual_replies else None) if telegram else None
-            monitor = LiveMonitor(None, None, db, options, publisher=publisher, manual_replies=manual_replies)
+            pilot = {"first_trade": True} if first_trade else {}
+            monitor = LiveMonitor(None, None, db, options, publisher=publisher, manual_replies=manual_replies, **pilot)
             with (
                 patch("news_live.fetch_official_news", new=AsyncMock(side_effect=sources)),
                 patch("news_live.fetch_discovery_news", new=AsyncMock(return_value=([], {}))),
@@ -188,15 +216,16 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
                 patch("news_live.assess_recorded_history", side_effect=assess),
                 patch("news_live.analyze_team", new=AsyncMock(side_effect=review)),
                 patch("news_live.refresh_plan", new=AsyncMock(side_effect=refresh)),
+                patch("news_live.refresh_first_trade_plan", new=AsyncMock(side_effect=refresh_first), create=True),
                 patch("live_delivery.send_signal",
                       new=AsyncMock(return_value=DeliveryResult("sent", message_id=42))) as send,
                 patch("live_delivery.emit"),
                 patch("news_live.emit") as output,
             ):
                 await monitor.scan_once()
-                if manual_replies:
+                if manual_replies and not revised:
                     await monitor.scan_once()
-            if telegram and history_supported and not revised and team_complete:
+            if telegram and (history_supported or first_trade) and not revised and team_complete:
                 send.assert_awaited_once()
                 self.assertEqual(send.await_args.args[1], 1234)
             else:
@@ -223,6 +252,25 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
         steps, output, _ = await self.verify_flow(history_supported=False)
         self.assertEqual(steps, ["source", "chart", "math"])
         self.assertEqual(output[-1]["type"], "watch")
+
+    async def test_first_trade_can_reach_telegram_without_history_or_models(self):
+        steps, output, report = await self.verify_flow(history_supported=False, telegram=True,
+                                                       manual_replies=True, first_trade=True)
+        self.assertNotIn("agents", steps)
+        self.assertEqual(steps.count("quote"), 1)
+        signal = next(item for item in output if item["type"] == "live_signal")
+        self.assertEqual(signal["evidence"]["mode"], "first_trade")
+        self.assertTrue(signal["reply_required"])
+        self.assertGreater(signal["expires_at"] - signal["issued_at"], 30)
+        self.assertEqual(report["telegram_deliveries"], {"sent": 1})
+        self.assertEqual(report["finished_reviews"], 0)
+
+    async def test_first_trade_rechecks_the_official_release(self):
+        steps, output, report = await self.verify_flow(history_supported=False, revised=True, telegram=True,
+                                                       manual_replies=True, first_trade=True)
+        self.assertNotIn("quote", steps)
+        self.assertFalse(any(item["type"] == "live_signal" for item in output))
+        self.assertEqual(report["telegram_deliveries"], {})
 
     async def test_reviewed_signal_is_delivered_to_telegram(self):
         _, _, report = await self.verify_flow(telegram=True)

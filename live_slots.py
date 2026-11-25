@@ -79,22 +79,26 @@ class SlotJournal:
         return {row["symbol"] for row in rows}
 
     def capacity(
-        self, route: str, external_symbols: frozenset[str] = frozenset(), *, db: sqlite3.Connection | None = None,
+        self, route: str, external_symbols: frozenset[str] = frozenset(), *,
+        db: sqlite3.Connection | None = None, max_positions: int = MAX_POSITIONS,
     ) -> str:
         """Return the current reason to postpone sending a new signal, or an empty string."""
         with (closing(self.connect()) if db is None else nullcontext(db)) as connection:
             waiting = self._waiting(connection, route)
             if waiting is not None and not _known_undelivered(waiting):
                 return "waiting_for_reply"
-            if len(self._held_symbols(connection, route) | external_symbols) >= MAX_POSITIONS:
+            if len(self._held_symbols(connection, route) | external_symbols) >= max_positions:
                 return "position_limit_reached"
         return ""
 
     def reserve(
-        self, db: sqlite3.Connection, signal_id: str, route: str, *, external_symbols: frozenset[str] = frozenset(),
+        self, db: sqlite3.Connection, signal_id: str, route: str, *,
+        external_symbols: frozenset[str] = frozenset(), max_positions: int = MAX_POSITIONS,
     ) -> bool:
         """Reserve and reconcile a slot inside the caller's BEGIN IMMEDIATE transaction."""
-        if not (db.in_transaction and signal_id and route) or self.capacity(route, external_symbols, db=db):
+        if not (db.in_transaction and signal_id and route) or self.capacity(
+            route, external_symbols, db=db, max_positions=max_positions,
+        ):
             return False
         signal = db.execute("SELECT symbol FROM live_signals WHERE id=? AND status='active'", (signal_id,)).fetchone()
         if signal is None or signal["symbol"] in (self._held_symbols(db, route) | external_symbols):

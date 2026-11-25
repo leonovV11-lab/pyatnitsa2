@@ -113,6 +113,18 @@ class LiveTelegramTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(expected, text)
         self.assertNotIn("\u202e", text)
 
+    async def test_first_trade_delivery_shows_limit_time_fee_and_manual_confirmation(self):
+        alert = signal()
+        alert.update(evidence={"mode": "first_trade"}, reply_required=True)
+        alert["plan"].update(tp2=alert["plan"]["tp1"], exit_qty=0.000798, fee_rate=0.002)
+        self.assertEqual((await send_signal(self.bot, CHAT_ID, alert)).status, "sent")
+        payload = self.bot.send_message.await_args.kwargs
+        for expected in ("Первые сделки", "Цена лимитной покупки, максимум", "0.20%", "FOK", "0.000798",
+                         "Доходность стратегии пока не подтверждена"):
+            self.assertIn(expected, payload["text"])
+        self.assertEqual([button.text for button in payload["reply_markup"].inline_keyboard[0]],
+                         ["Вошёл", "Пропуск"])
+
     async def test_stale_signal_and_bad_fields_never_touch_transport(self):
         stale = signal()
         stale["expires_at"] = NOW

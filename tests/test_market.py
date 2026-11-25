@@ -2,9 +2,10 @@ import asyncio
 import json
 import time
 import unittest
+from decimal import Decimal
 from unittest.mock import patch
 
-from market import Market, MarketError
+from market import Market, MarketError, prepare_spot_quantity
 
 
 class Response:
@@ -124,6 +125,36 @@ class MarketTests(unittest.IsolatedAsyncioTestCase):
             await market.quote("XRP/EUR")
         self.assertEqual([url.rsplit("/", 1)[1] for url, _ in session.requests], ["instruments", "tickers"])
         self.assertEqual(session.requests[0][1]["params"], {"instType": "SPOT"})
+
+    async def test_okx_order_rules_reuse_live_spot_catalog_and_keep_exact_decimals(self):
+        rules = {"minSz": "0.00001", "lotSz": "0.00000001", "tickSz": "0.1"}
+        session = Session(Response({"code": "0", "data": [
+            {**okx_instrument("BTC", "USDT"), **rules},
+            {**okx_instrument("ETH", "USDT", state="suspend"), **rules},
+            {**okx_instrument("SOL", "USDT"), **rules, "tickSz": "NaN"},
+            {**okx_instrument("XRP", "USDT"), **rules, "instId": "XRP-USDT-SWAP"},
+        ]}))
+        market = Market(session, "okx", all_spot=True)
+        self.assertEqual(await market.spot_symbols(), ("BTC/USDT", "SOL/USDT"))
+        btc = await market.spot_order_rules("BTC/USDT")
+        self.assertEqual((btc.min_size, btc.lot_size, btc.tick_size),
+                         (Decimal("0.00001"), Decimal("0.00000001"), Decimal("0.1")))
+        for symbol in ("ETH/USDT", "SOL/USDT", "XRP/USDT"):
+            with self.subTest(symbol=symbol), self.assertRaises(MarketError):
+                await market.spot_order_rules(symbol)
+        self.assertEqual(len(session.requests), 1)
+
+    async def test_order_quantity_respects_step_and_minimum_sellable_after_fee(self):
+        session = Session(Response({"code": "0", "data": [
+            {**okx_instrument("BTC", "USDT"), "minSz": "0.1", "lotSz": "0.05", "tickSz": "0.01"},
+        ]}))
+        rules = await Market(session, "okx").spot_order_rules("BTC/USDT")
+        self.assertEqual(prepare_spot_quantity(rules, 0.199, 0.001), 0.15)
+        self.assertEqual(prepare_spot_quantity(rules, 0.1, 0), 0.1)
+        self.assertIsNone(prepare_spot_quantity(rules, 0.149, 0.001))
+        self.assertIsNone(prepare_spot_quantity(rules, 0.06, 0))
+        self.assertIsNone(prepare_spot_quantity(rules, float("nan"), 0))
+        self.assertIsNone(prepare_spot_quantity(rules, 0.2, 1))
 
     async def test_binance_all_spot_uses_listed_base_quote_mapping(self):
         unicode_pair = "币安人生/USDC"

@@ -3,17 +3,25 @@
 import asyncio
 import math
 import time
+from decimal import ROUND_CEILING, Decimal, DecimalException, localcontext
 
 from pandas import DataFrame
 
-from market import DEFAULT_QUOTE_MAX_AGE, MarketError
-from strategies import BASELINE, build_plan, candidate_setups, is_bullish
+from market import DEFAULT_QUOTE_MAX_AGE, MarketError, prepare_spot_quantity
+from strategies import (
+    BASELINE,
+    MIN_NET_PAYOFF,
+    build_plan,
+    candidate_setups,
+    is_bullish,
+)
 
 FIVE_MINUTES = 5 * 60
 FIFTEEN_MINUTES = 15 * 60
 MAX_EVENT_AGE = 90 * 60
 HISTORY_LENGTH = 50
 EVIDENCE_LENGTH = 18
+EXTRA_COST_PER_SIDE = 0.001
 
 
 def _latest_close(now, interval):
@@ -75,6 +83,60 @@ async def refresh_plan(market, setup, budget, fee_rate) -> tuple[dict | None, st
             setup["snapshot_5m_close"] + FIVE_MINUTES,
             setup["event_known_at"] + MAX_EVENT_AGE,
         ),
+    }, ""
+
+
+async def refresh_first_trade_plan(market, setup, budget, fee_rate, risk_cap) -> tuple[dict | None, str]:
+    """Fit a single limit entry and exit to the current OKX spot instrument."""
+    if market.exchange != "okx" or not setup["symbol"].endswith("/USDT"):
+        return None, "Для первых сделок доступны спотовые пары OKX с расчётом в USDT"
+    try:
+        rules = await market.spot_order_rules(setup["symbol"])
+    except MarketError:
+        return None, "Нет подтверждённых шагов и минимума заявки OKX"
+    plan, reason = await refresh_plan(market, setup, budget, fee_rate)
+    if plan is None:
+        return None, reason
+
+    try:
+        with localcontext() as context:
+            context.prec = 64
+            tick, lot = rules.tick_size, rules.lot_size
+            entry = Decimal(str(plan["price"]))
+            lower = (Decimal(str(plan["entry_min"])) / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+            stop = (Decimal(str(plan["stop"])) // tick) * tick
+            target = ((Decimal(str(plan["tp1"])) + Decimal(str(plan["tp2"]))) / 2 // tick) * tick
+            if entry % tick or lower > entry or not 0 < stop < entry < target:
+                return None, "Цены не укладываются в шаг заявки OKX"
+            fee = Decimal(str(fee_rate))
+            stress = Decimal(str(EXTRA_COST_PER_SIDE))
+            cap = Decimal(str(risk_cap))
+            exit_value = stop * (1 - fee - stress)
+            loss_per_unit = entry * (1 + stress) - (1 - fee) * exit_value
+            # Allow for a sub-lot remainder when the buy fee is withheld in the base asset.
+            max_quantity = float((cap - lot * exit_value) / loss_per_unit)
+            quantity = prepare_spot_quantity(rules, min(plan["qty"], max_quantity), fee_rate)
+            if quantity is None:
+                return None, "Объём ниже торгового минимума OKX с учётом комиссии и лимита риска"
+            size = Decimal(str(quantity))
+            sellable = (size * (1 - fee) // lot) * lot
+            loss = size * entry - sellable * stop * (1 - fee)
+            reward = sellable * target * (1 - fee) - size * entry
+            stressed = loss + stress * (size * entry + sellable * stop)
+            stressed_reward = reward - stress * (size * entry + sellable * target)
+            if not 0 < stressed <= cap or stressed_reward < Decimal(str(MIN_NET_PAYOFF)) * stressed:
+                return None, "Соотношение цели и риска после округления и повышенных издержек ниже лимита"
+            ratio = reward / loss
+    except (DecimalException, OverflowError):
+        return None, "Параметры заявки OKX вне допустимого диапазона"
+
+    return {
+        **plan, "stop": float(stop), "tp1": float(target), "tp2": float(target),
+        "entry_min": float(lower), "entry_max": float(entry), "qty": quantity, "exit_qty": float(sellable),
+        "loss": float(loss), "reward": float(reward), "ratio": float(ratio),
+        "stressed_loss_usdt": float(stressed),
+        "entry_deadline": min(setup["snapshot_5m_close"] + FIVE_MINUTES,
+                              setup["event_known_at"] + MAX_EVENT_AGE),
     }, ""
 
 

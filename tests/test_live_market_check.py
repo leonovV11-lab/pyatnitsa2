@@ -2,6 +2,7 @@ import json
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from unittest.mock import patch
 
 import pandas as pd
@@ -10,9 +11,10 @@ from live_market_check import (
     inspect_market,
     observe_reaction,
     prepare_candidate,
+    refresh_first_trade_plan,
     refresh_plan,
 )
-from market import MarketError, Quote
+from market import MarketError, Quote, SpotOrderRules
 
 SYMBOL = "ETH/USDT"
 NOW = datetime(2026, 1, 1, 12, 1, tzinfo=UTC).timestamp()
@@ -44,6 +46,12 @@ class BookFixture:
         }
         self.book = Quote(SYMBOL, self.exchange, 104.90, 104.91, 20, 20, NOW)
         self.quote_calls = 0
+        self.order_rules = SpotOrderRules(Decimal("0.01"), Decimal("0.001"), Decimal("0.1"))
+
+    async def spot_order_rules(self, symbol):
+        if symbol != self.book.symbol:
+            raise MarketError("Unknown symbol")
+        return self.order_rules
 
     async def candles(self, symbol, timeframe, limit):
         return self.frames[symbol, timeframe].tail(limit)
@@ -62,6 +70,26 @@ class LiveMarketTests(unittest.IsolatedAsyncioTestCase):
 
     async def inspect(self, known_at=NOW - 500):
         return await inspect_market(self.market, SYMBOL, known_at, BUDGET, FEE)
+
+    async def test_first_trade_plan_sizes_to_60_usdt_budget_and_okx_steps(self):
+        setup = {"symbol": SYMBOL, "strategy": "trend_v1", "score": 85, "reference": 100, "atr": 2.0,
+                 "stop": 97.99, "tp1": 101.98, "tp2": 106.19,
+                 "snapshot_5m_close": NOW // 300 * 300, "event_known_at": NOW - 600}
+        self.market.book = Quote(SYMBOL, "okx", 99.45, 99.5, 20, 20, NOW)
+        plan, reason = await refresh_first_trade_plan(self.market, setup, 60, 0.002, 0.6)
+        self.assertEqual(reason, "")
+        assert plan is not None
+        self.assertEqual((plan["price"], plan["stop"], plan["tp1"], plan["tp2"]), (99.5, 97.9, 104.0, 104.0))
+        self.assertEqual(plan["qty"], 0.120)
+        self.assertEqual(plan["exit_qty"], 0.119)
+        self.assertLessEqual(plan["qty"] * plan["price"] * 1.002, 12)
+        self.assertLessEqual(plan["stressed_loss_usdt"], 0.6)
+        self.assertLess(plan["valid_until"], plan["entry_deadline"])
+
+        self.market.order_rules = replace(self.market.order_rules, min_size=Decimal("0.12"))
+        plan, reason = await refresh_first_trade_plan(self.market, setup, 60, 0.002, 0.6)
+        self.assertIsNone(plan)
+        self.assertIn("минимума OKX", reason)
 
     async def test_snapshot_uses_completed_post_event_bars_and_fee_adjusted_plan(self):
         result, reason = await self.inspect()

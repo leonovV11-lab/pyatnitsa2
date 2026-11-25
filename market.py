@@ -7,6 +7,7 @@ import math
 import re
 import time
 from dataclasses import dataclass
+from decimal import Decimal, DecimalException, localcontext
 from itertools import pairwise
 
 import aiohttp
@@ -17,6 +18,7 @@ DEFAULT_QUOTE_MAX_AGE = 5.0
 _ENDPOINTS = {"binance": "https://data-api.binance.vision", "okx": "https://www.okx.com"}
 _INTERVALS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
 _SYMBOL = re.compile(r"[A-Z0-9]+/USDT")
+_ORDER_RULE_NUMBER = re.compile(r"[0-9]{1,20}(?:\.[0-9]{1,20})?")
 _OKX_CATALOG_PATH = "/api/v5/public/instruments"
 _BINANCE_CATALOG_PATH = "/api/v3/exchangeInfo"
 _MAX_CATALOG_BYTES = 8 * 1024 * 1024
@@ -42,6 +44,43 @@ class Quote:
 
     def is_fresh(self, max_age=DEFAULT_QUOTE_MAX_AGE):
         return 0 <= time.time() - self.observed_at <= max_age
+
+
+@dataclass(frozen=True, slots=True)
+class SpotOrderRules:
+    min_size: Decimal
+    lot_size: Decimal
+    tick_size: Decimal
+
+
+def _okx_order_rules(row: dict) -> SpotOrderRules | None:
+    values = []
+    for field in ("minSz", "lotSz", "tickSz"):
+        value = row.get(field)
+        if not isinstance(value, str) or not _ORDER_RULE_NUMBER.fullmatch(value):
+            return None
+        values.append(Decimal(value))
+    return SpotOrderRules(*values) if min(values) > 0 else None
+
+
+def prepare_spot_quantity(rules: SpotOrderRules, qty: float, fee_rate: float) -> float | None:
+    """Round down to a tradable buy size and check the exit after a base-denominated fee."""
+    if isinstance(qty, bool) or isinstance(fee_rate, bool):
+        return None
+    if not (math.isfinite(qty) and qty > 0 and 0 <= fee_rate < 1):
+        return None
+    try:
+        with localcontext() as context:
+            context.prec = 64
+            rounded = (Decimal(str(qty)) // rules.lot_size) * rules.lot_size
+            net = rounded * (1 - Decimal(str(fee_rate)))
+            sellable = (net // rules.lot_size) * rules.lot_size
+    except DecimalException:
+        return None
+    if sellable < rules.min_size:
+        return None
+    result = float(rounded)
+    return result if Decimal(str(result)) == rounded else None
 
 
 def _number(value):
@@ -71,6 +110,7 @@ class Market:
         self._retry_at = 0.0
         self._catalog_lock = asyncio.Lock()
         self._catalog: dict[str, str] = {}
+        self._catalog_rules: dict[str, SpotOrderRules] = {}
         self._catalog_expires_at = 0.0
         self._catalog_retry_at = 0.0
 
@@ -153,6 +193,7 @@ class Market:
         if len(rows) > _MAX_CATALOG_ROWS:
             raise MarketError(f"{self.exchange} spot catalog exceeds its instrument limit")
         catalog = {}
+        rules = {}
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -165,10 +206,16 @@ class Market:
             base, quote, instrument = row.get(base_key), row.get(quote_key), row.get(symbol_key)
             if (_valid_asset(base) and _valid_asset(quote) and base != quote
                     and instrument == f"{base}{separator}{quote}"):
-                catalog[f"{base}/{quote}"] = instrument
+                symbol = f"{base}/{quote}"
+                if self.exchange == "okx":
+                    if symbol in catalog:
+                        rules.pop(symbol, None)
+                    elif order_rules := _okx_order_rules(row):
+                        rules[symbol] = order_rules
+                catalog[symbol] = instrument
         if not catalog or len(set(catalog.values())) != len(catalog):
             raise MarketError(f"{self.exchange} spot catalog is empty or ambiguous")
-        return catalog
+        return catalog, rules
 
     async def _spot_catalog(self):
         async with self._catalog_lock:
@@ -178,7 +225,7 @@ class Market:
             if now < self._catalog_retry_at:
                 raise MarketError(f"{self.exchange} spot catalog is temporarily unavailable")
             try:
-                self._catalog = await self._read_catalog()
+                self._catalog, self._catalog_rules = await self._read_catalog()
             except MarketError:
                 self._catalog_retry_at = time.monotonic() + _CATALOG_RETRY_SECONDS
                 raise
@@ -188,6 +235,15 @@ class Market:
     async def spot_symbols(self) -> tuple[str, ...]:
         """Return the sorted active public spot catalog, including non-USDT quotes."""
         return tuple(sorted(await self._spot_catalog()))
+
+    async def spot_order_rules(self, symbol: str) -> SpotOrderRules:
+        """Return public sizing constraints for the exact active OKX spot instrument."""
+        if self.exchange != "okx":
+            raise MarketError("Spot sizing constraints are available for OKX only")
+        await self._spot_catalog()
+        if symbol not in self._catalog_rules:
+            raise MarketError(f"OKX {symbol!r}: live spot sizing constraints unavailable")
+        return self._catalog_rules[symbol]
 
     async def _instruments(self, symbols):
         if not self._all_spot:
