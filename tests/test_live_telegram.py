@@ -12,6 +12,7 @@ from live_telegram import (
     DeliveryResult,
     edit_signal,
     parse_chat_id,
+    parse_reply_callback,
     send_signal,
     verify_chat,
 )
@@ -189,3 +190,30 @@ class LiveTelegramTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await edit_signal(self.bot, CHAT_ID, 0, signal(), "alert_expired")).reason,
                          "message_id_invalid")
         self.bot.edit_message_text.assert_not_awaited()
+
+    async def test_reply_buttons_follow_persisted_state_through_expiry(self):
+        alert = {**signal(), "reply_required": True}
+        self.assertEqual((await send_signal(self.bot, CHAT_ID, alert)).status, "sent")
+        buttons = self.bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard[0]
+        self.assertEqual([button.text for button in buttons], ["Вошёл", "Пропуск"])
+        enter_data = buttons[0].callback_data
+        self.assertEqual(parse_reply_callback(enter_data), ("signal-01", "enter"))
+        self.assertIsNone(parse_reply_callback("lq:b:signal-01"))
+
+        for state, labels in (("waiting", ["Вошёл", "Пропуск"]), ("entered", ["Закрыл"]), ("closed", [])):
+            await edit_signal(self.bot, CHAT_ID, 35, alert, "alert_expired", response_state=state)
+            kwargs = self.bot.edit_message_text.await_args.kwargs
+            self.assertIn("ИСТЁК", kwargs["text"])
+            markup = kwargs["reply_markup"]
+            actual = [button.text for row in markup.inline_keyboard for button in row] if markup else []
+            self.assertEqual(actual, labels)
+
+    async def test_non_usdt_price_uses_native_quote_when_plan_matches_pair(self):
+        alert = {**signal(), "symbol": "ETH/BTC"}
+        self.assertEqual((await send_signal(self.bot, CHAT_ID, alert)).reason, "signal_invalid")
+        alert["plan"]["quote_asset"] = "BTC"
+        self.assertEqual((await send_signal(self.bot, CHAT_ID, alert)).status, "sent")
+        text = self.bot.send_message.await_args.kwargs["text"]
+        self.assertIn("12550.5 BTC", text)
+        self.assertIn("Объём: 0.0008 ETH", text)
+        self.assertIn("Риск по плану: 0.11 USDT", text)

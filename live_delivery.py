@@ -122,11 +122,13 @@ class TelegramOutbox:
 
 
 class TelegramPublisher:
-    def __init__(self, bot, chat_id, route, outbox):
+    def __init__(self, bot, chat_id, route, outbox, *, slots=None):
         self.bot = bot
         self.chat_id = chat_id
         self.route = route
         self.outbox = outbox
+        self.slots = slots
+        self.edit_lock = asyncio.Lock()
 
     async def flush(self):
         signal = self.outbox.claim_send(self.route, time.time())
@@ -137,7 +139,12 @@ class TelegramPublisher:
         update = self.outbox.claim_update(self.route, time.time())
         if update is not None:
             signal, message_id, reason = update
-            result = await edit_signal(self.bot, self.chat_id, message_id, signal, reason)
+            async with self.edit_lock:
+                if self.slots is not None and signal.get("reply_required"):
+                    state = self.slots.state(signal["id"], route=self.route)
+                    result = await edit_signal(self.bot, self.chat_id, message_id, signal, reason, response_state=state)
+                else:
+                    result = await edit_signal(self.bot, self.chat_id, message_id, signal, reason)
             self.outbox.finish_update(signal["id"], result)
             emit({"type": "telegram_update", "signal_id": signal["id"], "status": result.status,
                   "reason": result.reason})

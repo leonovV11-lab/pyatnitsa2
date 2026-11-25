@@ -17,7 +17,7 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements.txt
       - run: python -m pip install ruff==0.17.6 pyright==1.1.414
-      - run: ruff check bot.py market.py paper_ledger.py research.py strategies.py trade_reviewer.py official_news.py news_agent_team.py news_quant.py news_paper.py news_journal.py live_evidence.py live_market_check.py live_portfolio.py live_telegram.py live_delivery.py news_live.py tests
+      - run: ruff check bot.py market.py paper_ledger.py research.py strategies.py trade_reviewer.py official_news.py news_agent_team.py news_quant.py news_paper.py news_journal.py live_evidence.py live_market_check.py live_portfolio.py live_reply_worker.py live_slots.py live_telegram.py live_delivery.py news_live.py tests
       - run: pyright
       - run: python -m compileall -q .
       - run: python -m unittest discover -s tests -v

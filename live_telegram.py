@@ -10,7 +10,7 @@ from decimal import Decimal
 from typing import Literal, TypedDict, TypeGuard
 from urllib.parse import urlsplit
 
-from telegram import Bot, LinkPreviewOptions
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.constants import ChatType
 from telegram.error import (
     BadRequest,
@@ -23,6 +23,8 @@ from telegram.error import (
 
 MOSCOW_TIME = timezone(timedelta(hours=3))
 MAX_CHAT_ID = 2 ** 52 - 1
+_REPLY_ID = r"[A-Za-z0-9_-]{1,59}"
+_REPLY_ACTIONS = {"e": "enter", "s": "skip", "c": "close"}
 UPDATE_TEXT = {
     "alert_expired": "ИСТЁК. Срок действия сигнала завершился.",
     "expired": "ИСТЁК. Срок действия сигнала завершился.",
@@ -37,6 +39,10 @@ class _Timeouts(TypedDict):
     read_timeout: float
     write_timeout: float
     pool_timeout: float
+
+
+class _ReplyMarkup(TypedDict, total=False):
+    reply_markup: InlineKeyboardMarkup | None
 
 
 TIMEOUTS: _Timeouts = {
@@ -154,6 +160,32 @@ def _label(value: object, pattern: str) -> str:
     return value
 
 
+def parse_reply_callback(data: object) -> tuple[str, str] | None:
+    """Read the callback identifier and action before validating the stored message."""
+    if not isinstance(data, str):
+        return None
+    match = re.fullmatch(rf"lq:([esc]):({_REPLY_ID})", data)
+    if match is None:
+        return None
+    code, signal_id = match.groups()
+    return signal_id, _REPLY_ACTIONS[code]
+
+
+def reply_markup(signal_id: str, response_state: str | None) -> InlineKeyboardMarkup | None:
+    """Make the buttons valid for the current persisted response state."""
+    signal_id = _label(signal_id, _REPLY_ID)
+    if response_state == "waiting":
+        buttons = [
+            InlineKeyboardButton("Вошёл", callback_data=f"lq:e:{signal_id}"),
+            InlineKeyboardButton("Пропуск", callback_data=f"lq:s:{signal_id}"),
+        ]
+    elif response_state == "entered":
+        buttons = [InlineKeyboardButton("Закрыл", callback_data=f"lq:c:{signal_id}")]
+    else:
+        return None
+    return InlineKeyboardMarkup([buttons])
+
+
 def _evidence_lines(evidence: object) -> list[str]:
     if not isinstance(evidence, dict):
         return []
@@ -170,10 +202,13 @@ def _evidence_lines(evidence: object) -> list[str]:
 
 def _render(signal: dict, reason: str | None = None) -> tuple[str, float]:
     venue = _label(signal.get("venue"), r"[a-zA-Z0-9_-]{1,32}")
-    symbol = _label(signal.get("symbol"), r"[A-Z0-9]{1,24}/USDT")
+    symbol = _label(signal.get("symbol"), r"[A-Z0-9]{1,24}/[A-Z0-9]{1,24}")
     signal_id = _label(signal.get("id"), r"[A-Za-z0-9_-]{1,64}")
     if signal.get("side") != "buy" or not isinstance(plan := signal.get("plan"), dict):
         raise ValueError("Invalid plan")
+    asset, quote_asset = symbol.split("/")
+    if quote_asset != plan.get("quote_asset", "USDT") or asset == quote_asset:
+        raise ValueError("Invalid quote asset")
     headline = _headline(signal.get("headline"))
     source_url = _url(signal.get("url"))
     expiry = _positive(signal.get("expires_at"))
@@ -186,7 +221,6 @@ def _render(signal: dict, reason: str | None = None) -> tuple[str, float]:
     stress = _positive(plan.get("stressed_loss_usdt", loss))
     if stress < loss:
         raise ValueError("Invalid stressed risk")
-    asset = symbol.split("/", 1)[0]
     market_label = f"{symbol} · {venue.upper()}"
     if reason is None:
         lines = [f"Пятница 2 · Покупка на споте · {market_label}"]
@@ -197,16 +231,16 @@ def _render(signal: dict, reason: str | None = None) -> tuple[str, float]:
             f"Статус: {status}",
             "Историческая котировка и параметры на момент публикации.",
         ]
-    lines += ["", f"Вход по снимку рынка: {_decimal_text(entry)} USDT"]
+    lines += ["", f"Вход по снимку рынка: {_decimal_text(entry)} {quote_asset}"]
     if "entry_min" in plan or "entry_max" in plan:
         entry_min = _positive(plan.get("entry_min"))
         entry_max = _positive(plan.get("entry_max"))
         if not entry_min <= entry <= entry_max <= tp1:
             raise ValueError("Invalid entry range")
-        lines.append(f"Диапазон входа: {_decimal_text(entry_min)}–{_decimal_text(entry_max)} USDT")
+        lines.append(f"Диапазон входа: {_decimal_text(entry_min)}–{_decimal_text(entry_max)} {quote_asset}")
     lines += [
-        f"Стоп: {_decimal_text(stop)} USDT",
-        f"Цель 1: {_decimal_text(tp1)} USDT · Цель 2: {_decimal_text(tp2)} USDT",
+        f"Стоп: {_decimal_text(stop)} {quote_asset}",
+        f"Цель 1: {_decimal_text(tp1)} {quote_asset} · Цель 2: {_decimal_text(tp2)} {quote_asset}",
         f"Объём: {_decimal_text(qty)} {asset}",
         f"Риск по плану: {_decimal_text(loss, 6)} USDT · При росте издержек: {_decimal_text(stress, 6)} USDT",
         f"Расчёт при обеих целях: {_decimal_text(reward, 6)} USDT · {_decimal_text(ratio, 4)} R",
@@ -220,6 +254,8 @@ def _render(signal: dict, reason: str | None = None) -> tuple[str, float]:
         ]
     else:
         lines += ["", f"Срок действия сигнала: до {local_expiry} МСК."]
+    if signal.get("reply_required") is True:
+        lines += ["", "«Вошёл» подтверждает уже совершённый вручную вход. Кнопки не продлевают срок сигнала."]
     lines += ["", headline, source_url, "", f"Пятница 2 · ID {signal_id}"]
     text = "\n".join(lines)
     if len(text.encode("utf-16-le")) // 2 > 4_096:
@@ -246,6 +282,7 @@ async def send_signal(bot: Bot, chat_id: int, signal: dict) -> DeliveryResult:
         return DeliveryResult("rejected", reason="chat_id_invalid")
     try:
         text, expiry = _render(signal)
+        markup = reply_markup(signal["id"], "waiting") if signal.get("reply_required") is True else None
     except (AttributeError, OverflowError, OSError, TypeError, ValueError):
         return DeliveryResult("rejected", reason="signal_invalid")
     if expiry <= time.time():
@@ -253,7 +290,7 @@ async def send_signal(bot: Bot, chat_id: int, signal: dict) -> DeliveryResult:
     try:
         message = await bot.send_message(
             chat_id=chat_id, text=text, parse_mode=None, link_preview_options=LinkPreviewOptions(is_disabled=True),
-            allow_paid_broadcast=False,
+            allow_paid_broadcast=False, reply_markup=markup,
             **TIMEOUTS,
         )
     except (TelegramError, OSError) as error:
@@ -261,7 +298,9 @@ async def send_signal(bot: Bot, chat_id: int, signal: dict) -> DeliveryResult:
     return _message_result(message, chat_id)
 
 
-async def edit_signal(bot: Bot, chat_id: int, message_id: int, signal: dict, reason: str) -> DeliveryResult:
+async def edit_signal(
+    bot: Bot, chat_id: int, message_id: int, signal: dict, reason: str, *, response_state: str | None = "waiting",
+) -> DeliveryResult:
     """Amend the original signal after a source change or expiry."""
     try:
         chat_id = parse_chat_id(chat_id)
@@ -271,12 +310,17 @@ async def edit_signal(bot: Bot, chat_id: int, message_id: int, signal: dict, rea
         return DeliveryResult("rejected", reason="message_id_invalid")
     try:
         text, _ = _render(signal, reason)
+        markup: _ReplyMarkup = (
+            {"reply_markup": reply_markup(signal["id"], response_state)}
+            if signal.get("reply_required") is True
+            else {}
+        )
     except (AttributeError, OverflowError, OSError, TypeError, ValueError):
         return DeliveryResult("rejected", reason="signal_invalid")
     try:
         message = await bot.edit_message_text(
             chat_id=chat_id, message_id=message_id, text=text, parse_mode=None,
-            link_preview_options=LinkPreviewOptions(is_disabled=True), **TIMEOUTS,
+            link_preview_options=LinkPreviewOptions(is_disabled=True), **markup, **TIMEOUTS,
         )
     except (TelegramError, OSError) as error:
         if isinstance(error, BadRequest) and str(error).casefold().startswith("message is not modified"):

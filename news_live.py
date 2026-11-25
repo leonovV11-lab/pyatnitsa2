@@ -9,6 +9,7 @@ import re
 import time
 from collections import Counter
 from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
@@ -20,8 +21,10 @@ from live_delivery import TelegramOutbox, TelegramPublisher
 from live_evidence import assess_recorded_history, read_recorded_history
 from live_market_check import observe_reaction, prepare_candidate, refresh_plan
 from live_portfolio import MAX_PORTFOLIO_AGE_SECONDS, read_portfolio
+from live_reply_worker import check_reply_transport, run_replies
+from live_slots import SlotJournal
 from live_telegram import parse_chat_id, verify_chat
-from market import DEFAULT_QUOTE_MAX_AGE, SUPPORTED_EXCHANGES, Market
+from market import DEFAULT_QUOTE_MAX_AGE, SUPPORTED_EXCHANGES, Market, MarketError
 from news_agent_team import ROLE_GROUPS, analyze_team
 from news_journal import (
     DISCOVERY_WINDOW,
@@ -32,11 +35,13 @@ from news_journal import (
     key,
 )
 from official_news import NewsSource, fetch_official_news
-from strategies import BASELINE, MAX_POSITION_FRACTION
+from strategies import BASELINE, MAX_POSITION_FRACTION, MIN_NET_PAYOFF
 
 SIGNAL_TTL = 5
 RISK_RESERVATION_SECONDS = 300
 MAX_SYMBOLS = 16
+PAIRS_PER_CATALOG_SCAN = 32
+CHART_MINUTES_SECONDS = 300
 MAX_REVIEWS_PER_SCAN = 4
 EXTRA_COST_PER_SIDE = 0.001
 DISCOVERY_SOURCES = (
@@ -112,6 +117,7 @@ class LiveJournal(HeadlineJournal):
                 );
             """)
         self.telegram = TelegramOutbox(self.connect)
+        self.slots = SlotJournal(self.connect)
 
     def record_discoveries(self, items, as_of):
         start = as_of - DISCOVERY_WINDOW
@@ -158,10 +164,13 @@ class LiveJournal(HeadlineJournal):
     @staticmethod
     def capacity_reason(db, symbol, plan, cap, budget, as_of, portfolio):
         risk = plan.get("stressed_loss_usdt", plan["loss"])
-        cash_needed = plan.get("qty", 0) * plan.get("price", 0) * (1 + plan.get("fee_rate", 0))
+        cash_native, cash_usdt = plan_cost(plan)
+        quote_asset = symbol.split("/", 1)[1]
         since = as_of - RISK_RESERVATION_SECONDS
         open_risk = 0.0
-        cash_available = math.inf if budget is None else budget
+        open_symbols = frozenset()
+        available_native = math.inf
+        available_total = math.inf if budget is None else budget
         if portfolio is not None:
             if not 0 <= as_of - portfolio.observed_at <= MAX_PORTFOLIO_AGE_SECONDS:
                 return "portfolio_snapshot_expired"
@@ -169,19 +178,33 @@ class LiveJournal(HeadlineJournal):
                 return "symbol_already_held"
             since = max(since, portfolio.observed_at)
             open_risk = portfolio.stressed_risk_usdt
-            cash_available = min(cash_available, portfolio.available_cash_usdt)
-        reserved = db.execute("""
-            SELECT COALESCE(SUM(risk), 0) AS risk,
-                COALESCE(MAX(symbol=?), 0) AS occupied,
-                COALESCE(SUM(json_extract(payload,'$.plan.qty') * json_extract(payload,'$.plan.price')
-                    * (1 + COALESCE(json_extract(payload,'$.plan.fee_rate'), 0))), 0) AS cash
-            FROM live_signals WHERE issued_at>? AND issued_at<=?
-        """, (symbol, since, as_of)).fetchone()
-        if reserved["occupied"]:
-            return "symbol_already_reserved"
-        if open_risk + reserved["risk"] + risk > cap:
+            open_symbols = portfolio.open_symbols
+            available_native = (portfolio.available_cash_usdt if quote_asset == "USDT"
+                                else portfolio.available_balance(quote_asset))
+        reserved_risk = reserved_total = reserved_native = 0.0
+        reservations = db.execute("""
+            SELECT s.symbol, s.risk, s.payload, sl.state AS reply_state, d.state AS delivery_state
+            FROM live_signals s LEFT JOIN live_manual_slots sl ON sl.signal_id=s.id
+            LEFT JOIN telegram_deliveries d ON d.signal_id=s.id
+            WHERE s.issued_at<=? AND (s.issued_at>? OR sl.state='entered')
+        """, (as_of, since))
+        for reservation in reservations:
+            state, held_symbol = reservation["reply_state"], reservation["symbol"]
+            if (state in {"skipped", "closed"} or (state == "entered" and held_symbol in open_symbols)
+                    or (state == "waiting" and reservation["delivery_state"] in {"rejected", "skipped"})):
+                continue
+            if held_symbol == symbol:
+                return "symbol_already_reserved"
+            reserved_risk += reservation["risk"]
+            native, total = plan_cost(json.loads(reservation["payload"])["plan"])
+            reserved_total += total
+            if held_symbol.rsplit("/", 1)[1] == quote_asset:
+                reserved_native += native
+        if not math.isfinite(risk) or open_risk + reserved_risk + risk > cap:
             return "portfolio_stressed_risk_limit"
-        if reserved["cash"] + cash_needed > cash_available:
+        if (not math.isfinite(cash_native) or not math.isfinite(cash_usdt)
+                or reserved_total + cash_usdt > available_total
+                or reserved_native + cash_native > available_native):
             return "insufficient_unreserved_cash"
         return ""
 
@@ -194,7 +217,7 @@ class LiveJournal(HeadlineJournal):
             return db.execute("SELECT 1 FROM news_reviews WHERE review_id=?", (review_id,)).fetchone() is not None
 
     def issue(self, event, venue, symbol, plan, *, cap, as_of, details=None, review_result=None,
-              telegram_route=None, budget=None, portfolio=None):
+              telegram_route=None, budget=None, portfolio=None, reply_required=False):
         risk = plan.get("stressed_loss_usdt", plan["loss"])
         quote_time = plan.get("quote_observed_at", as_of)
         if not (math.isfinite(risk) and 0 < risk <= cap and math.isfinite(cap)
@@ -212,6 +235,10 @@ class LiveJournal(HeadlineJournal):
             "known_at": event["known_at"], "issued_at": as_of, "expires_at": expiry,
             "plan": plan, "evidence": details or {},
         }
+        if reply_required:
+            if telegram_route is None:
+                return None
+            payload["reply_required"] = True
         with closing(self.connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
             if self.current_revision(db, event["id"], as_of) != event["revision"]:
@@ -231,6 +258,13 @@ class LiveJournal(HeadlineJournal):
                                   {**review_result, "reason": "", "signal_id": signal_id})
             if telegram_route:
                 self.telegram.enqueue(db, signal_id, telegram_route, as_of)
+            if reply_required and (
+                telegram_route is None or not self.slots.reserve(
+                    db, signal_id, telegram_route, external_symbols=portfolio.open_symbols if portfolio else frozenset(),
+                )
+            ):
+                db.rollback()
+                return None
             return payload
 
     def invalidate(self, health, as_of, listed=None):
@@ -291,7 +325,7 @@ class LiveJournal(HeadlineJournal):
         return {"type": "report", **dict(summary), "signals": counts, "active": active,
                 "latest_review": last_review, "recent_reactions": latest_reactions,
                 "recent_headlines": self.current_news(now)[:10], "discovery_candidates": discoveries,
-                "telegram_deliveries": self.telegram.counts()}
+                "telegram_deliveries": self.telegram.counts(), "manual_slots": self.slots.report()}
 
 
 def review_verdict(results):
@@ -308,6 +342,34 @@ def review_verdict(results):
 
 def stressed_loss(plan):
     return plan["loss"] + EXTRA_COST_PER_SIDE * plan["qty"] * (plan["price"] + plan["stop"])
+
+
+def plan_cost(plan):
+    notional = plan.get("qty", 0) * plan.get("price", 0)
+    fee = 1 + plan.get("fee_rate", 0)
+    return notional * fee, plan.get("notional_usdt", notional) * fee
+
+
+@dataclass(frozen=True)
+class FundingRate:
+    buy_rate: float
+    sell_rate: float
+    valid_until: float
+
+
+async def funding_rate(market, asset):
+    if asset == "USDT":
+        return FundingRate(1.0, 1.0, math.inf)
+    for symbol, inverse in ((f"{asset}/USDT", False), (f"USDT/{asset}", True)):
+        try:
+            quote = await market.quote(symbol)
+        except (MarketError, ValueError):
+            continue
+        if quote.is_fresh() and 0 < quote.bid <= quote.ask:
+            buy, sell = (1 / quote.bid, 1 / quote.ask) if inverse else (quote.ask, quote.bid)
+            if math.isfinite(buy) and math.isfinite(sell):
+                return FundingRate(buy, sell, quote.observed_at + DEFAULT_QUOTE_MAX_AGE)
+    return None
 
 
 def ranking_key(candidate):
@@ -333,15 +395,36 @@ class ScanMarket:
 
 
 class LiveMonitor:
-    def __init__(self, public_session, private_session, journal, options, publisher=None):
+    def __init__(self, public_session, private_session, journal, options, publisher=None, *,
+                 all_pairs=False, manual_replies=False):
         self.public_session = public_session
         self.private_session = private_session
         self.journal = journal
         self.options = options
         self.publisher = publisher
-        self.market = Market(public_session, options.venue)
+        if manual_replies and publisher is None:
+            raise ValueError("Режиму ручных ответов нужен отправитель Telegram.")
+        self.market = Market(public_session, options.venue, all_spot=all_pairs)
+        self.all_pairs = all_pairs
+        self.manual_replies = manual_replies
+        self.market_cursor = 0
+        self.catalog_size = len(options.symbols)
+        self.candidate_cache = {}
+        self.cached_history = []
         self.last_decisions = {}
         self.listed_news = set()
+
+    async def scan_symbols(self):
+        if not self.all_pairs:
+            return tuple(self.options.symbols)
+        symbols = await self.market.spot_symbols()
+        self.catalog_size = len(symbols)
+        if not symbols:
+            return ()
+        current = self.market_cursor % len(symbols)
+        batch = symbols[current:current + PAIRS_PER_CATALOG_SCAN]
+        self.market_cursor = (current + len(batch)) % len(symbols)
+        return batch
 
     def watch(self, event, symbol, reason, **details):
         identity = event["id"], symbol
@@ -373,14 +456,37 @@ class LiveMonitor:
 
     async def current_plan(self, draft, symbol):
         options = self.options
-        sizing_budget = options.budget * min(1.0, 1.0 / (MAX_POSITION_FRACTION * options.allocation_slots))
-        plan, reason = await refresh_plan(self.market, draft["setup"], sizing_budget, options.fee_rate)
-        if plan is None:
-            return None, None, reason
         portfolio, reason = self.portfolio()
         if reason:
             return None, None, reason
-        plan["stressed_loss_usdt"] = stressed_loss(plan)
+        quote_asset = symbol.split("/", 1)[1]
+        if quote_asset != "USDT" and portfolio is None:
+            return None, None, "quote_balance_required"
+        rate = await funding_rate(self.market, quote_asset)
+        if rate is None:
+            return None, None, "quote_conversion_unavailable"
+        sizing_budget = options.budget * min(1.0, 1.0 / (MAX_POSITION_FRACTION * options.allocation_slots))
+        sizing_budget /= rate.buy_rate
+        if portfolio is not None:
+            available = portfolio.available_balance(quote_asset)
+            if available <= 0:
+                return None, None, "quote_balance_required"
+            sizing_budget = min(sizing_budget, available / MAX_POSITION_FRACTION)
+        plan, reason = await refresh_plan(self.market, draft["setup"], sizing_budget, options.fee_rate)
+        if plan is None:
+            return None, None, reason
+        if rate.valid_until <= time.time():
+            return None, None, "quote_conversion_expired"
+        plan["quote_asset"] = quote_asset
+        plan["stressed_loss_usdt"] = stressed_loss(plan) * rate.buy_rate
+        plan["notional_usdt"] = plan["qty"] * plan["price"] * rate.buy_rate
+        plan["loss"] *= rate.buy_rate
+        plan["reward"] *= rate.sell_rate
+        plan["ratio"] *= rate.sell_rate / rate.buy_rate
+        if quote_asset != "USDT":
+            plan["valid_until"] = min(plan.get("valid_until", math.inf), rate.valid_until)
+            if plan["ratio"] < MIN_NET_PAYOFF:
+                return None, None, "quote_conversion_reduces_net_payoff"
         reason = self.journal.check_capacity(symbol, plan, cap=options.risk_cap, budget=options.budget,
                                              as_of=time.time(), portfolio=portfolio)
         return (None, None, reason) if reason else (plan, portfolio, "")
@@ -391,7 +497,8 @@ class LiveMonitor:
         book = {field: plan.get(field) for field in ("price", "bid", "ask_size", "bid_size", "quote_observed_at")}
         snapshot = {
             "mode": "live", "event": event,
-            "market": {**check["market"], "book": book, "plan": {field: plan[field] for field in _PUBLIC_PLAN_FIELDS}},
+            "market": {**check["market"], "book": book, "quote_asset": plan["quote_asset"],
+                       "plan": {field: plan[field] for field in _PUBLIC_PLAN_FIELDS}},
             "recorded_results": stats,
         }
         results = await analyze_team(
@@ -415,6 +522,7 @@ class LiveMonitor:
                     alert = self.journal.issue(event, options.venue, symbol, plan, cap=options.risk_cap,
                                                as_of=time.time(), details=details, review_result=review_result,
                                                budget=options.budget, portfolio=portfolio,
+                                               reply_required=self.manual_replies,
                                                telegram_route=self.publisher.route if self.publisher else None)
                     if alert is None:
                         reason = "alert_expired_duplicate_or_risk_limit"
@@ -426,14 +534,14 @@ class LiveMonitor:
             self.journal.finish_review(review_id, {**review_result, "reason": reason, "signal_id": None})
             self.watch(event, symbol, reason, pnl=stats)
 
-    async def scan_event(self, market, event, history):
+    async def scan_event(self, market, event, history, symbols):
         options = self.options
         family, eligible = classify_live_event(event["source"], event["title"])
         observations = await asyncio.gather(*(
-            observe_reaction(market, symbol, event["known_at"]) for symbol in options.symbols
+            observe_reaction(market, symbol, event["known_at"]) for symbol in symbols
         ))
         candidates = []
-        for symbol, (observation, reason) in zip(options.symbols, observations, strict=True):
+        for symbol, (observation, reason) in zip(symbols, observations, strict=True):
             if observation is None:
                 self.watch(event, symbol, reason, family=family)
                 continue
@@ -471,6 +579,15 @@ class LiveMonitor:
                 continue
             if reviews >= options.max_reviews_per_scan:
                 break
+            if self.manual_replies and (publisher := self.publisher) is not None:
+                portfolio, reason = self.portfolio()
+                if not reason:
+                    reason = self.journal.slots.capacity(
+                        publisher.route, portfolio.open_symbols if portfolio else frozenset(),
+                    )
+                if reason:
+                    emit({"type": "manual_queue", "status": reason, "candidates_available": len(candidates)})
+                    return
             if (event["id"], event["revision"]) not in self.listed_news:
                 self.watch(event, symbol, "official_release_unavailable")
                 continue
@@ -499,21 +616,42 @@ class LiveMonitor:
                                if identity[0] in visible}
         options = self.options
         try:
+            symbols = await self.scan_symbols()
+        except MarketError:
+            emit({"type": "catalog_unavailable", "venue": options.venue})
+            return
+        try:
             history = read_recorded_history(options.history_file)
         except (OSError, ValueError):
             history = []
             emit({"type": "history_unavailable", "reason": "cannot_read_real_fill_export"})
+        if self.all_pairs and history != self.cached_history:
+            self.candidate_cache.clear()
+            self.cached_history = history
         emit({"type": "scan", "source_health": health, "received": len(items), "recent": len(events),
               "discovery_health": discovery_health, "discovery_candidates": discovered,
               "history_rows": len(history), "sizing_configured": options.budget is not None,
-              "team_enabled": options.team, "symbols": len(options.symbols)})
+              "team_enabled": options.team, "symbols": len(symbols), "catalog_size": self.catalog_size})
         market = ScanMarket(self.market)
         candidates = []
         for event in events:
             if (event["id"], event["revision"]) not in listed:
                 self.watch(event, None, "official_release_unavailable")
                 continue
-            candidates.extend(await self.scan_event(market, event, history))
+            candidates.extend(await self.scan_event(market, event, history, symbols))
+        if self.all_pairs:
+            chart_close = int(time.time() // CHART_MINUTES_SECONDS) * CHART_MINUTES_SECONDS
+            current_symbols = set(symbols)
+            self.candidate_cache = {
+                identity: candidate for identity, candidate in self.candidate_cache.items()
+                if identity[:2] in listed and identity[2] not in current_symbols
+                and candidate["draft"]["setup"]["snapshot_5m_close"] == chart_close
+                and time.time() - candidate["event"]["published_at"] < REACTION_WINDOW
+            }
+            for candidate in candidates:
+                event = candidate["event"]
+                self.candidate_cache[event["id"], event["revision"], candidate["symbol"]] = candidate
+            candidates = list(self.candidate_cache.values())
         candidates.sort(key=ranking_key)
         if candidates:
             emit({"type": "candidate_ranking", "ranked": len(candidates), "top": [
@@ -526,18 +664,29 @@ class LiveMonitor:
 
 async def run_monitor(options, journal, publisher=None):
     async with aiohttp.ClientSession(trust_env=True) as public, aiohttp.ClientSession() as private:
-        monitor = LiveMonitor(public, private, journal, options, publisher=publisher)
+        monitor = LiveMonitor(public, private, journal, options, publisher=publisher,
+                              all_pairs=options.all_pairs, manual_replies=options.manual_replies)
         if options.once:
             await monitor.scan_once()
             if publisher is not None:
                 await publisher.flush()
             return
         async with asyncio.TaskGroup() as tasks:
+            wake = asyncio.Event()
             if publisher is not None:
                 tasks.create_task(publisher.run())
+                if options.manual_replies:
+                    tasks.create_task(run_replies(
+                        publisher.bot, publisher.chat_id, publisher.route, journal.slots, wake,
+                        edit_lock=publisher.edit_lock,
+                    ))
             while True:
                 await monitor.scan_once()
-                await asyncio.sleep(options.interval)
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=options.interval)
+                except TimeoutError:
+                    pass
+                wake.clear()
 
 
 async def run(options, journal):
@@ -555,8 +704,14 @@ async def run(options, journal):
             if status != "ready":
                 return False
             if not options.telegram_check:
+                if options.manual_replies:
+                    status = await check_reply_transport(bot)
+                    emit({"type": "telegram_replies_check", "status": status})
+                    if status != "ready":
+                        return False
                 route = key("telegram", bot.id, options.telegram_chat_id)
-                publisher = TelegramPublisher(bot, options.telegram_chat_id, route, journal.telegram)
+                publisher = TelegramPublisher(bot, options.telegram_chat_id, route, journal.telegram,
+                                              slots=journal.slots if options.manual_replies else None)
                 await run_monitor(options, journal, publisher)
     except InvalidToken:
         emit({"type": "telegram_check", "status": "token_invalid"})
@@ -574,7 +729,9 @@ def main():
     mode.add_argument("--report", action="store_true", help="Показать журнал без сетевых запросов")
     mode.add_argument("--telegram-check", action="store_true", help="Проверить доступ к личному чату без отправки")
     parser.add_argument("--venue", choices=SUPPORTED_EXCHANGES, default="okx")
-    parser.add_argument("--symbols", nargs="+", default=["BTC/USDT"], metavar="PAIR")
+    universe = parser.add_mutually_exclusive_group()
+    universe.add_argument("--symbols", nargs="+", default=["BTC/USDT"], metavar="PAIR")
+    universe.add_argument("--all-pairs", action="store_true", help="По очереди сканировать весь каталог спота биржи")
     parser.add_argument("--data-dir", type=Path, default=Path("data/live"))
     parser.add_argument("--history-file", type=Path)
     parser.add_argument("--portfolio-file", type=Path, help="Снимок свободных USDT и открытых позиций")
@@ -585,6 +742,8 @@ def main():
     parser.add_argument("--risk-cap", type=float, help="Лимит суммарного сценарного риска, USDT")
     parser.add_argument("--team", action="store_true", help="Подключить 50 агентов к финальной проверке")
     parser.add_argument("--telegram", action="store_true", help="Отправлять сигналы в личный чат BOT_OWNER_ID")
+    parser.add_argument("--manual-replies", action="store_true",
+                        help="Ждать ответа в Telegram и вести до 16 открытых позиций")
     parser.add_argument("--concurrency", type=int, choices=range(1, 51), default=10, metavar="N")
     parser.add_argument("--max-reviews-per-scan", type=int, choices=range(1, MAX_REVIEWS_PER_SCAN + 1), default=1,
                         help="Сколько кандидатов можно передать команде за цикл")
@@ -598,6 +757,8 @@ def main():
         except ValueError:
             parser.error("Для Telegram задайте числовой BOT_OWNER_ID личного чата.")
     if not (options.report or options.telegram_check):
+        if options.manual_replies and (not options.telegram or options.once):
+            parser.error("Для ответов владельца нужен постоянный запуск с --telegram.")
         if (len(options.symbols) > MAX_SYMBOLS or len(set(options.symbols)) != len(options.symbols)
                 or any(not re.fullmatch(r"[A-Z0-9]{1,16}/USDT", pair) for pair in options.symbols)):
             parser.error(f"Укажите от 1 до {MAX_SYMBOLS} разных спотовых пар формата BTC/USDT.")
@@ -615,8 +776,9 @@ def main():
                 parser.error("Для команды нужны настроенные параметры риска.")
             if not (config.TRADE_REVIEW_KEY and config.TRADE_REVIEW_URL and config.TRADE_REVIEW_MODEL):
                 parser.error("Для команды нужны TRADE_REVIEW_KEY, TRADE_REVIEW_URL и TRADE_REVIEW_MODEL.")
-            if (len(options.symbols) > 4 or options.max_reviews_per_scan > 1) and options.portfolio_file is None:
-                parser.error("Для нескольких сигналов за цикл или более четырёх пар укажите --portfolio-file.")
+            if (options.all_pairs or options.manual_replies or len(options.symbols) > 4
+                    or options.max_reviews_per_scan > 1) and options.portfolio_file is None:
+                parser.error("Для каталога, очереди подтверждений или нескольких сигналов укажите --portfolio-file.")
     if options.report:
         emit(LiveJournal(options.data_dir / "news-live.sqlite3").report())
         return

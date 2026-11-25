@@ -6,12 +6,12 @@
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 MAX_PORTFOLIO_AGE_SECONDS = 300
 _VENUE = re.compile(r"[a-z0-9][a-z0-9_-]*")
-_SYMBOL = re.compile(r"[A-Z0-9]+/[A-Z0-9]+")
+_ASSET = re.compile(r"[^\W_]{1,32}")
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,10 @@ class PortfolioSnapshot:
     available_cash_usdt: float
     stressed_risk_usdt: float
     open_symbols: frozenset[str]
+    quote_balances: dict[str, float] = field(default_factory=dict)
+
+    def available_balance(self, asset: str) -> float:
+        return self.available_cash_usdt if asset == "USDT" else self.quote_balances.get(asset, 0.0)
 
 
 def _distinct_keys(pairs):
@@ -80,6 +84,13 @@ def read_portfolio(path: Path | str, *, as_of: float) -> PortfolioSnapshot:
         raise ValueError(f"Снимок портфеля устарел. Максимальный возраст {MAX_PORTFOLIO_AGE_SECONDS} секунд.")
 
     cash = _number(data.get("available_cash_usdt"), message="Укажите неотрицательный остаток available_cash_usdt.")
+    raw_balances = data.get("quote_balances", {})
+    if not isinstance(raw_balances, dict) or any(
+        asset == "USDT" or not _ASSET.fullmatch(asset) or asset != asset.upper() for asset in raw_balances
+    ):
+        raise ValueError("Укажите quote_balances как остатки по отдельным валютам котировки без USDT.")
+    quote_balances = {asset: _number(value, message="Остаток валюты котировки должен быть неотрицательным.")
+                      for asset, value in raw_balances.items()}
     positions = data.get("positions")
     if not isinstance(positions, list):
         raise ValueError("Укажите открытые позиции списком positions.")
@@ -92,7 +103,8 @@ def read_portfolio(path: Path | str, *, as_of: float) -> PortfolioSnapshot:
         venue, symbol = position.get("venue"), position.get("symbol")
         if not isinstance(venue, str) or not _VENUE.fullmatch(venue):
             raise ValueError("Укажите биржу в поле venue строчными латинскими буквами.")
-        if not isinstance(symbol, str) or not _SYMBOL.fullmatch(symbol):
+        if (not isinstance(symbol, str) or symbol != symbol.upper() or symbol.count("/") != 1
+                or not all(_ASSET.fullmatch(asset) for asset in symbol.split("/"))):
             raise ValueError("Укажите инструмент в поле symbol в формате BTC/USDT.")
         if (venue, symbol) in open_markets:
             raise ValueError("В снимке повторяются позиции по одной бирже и инструменту.")
@@ -105,4 +117,4 @@ def read_portfolio(path: Path | str, *, as_of: float) -> PortfolioSnapshot:
         risk = math.fsum(risk_amounts)
     except OverflowError:
         raise ValueError("Общий риск портфеля превышает допустимое числовое значение.") from None
-    return PortfolioSnapshot(observed_at, cash, risk, frozenset(symbol for _, symbol in open_markets))
+    return PortfolioSnapshot(observed_at, cash, risk, frozenset(symbol for _, symbol in open_markets), quote_balances)

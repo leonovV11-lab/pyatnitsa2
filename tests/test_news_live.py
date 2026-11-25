@@ -131,7 +131,7 @@ def reaction(direction="up"):
 
 class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
     async def verify_flow(self, *, history_supported=True, revised=False, team_complete=True, telegram=False,
-                          symbols=("BTC/USDT",), stale_symbol=None):
+                          symbols=("BTC/USDT",), stale_symbol=None, manual_replies=False):
         now = time.time()
         initial = release(now)
         updated = release(now + 1800, "r2")
@@ -143,7 +143,7 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
         plan = {
             "strategy": "trend_v1", "price": 101.0, "stop": 90.0, "tp1": 112.0, "tp2": 123.0,
             "ratio": 1.4, "entry_min": 98.0, "entry_max": 103.0, "quote_observed_at": now,
-            "loss": 1.2, "qty": 0.1,
+            "loss": 1.2, "qty": 0.1, "reward": 1.68,
         }
         steps = []
 
@@ -176,9 +176,10 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
             db = LiveJournal(Path(root) / "live.sqlite3")
             options = SimpleNamespace(venue="okx", symbols=symbols, budget=300.0, fee_rate=0.001, risk_cap=2.0,
                                       team=True, concurrency=50, history_file=None, portfolio_file=None,
-                                      max_reviews_per_scan=1, allocation_slots=len(symbols))
-            publisher = TelegramPublisher(object(), 1234, "owner", db.telegram) if telegram else None
-            monitor = LiveMonitor(None, None, db, options, publisher=publisher)
+                                      max_reviews_per_scan=2 if manual_replies else 1, allocation_slots=len(symbols))
+            publisher = TelegramPublisher(object(), 1234, "owner", db.telegram,
+                                          slots=db.slots if manual_replies else None) if telegram else None
+            monitor = LiveMonitor(None, None, db, options, publisher=publisher, manual_replies=manual_replies)
             with (
                 patch("news_live.fetch_official_news", new=AsyncMock(side_effect=sources)),
                 patch("news_live.fetch_discovery_news", new=AsyncMock(return_value=([], {}))),
@@ -193,6 +194,8 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
                 patch("news_live.emit") as output,
             ):
                 await monitor.scan_once()
+                if manual_replies:
+                    await monitor.scan_once()
             if telegram and history_supported and not revised and team_complete:
                 send.assert_awaited_once()
                 self.assertEqual(send.await_args.args[1], 1234)
@@ -202,7 +205,7 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
                 tables = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 self.assertEqual(tables, {
                     "official_headlines", "news_reviews", "live_signals", "market_reactions", "discovery_headlines",
-                    "telegram_deliveries",
+                    "telegram_deliveries", "live_manual_slots",
                 })
             return steps, [call.args[0] for call in output.call_args_list], db.report()
 
@@ -223,6 +226,19 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_reviewed_signal_is_delivered_to_telegram(self):
         _, _, report = await self.verify_flow(telegram=True)
         self.assertEqual(report["telegram_deliveries"], {"sent": 1})
+
+    async def test_one_signal_waits_for_manual_reply_after_both_pairs_are_ranked(self):
+        steps, output, _ = await self.verify_flow(symbols=("BTC/USDT", "ETH/USDT"), telegram=True,
+                                                manual_replies=True)
+        ranking = next(item for item in output if item["type"] == "candidate_ranking")
+        self.assertEqual(ranking["ranked"], 2)
+        self.assertEqual(steps.count("agents"), 1)
+        self.assertEqual(steps.count("chart"), 4)
+        signals = [item for item in output if item["type"] == "live_signal"]
+        self.assertEqual(len(signals), 1)
+        self.assertTrue(signals[0]["reply_required"])
+        manual = next(item for item in output if item["type"] == "manual_queue")
+        self.assertEqual(manual["status"], "waiting_for_reply")
 
     async def test_ranks_all_sixteen_pairs_before_requesting_quotes_or_agents(self):
         symbols = tuple(f"ASSET{index}/USDT" for index in range(16))
