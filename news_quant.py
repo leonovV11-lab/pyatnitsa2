@@ -1,4 +1,4 @@
-"""Point-in-time evidence screen for completed, comparable paper outcomes."""
+"""Point-in-time evidence screen for completed, comparable outcomes."""
 
 import math
 import statistics
@@ -10,7 +10,7 @@ LOOKBACK_DAYS = 90
 MIN_EVENTS = 20
 MIN_EVENT_DAYS = 10
 STANDARD_ERROR_MULTIPLIER = 2.5
-PROVENANCE = {"paper_journal", "paper_replay"}
+PROVENANCE = frozenset({"paper_journal", "paper_replay"})
 
 
 @dataclass(frozen=True)
@@ -36,7 +36,7 @@ def _finite(value):
     return finite if math.isfinite(finite) else None
 
 
-def _eligible_outcomes(samples, start, cutoff):
+def _eligible_outcomes(samples, start, cutoff, allowed_provenance):
     by_id: dict[str, Outcome] = {}
     conflicted: set[str] = set()
     invalid = 0
@@ -62,7 +62,7 @@ def _eligible_outcomes(samples, start, cutoff):
         if (
             not isinstance(outcome_id, str) or not outcome_id.strip()
             or not isinstance(event_id, str) or not event_id.strip()
-            or not isinstance(provenance, str) or provenance not in PROVENANCE
+            or not isinstance(provenance, str) or provenance not in allowed_provenance
             or opened_at is None or closed_at is None
             or not event_at <= opened_at < closed_at <= available_at
             or risk is None or risk <= 0 or net is None or stressed is None or stressed > net
@@ -78,10 +78,11 @@ def _eligible_outcomes(samples, start, cutoff):
     return [entry for key, entry in by_id.items() if key not in conflicted], invalid
 
 
-def assess_outcomes(samples, *, as_of, before=None):
-    """Screen completed paper outcomes with information available strictly before the cutoff.
+def assess_outcomes(samples, *, as_of, before=None, allowed_provenance=PROVENANCE, lookback_days=LOOKBACK_DAYS):
+    """Screen completed outcomes with information available strictly before the cutoff.
 
     The caller supplies one prespecified, comparable event family and strategy policy.
+    The default window is 90 days and accepts paper provenance.
     Trade receipts cluster by the original event ID. Risk weights trades within each event,
     then event means receive equal weight within a UTC day. The lower stress estimate
     subtracts 2.5 standard errors across day blocks. It is a conservative screening
@@ -103,9 +104,13 @@ def assess_outcomes(samples, *, as_of, before=None):
     cutoff = now if before is None else _finite(before)
     if now is None or cutoff is None or min(now, cutoff) <= 0:
         return result
+    window = _finite(lookback_days)
+    if window is None or window <= 0:
+        result["reason"] = "invalid_lookback"
+        return result
     cutoff = min(now, cutoff)
-    recent = max(0.0, now - LOOKBACK_DAYS * DAY_SECONDS)
-    observations, invalid = _eligible_outcomes(samples, recent, cutoff)
+    start = max(0.0, now - window * DAY_SECONDS)
+    observations, invalid = _eligible_outcomes(samples, start, cutoff, allowed_provenance)
     events: dict[str, list[Outcome]] = defaultdict(list)
     for outcome in observations:
         events[outcome.event_id].append(outcome)

@@ -97,6 +97,18 @@ class TeamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session.calls), 100)
         self.assertEqual(session.peak, 4)
 
+    async def test_live_context_uses_recorded_trade_statistics(self):
+        session = Session()
+        evidence = {"mode": "live", "recorded_results": {"provenance": "recorded_fill", "event_count": 22}}
+        rows = await analyze_team(session, evidence, concurrency=50, **PARAMETERS)
+        self.assertEqual(len(rows), 50)
+        self.assertEqual(session.peak, 50)
+        for _, request in session.calls:
+            messages = request["json"]["messages"]
+            self.assertIn("operator-supplied real-fill records", messages[0]["content"])
+            self.assertNotIn("simulation", messages[0]["content"])
+            self.assertEqual(json.loads(messages[1]["content"]), evidence)
+
     async def test_malformed_responses_rate_limits_and_timeouts_are_unavailable(self):
         session = Session({0: "malformed", 2: "oversized", 4: "rate_limited", 6: "timeout"})
         with patch("news_agent_team.MAX_ROUND_TRIP_SECONDS", 0.02):

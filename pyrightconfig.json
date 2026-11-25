@@ -9,7 +9,11 @@
     "official_news.py",
     "news_agent_team.py",
     "news_quant.py",
-    "news_paper.py"
+    "news_paper.py",
+    "news_journal.py",
+    "live_evidence.py",
+    "live_market_check.py",
+    "news_live.py"
   ],
   "typeCheckingMode": "basic",
   "pythonVersion": "3.13"

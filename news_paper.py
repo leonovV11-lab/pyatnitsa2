@@ -2,14 +2,10 @@
 
 import argparse
 import asyncio
-import hashlib
-import json
 import math
 import re
-import sqlite3
 import time
 from contextlib import closing
-from dataclasses import asdict
 from pathlib import Path
 
 import aiohttp
@@ -17,28 +13,14 @@ import aiohttp
 import config
 from market import SUPPORTED_EXCHANGES, Market, MarketError
 from news_agent_team import analyze_team
+from news_journal import REACTION_WINDOW, HeadlineJournal, classify_headline, emit, key
 from news_quant import assess_outcomes
-from official_news import NewsItem, fetch_official_news
+from official_news import fetch_official_news
 from paper_ledger import LedgerError, PaperLedger
 from strategies import BASELINE, build_plan, candidate_setups, is_bullish
 
-FAMILY_RULES = {
-    "nvidia": ("nvidia_leadership", r"\b(?:CEO|Chief Executive Officer|interim chief executive)\b", False),
-    "fed": ("us_monetary_policy", r"\b(?:FOMC statement|federal funds rate|monetary policy decision)\b", True),
-    "ecb": ("eu_monetary_policy", r"\bmonetary policy decisions?\b", True),
-    "bls": ("us_economic_release", r"\b(?:Consumer Price Index|Employment Situation|Producer Price Index)\b", True),
-}
-DISCOVERY_WINDOW = 36 * 3600
-REACTION_WINDOW = 90 * 60
 STRESS_RATE_PER_FILL = 0.001
 MONITOR_SECONDS = 5
-
-
-def classify_headline(source, title):
-    pattern = FAMILY_RULES.get(source)
-    if pattern and re.search(pattern[1], title, re.IGNORECASE):
-        return pattern[0], pattern[2]
-    return "uncatalogued", False
 
 
 def decision_after_review(math_gate, results):
@@ -54,57 +36,17 @@ def decision_after_review(math_gate, results):
     return "paper_signal", "Проверки источника, расчёта и команды пройдены"
 
 
-class NewsJournal:
+class NewsJournal(HeadlineJournal):
     def __init__(self, path):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        super().__init__(path)
         with closing(self.connect()) as db, db:
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS official_headlines (
-                    event_id TEXT NOT NULL, revision TEXT NOT NULL, source TEXT NOT NULL,
-                    published_at REAL NOT NULL, known_at REAL NOT NULL, payload TEXT NOT NULL,
-                    PRIMARY KEY(event_id, revision)
-                );
-                CREATE INDEX IF NOT EXISTS official_headlines_known ON official_headlines (known_at);
+            db.execute("""
                 CREATE TABLE IF NOT EXISTS news_trials (
                     trial_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, family TEXT NOT NULL,
                     event_at REAL NOT NULL, exchange TEXT NOT NULL, symbol TEXT NOT NULL,
                     risk_usdt REAL NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS news_reviews (
-                    review_id TEXT PRIMARY KEY, started_at REAL NOT NULL, finished_at REAL,
-                    event_id TEXT NOT NULL, revision TEXT NOT NULL, result TEXT
-                );
             """)
-
-    def connect(self):
-        db = sqlite3.connect(self.path, timeout=8)
-        db.row_factory = sqlite3.Row
-        return db
-
-    def observe(self, item: NewsItem):
-        payload = asdict(item)
-        known = max(item.published_at, item.fetched_at)
-        payload["known_at"] = known
-        with closing(self.connect()) as db, db:
-            result = db.execute(
-                "INSERT OR IGNORE INTO official_headlines VALUES (?, ?, ?, ?, ?, ?)",
-                (item.id, item.revision, item.source, item.published_at, known, json.dumps(payload, ensure_ascii=False)),
-            )
-            return payload if result.rowcount else None
-
-    def current_news(self, as_of):
-        with closing(self.connect()) as db:
-            rows = db.execute("""
-                WITH ranked AS (
-                    SELECT payload, published_at, event_id,
-                        ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY known_at DESC, rowid DESC) AS latest
-                    FROM official_headlines
-                    WHERE known_at <= ? AND published_at BETWEEN ? AND ?
-                )
-                SELECT payload FROM ranked WHERE latest = 1 ORDER BY published_at DESC, event_id
-            """, (as_of, as_of - DISCOVERY_WINDOW, as_of))
-            return [json.loads(row["payload"]) for row in rows]
 
     def register_trial(self, trial_id, event_id, family, event_at, venue, symbol, risk):
         with closing(self.connect()) as db, db:
@@ -128,12 +70,6 @@ class NewsJournal:
             """, (STRESS_RATE_PER_FILL, family, venue, symbol, as_of))
             return [dict(row, available_at=row["closed_at"], provenance="paper_journal") for row in rows]
 
-    def claim_review(self, review_id, event, now):
-        with closing(self.connect()) as db, db:
-            row = db.execute("INSERT OR IGNORE INTO news_reviews VALUES (?, ?, NULL, ?, ?, NULL)",
-                             (review_id, now, event["id"], event["revision"]))
-            return row.rowcount == 1
-
     def counts(self):
         with closing(self.connect()) as db:
             row = db.execute("""
@@ -142,19 +78,6 @@ class NewsJournal:
                     (SELECT COUNT(*) FROM news_trials JOIN paper_positions ON trial_id=candidate_id) AS trials
             """).fetchone()
             return dict(row)
-
-    def finish_review(self, review_id, result):
-        with closing(self.connect()) as db, db:
-            db.execute("UPDATE news_reviews SET finished_at=?, result=? WHERE review_id=?",
-                       (time.time(), json.dumps(result, ensure_ascii=False, allow_nan=False), review_id))
-
-
-def key(*values):
-    return hashlib.sha256(json.dumps(values, separators=(",", ":")).encode()).hexdigest()[:32]
-
-
-def emit(event):
-    print(json.dumps(event, ensure_ascii=True, allow_nan=False), flush=True)
 
 
 class NewsPaperRunner:

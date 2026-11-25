@@ -80,6 +80,13 @@ class NewsQuantTests(unittest.TestCase):
         self.assertEqual(result["sample_count"], 0)
         self.assertEqual(result["status"], "watch")
 
+    def test_custom_lookback_does_not_change_paper_default(self):
+        data = [outcome(i, day=i // 2) for i in range(24)]
+        now = 140 * DAY
+        self.assertEqual(assess_outcomes(data, as_of=now)["status"], "watch")
+        self.assertEqual(assess_outcomes(data, as_of=now, lookback_days=140)["status"], "supported")
+        self.assertEqual(assess_outcomes(data, as_of=now, lookback_days=0)["reason"], "invalid_lookback")
+
     def test_losses_when_costs_increase_block_the_signal(self):
         result = assess_outcomes(
             [outcome(i, stressed=-2.0) for i in range(24)], as_of=AS_OF,

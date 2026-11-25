@@ -3,15 +3,18 @@
 import asyncio
 import json
 import re
+import ssl
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from email.utils import parsedate_to_datetime
+from functools import cache
 from hashlib import sha256
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 from xml.etree import ElementTree
 
 import aiohttp
+import certifi
 
 MAX_FEED_BYTES = 2 * 1024 * 1024
 MAX_ITEMS_PER_SOURCE = 40
@@ -28,6 +31,10 @@ class NewsSource:
     article_host: str
     path_prefix: str
     reuse_article_url: bool = False
+    additional_article_prefixes: tuple[str, ...] = ()
+    upgrade_legacy_http: bool = False
+    article_pattern: re.Pattern[str] | None = None
+    feed_encoding: str = "utf-8-sig"
 
 
 @dataclass(frozen=True)
@@ -51,6 +58,24 @@ SOURCES = (
                "www.ecb.europa.eu", "/press/"),
     NewsSource("bls", "U.S. Bureau of Labor Statistics", "https://www.bls.gov/feed/cpi.rss",
                "www.bls.gov", "/news.release/", reuse_article_url=True),
+    NewsSource("sec", "U.S. Securities and Exchange Commission", "https://www.sec.gov/news/pressreleases.rss",
+               "www.sec.gov", "/newsroom/press-releases/"),
+    NewsSource("boe", "Bank of England", "https://www.bankofengland.co.uk/rss/news",
+               "www.bankofengland.co.uk", "/monetary-policy-summary-and-minutes/",
+               additional_article_prefixes=("/news/",)),
+    # The HTTPS BoJ feed still publishes its own article links with the old scheme.
+    NewsSource("boj", "Bank of Japan", "https://www.boj.or.jp/en/rss/whatsnew.xml",
+               "www.boj.or.jp", "/en/mopo/", upgrade_legacy_http=True),
+    NewsSource("eia", "U.S. Energy Information Administration", "https://www.eia.gov/rss/todayinenergy.xml",
+               "www.eia.gov", "/todayinenergy/",
+               article_pattern=re.compile(r"/todayinenergy/detail\.php\?id=[1-9][0-9]*"),
+               feed_encoding="iso-8859-1"),
+    NewsSource("unpress", "United Nations Meetings Coverage", "https://press.un.org/en/rss.xml",
+               "press.un.org", "/en/", article_pattern=re.compile(r"/en/[0-9]{4}/[a-z0-9_-]+\.doc\.htm")),
+    NewsSource("eucommission", "European Commission Press Corner", "https://ec.europa.eu/commission/presscorner/api/rss",
+               "ec.europa.eu", "/commission/presscorner/detail/en/"),
+    NewsSource("bea", "U.S. Bureau of Economic Analysis", "https://apps.bea.gov/rss/rss.xml",
+               "www.bea.gov", "/news/"),
 )
 
 
@@ -64,17 +89,26 @@ def _article_url(raw: str, source: NewsSource) -> str:
         return ""
     try:
         link = urlsplit(urljoin(source.feed_url, raw))
-        if (link.scheme != "https" or link.hostname != source.article_host
-                or link.port not in {None, 443} or link.username is not None or link.password is not None):
+        is_https = link.scheme == "https" and link.port in {None, 443}
+        is_legacy_http = source.upgrade_legacy_http and link.scheme == "http" and link.port is None
+        if (not (is_https or is_legacy_http) or link.hostname != source.article_host
+                or link.username is not None or link.password is not None):
             return ""
     except ValueError:
         return ""
-    path = unquote(link.path)
-    if (not path.startswith(source.path_prefix) or path == source.path_prefix
+    # ECB emits article URLs with two leading slashes in the HTTPS path.
+    raw_path = "/" + link.path.lstrip("/") if source.slug == "ecb" else link.path
+    path = unquote(raw_path)
+    prefixes = (source.path_prefix, *source.additional_article_prefixes)
+    if (not path.startswith(prefixes) or path in prefixes
             or "\\" in path or any(segment in {".", ".."} for segment in path.split("/"))
             or any(ord(character) < 32 for character in path)):
         return ""
-    return urlunsplit(("https", source.article_host, link.path, link.query, ""))
+    if source.article_pattern is not None and not source.article_pattern.fullmatch(
+        urlunsplit(("", "", raw_path, link.query, ""))
+    ):
+        return ""
+    return urlunsplit(("https", source.article_host, raw_path, link.query, ""))
 
 
 def _published_at(raw: str) -> float | None:
@@ -125,10 +159,10 @@ def _item_from_entry(
 
 
 def parse_feed(payload: bytes, source: NewsSource, *, fetched_at: float) -> list[NewsItem]:
-    """Parse a bounded UTF-8 RSS/Atom feed without fetching linked content."""
+    """Parse a bounded RSS/Atom feed using its configured encoding."""
     if len(payload) > MAX_FEED_BYTES:
         raise ValueError("Feed exceeds size limit")
-    text = payload.decode("utf-8-sig")
+    text = payload.decode(source.feed_encoding)
     if "\0" in text or XML_DECLARATION.search(text):
         raise ValueError("Feed contains an unsupported XML declaration")
     try:
@@ -149,11 +183,19 @@ def parse_feed(payload: bytes, source: NewsSource, *, fetched_at: float) -> list
     return sorted(by_id.values(), key=lambda item: (item.published_at, item.id), reverse=True)[:MAX_ITEMS_PER_SOURCE]
 
 
+@cache
+def _europa_tls_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    context.load_verify_locations(cafile=certifi.where())
+    return context
+
+
 async def _fetch_feed(session: aiohttp.ClientSession, source: NewsSource) -> tuple[list[NewsItem], str]:
     payload = bytearray()
     try:
         async with session.get(
             source.feed_url, timeout=FEED_TIMEOUT, allow_redirects=False, auto_decompress=False,
+            ssl=_europa_tls_context() if source.slug in {"ecb", "eucommission"} else True,
             headers={"Accept-Encoding": "identity", "User-Agent": "Pyatnitsa2-public-news/1.0"},
         ) as response:
             if response.status != 200:
@@ -169,16 +211,19 @@ async def _fetch_feed(session: aiohttp.ClientSession, source: NewsSource) -> tup
     except (aiohttp.ClientError, OSError):
         return [], "unavailable"
     try:
-        return parse_feed(bytes(payload), source, fetched_at=time.time()), "ok"
+        items = parse_feed(bytes(payload), source, fetched_at=time.time())
     except ValueError:
         return [], "invalid_feed"
+    return items, "ok" if items else "no_verified_items"
 
 
-async def fetch_official_news(session: aiohttp.ClientSession) -> tuple[list[NewsItem], dict[str, str]]:
-    batches = await asyncio.gather(*(_fetch_feed(session, source) for source in SOURCES))
+async def fetch_official_news(
+    session: aiohttp.ClientSession, *, sources: tuple[NewsSource, ...] = SOURCES,
+) -> tuple[list[NewsItem], dict[str, str]]:
+    batches = await asyncio.gather(*(_fetch_feed(session, source) for source in sources))
     items: list[NewsItem] = []
     health: dict[str, str] = {}
-    for source, (batch, status) in zip(SOURCES, batches, strict=True):
+    for source, (batch, status) in zip(sources, batches, strict=True):
         items.extend(batch)
         health[source.slug] = status
     items.sort(key=lambda item: (item.published_at, item.id), reverse=True)
