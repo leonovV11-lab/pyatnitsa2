@@ -193,6 +193,33 @@ def reaction(direction="up"):
 
 
 class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_catalog_checks_reference_pairs_each_scan_and_rotates_every_other_pair(self):
+        priority = ("BTC/USDT", "ETH/USDT")
+        rotating = tuple(f"TEST{i}/USDT" for i in range(63))
+        catalog = (*rotating[:9], priority[0], *rotating[9:37], priority[1], *rotating[37:])
+        with TemporaryDirectory() as root:
+            journal = LiveJournal(Path(root) / "live.sqlite3")
+            options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"])
+            monitor = LiveMonitor(None, None, journal, options, all_pairs=True)
+            with patch.object(monitor.market, "spot_symbols", new=AsyncMock(return_value=catalog)):
+                batches = [await monitor.scan_symbols() for _ in range(4)]
+            self.assertEqual(monitor.catalog_size, len(catalog))
+            self.assertEqual([batch[:2] for batch in batches], [priority] * 4)
+            self.assertTrue(all(len(batch) <= 32 and len(set(batch)) == len(batch) for batch in batches))
+            self.assertEqual(tuple(pair for batch in batches[:3] for pair in batch[2:]), rotating)
+            self.assertEqual(batches[0], batches[3])
+
+    async def test_catalog_checks_available_reference_pairs_only(self):
+        with TemporaryDirectory() as root:
+            journal = LiveJournal(Path(root) / "live.sqlite3")
+            options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"])
+            monitor = LiveMonitor(None, None, journal, options, all_pairs=True)
+            get_symbols = AsyncMock(side_effect=[("ETH/USDT",), ("OTHER/USDT", "ETH/USDT"), ()])
+            with patch.object(monitor.market, "spot_symbols", new=get_symbols):
+                self.assertEqual(await monitor.scan_symbols(), ("ETH/USDT",))
+                self.assertEqual(await monitor.scan_symbols(), ("ETH/USDT", "OTHER/USDT"))
+                self.assertEqual(await monitor.scan_symbols(), ())
+
     async def verify_flow(self, *, history_supported=True, revised=False, team_complete=True, telegram=False,
                           symbols=("BTC/USDT",), stale_symbol=None, manual_replies=False):
         now = time.time()

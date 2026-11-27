@@ -44,6 +44,7 @@ SIGNAL_TTL = 5
 RISK_RESERVATION_SECONDS = 300
 MAX_SYMBOLS = 16
 PAIRS_PER_CATALOG_SCAN = 32
+CATALOG_REFERENCE_PAIRS = ("BTC/USDT", "ETH/USDT")
 CHART_MINUTES_SECONDS = 300
 MAX_REVIEWS_PER_SCAN = 4
 EXTRA_COST_PER_SIDE = 0.001
@@ -441,12 +442,15 @@ class LiveMonitor:
             return tuple(self.options.symbols)
         symbols = await self.market.spot_symbols()
         self.catalog_size = len(symbols)
-        if not symbols:
-            return ()
-        current = self.market_cursor % len(symbols)
-        batch = symbols[current:current + PAIRS_PER_CATALOG_SCAN]
-        self.market_cursor = (current + len(batch)) % len(symbols)
-        return batch
+        reference = tuple(symbol for symbol in CATALOG_REFERENCE_PAIRS if symbol in symbols)
+        rotating = tuple(symbol for symbol in symbols if symbol not in reference)
+        if not rotating:
+            self.market_cursor = 0
+            return reference
+        current = self.market_cursor % len(rotating)
+        batch = rotating[current:current + PAIRS_PER_CATALOG_SCAN - len(reference)]
+        self.market_cursor = (current + len(batch)) % len(rotating)
+        return reference + batch
 
     def watch(self, event, symbol, reason, **details):
         identity = event["id"], symbol
