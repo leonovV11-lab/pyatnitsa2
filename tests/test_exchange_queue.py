@@ -17,11 +17,14 @@ class DynamicCatalogTests(unittest.IsolatedAsyncioTestCase):
         symbols = tuple(f"A{index}/{('BTC' if index % 2 else 'USDT')}" for index in range(70))
         options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"])
         monitor = LiveMonitor(None, None, None, options, all_pairs=True)
-        monitor.market = SimpleNamespace(spot_symbols=AsyncMock(return_value=symbols))
-        pages = [await monitor.scan_symbols() for _ in range(3)]
-        self.assertEqual(tuple(pair for page in pages for pair in page), symbols)
-        self.assertTrue(any(pair.endswith("/BTC") for pair in pages[0]))
-        self.assertEqual(await monitor.scan_symbols(), pages[0])
+        with (
+            patch.object(monitor.market, "spot_symbols", new=AsyncMock(return_value=symbols)),
+            patch.object(monitor.market, "universe", new=AsyncMock(return_value=[])),
+        ):
+            pages = [await monitor.scan_symbols() for _ in range(2)]
+            self.assertEqual(tuple(pair for page in pages for pair in page), symbols)
+            self.assertTrue(any(pair.endswith("/BTC") for pair in pages[0]))
+            self.assertEqual(await monitor.scan_symbols(), pages[0])
 
     async def test_non_usdt_funding_uses_fresh_conversion_in_both_directions(self):
         from market import MarketError, Quote

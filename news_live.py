@@ -20,7 +20,13 @@ from telegram.error import InvalidToken, TelegramError
 import config
 from live_delivery import TelegramOutbox, TelegramPublisher
 from live_evidence import assess_recorded_history, read_recorded_history
-from live_market_check import observe_reaction, prepare_candidate, refresh_plan
+from live_market_check import (
+    FIFTEEN_MINUTES,
+    FIVE_MINUTES,
+    observe_reaction,
+    prepare_candidate,
+    refresh_plan,
+)
 from live_portfolio import MAX_PORTFOLIO_AGE_SECONDS, read_portfolio
 from live_readiness import readiness_report
 from live_reply_worker import check_reply_transport, run_replies
@@ -43,9 +49,13 @@ from strategies import BASELINE, MAX_POSITION_FRACTION, MIN_NET_PAYOFF
 SIGNAL_TTL = 5
 RISK_RESERVATION_SECONDS = 300
 MAX_SYMBOLS = 16
-PAIRS_PER_CATALOG_SCAN = 32
+PAIRS_PER_CATALOG_SCAN = 64
 CATALOG_REFERENCE_PAIRS = ("BTC/USDT", "ETH/USDT")
-CHART_MINUTES_SECONDS = 300
+CATALOG_PRIORITY_LIMIT = 8
+CATALOG_VOLUME_TTL = 300
+CATALOG_VOLUME_RETRY = 30
+CHART_MINUTES_SECONDS = FIVE_MINUTES
+SCAN_CANDLE_INTERVALS = {"5m": FIVE_MINUTES, "15m": FIFTEEN_MINUTES}
 MAX_REVIEWS_PER_SCAN = 4
 EXTRA_COST_PER_SIDE = 0.001
 DISCOVERY_SOURCES = (
@@ -400,19 +410,44 @@ def ranking_key(candidate):
 
 
 class ScanMarket:
-    """Reuse each public candle response within one scan."""
+    """Share candle requests and reuse current confirmed candles across scans."""
 
     def __init__(self, market):
         self.exchange = market.exchange
         self.quote = market.quote
         self.market = market
         self.requests = {}
+        self.closed_frames = {}
+
+    @staticmethod
+    def candle_boundary(interval, now):
+        seconds = SCAN_CANDLE_INTERVALS[interval]
+        return int(now // seconds) * seconds
+
+    def begin_scan(self):
+        now = time.time()
+        self.requests.clear()
+        self.closed_frames = {
+            request: cached for request, cached in self.closed_frames.items()
+            if cached[0] == self.candle_boundary(request[1], now)
+        }
 
     async def candles(self, symbol, interval, limit):
         identity = symbol, interval, limit
-        if identity not in self.requests:
-            self.requests[identity] = asyncio.create_task(self.market.candles(symbol, interval, limit))
-        return await self.requests[identity]
+        if interval not in SCAN_CANDLE_INTERVALS:
+            return await self.market.candles(symbol, interval, limit)
+        boundary = self.candle_boundary(interval, time.time())
+        cached = self.closed_frames.get(identity)
+        if cached is not None and cached[0] == boundary:
+            return cached[1]
+        key = identity, boundary
+        if key not in self.requests:
+            self.requests[key] = asyncio.create_task(self.market.candles(symbol, interval, limit))
+        frame = await self.requests[key]
+        # The exchange can be one candle behind just after a close. Retry such frames next scan.
+        if not frame.empty and frame["ts"].iloc[-1].timestamp() + SCAN_CANDLE_INTERVALS[interval] == boundary:
+            self.closed_frames[identity] = boundary, frame
+        return frame
 
 
 class LiveMonitor:
@@ -432,6 +467,9 @@ class LiveMonitor:
         self.daily_risk_cap = daily_risk_cap
         self.market_cursor = 0
         self.catalog_size = len(options.symbols)
+        self.liquid_pairs = ()
+        self.liquidity_refresh_at = 0.0
+        self.scan_market = ScanMarket(self.market)
         self.candidate_cache = {}
         self.cached_history = []
         self.last_decisions = {}
@@ -442,15 +480,26 @@ class LiveMonitor:
             return tuple(self.options.symbols)
         symbols = await self.market.spot_symbols()
         self.catalog_size = len(symbols)
-        reference = tuple(symbol for symbol in CATALOG_REFERENCE_PAIRS if symbol in symbols)
-        rotating = tuple(symbol for symbol in symbols if symbol not in reference)
+        if symbols and time.monotonic() >= self.liquidity_refresh_at:
+            try:
+                self.liquid_pairs = tuple(await self.market.universe(limit=CATALOG_PRIORITY_LIMIT))
+            except MarketError:
+                self.liquid_pairs = ()
+                self.liquidity_refresh_at = time.monotonic() + CATALOG_VOLUME_RETRY
+            else:
+                self.liquidity_refresh_at = time.monotonic() + CATALOG_VOLUME_TTL
+        active = set(symbols)
+        priorities = dict.fromkeys(symbol for symbol in (*CATALOG_REFERENCE_PAIRS, *self.liquid_pairs)
+                                  if symbol in active)
+        priority = tuple(priorities)[:CATALOG_PRIORITY_LIMIT]
+        rotating = tuple(symbol for symbol in symbols if symbol not in priority)
         if not rotating:
             self.market_cursor = 0
-            return reference
+            return priority
         current = self.market_cursor % len(rotating)
-        batch = rotating[current:current + PAIRS_PER_CATALOG_SCAN - len(reference)]
+        batch = rotating[current:current + PAIRS_PER_CATALOG_SCAN - len(priority)]
         self.market_cursor = (current + len(batch)) % len(rotating)
-        return reference + batch
+        return priority + batch
 
     def watch(self, event, symbol, reason, **details):
         identity = event["id"], symbol
@@ -672,13 +721,15 @@ class LiveMonitor:
               "team_enabled": options.team, "symbols": len(symbols), "catalog_size": self.catalog_size,
               "collecting_market_evidence": self.sampler is not None,
               "daily_risk_configured": self.daily_risk_cap is not None})
-        market = ScanMarket(self.market)
+        if self.scan_market.market is not self.market:
+            self.scan_market = ScanMarket(self.market)
+        self.scan_market.begin_scan()
         candidates = []
         for event in events:
             if (event["id"], event["revision"]) not in listed:
                 self.watch(event, None, "official_release_unavailable")
                 continue
-            candidates.extend(await self.scan_event(market, event, history, symbols))
+            candidates.extend(await self.scan_event(self.scan_market, event, history, symbols))
         if self.all_pairs:
             chart_close = int(time.time() // CHART_MINUTES_SECONDS) * CHART_MINUTES_SECONDS
             current_symbols = set(symbols)

@@ -8,10 +8,19 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pandas as pd
+
 from live_delivery import TelegramPublisher
 from live_telegram import DeliveryResult
+from market import MarketError
 from news_agent_team import ROLE_GROUPS
-from news_live import LiveJournal, LiveMonitor, classify_live_event, review_verdict
+from news_live import (
+    LiveJournal,
+    LiveMonitor,
+    ScanMarket,
+    classify_live_event,
+    review_verdict,
+)
 from official_news import NewsItem
 
 
@@ -194,19 +203,25 @@ def reaction(direction="up"):
 
 class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_catalog_checks_reference_pairs_each_scan_and_rotates_every_other_pair(self):
-        priority = ("BTC/USDT", "ETH/USDT")
-        rotating = tuple(f"TEST{i}/USDT" for i in range(63))
-        catalog = (*rotating[:9], priority[0], *rotating[9:37], priority[1], *rotating[37:])
+        priority = ("BTC/USDT", "ETH/USDT", "SOL/USDT")
+        rotating = tuple(f"TEST{i}/USDT" for i in range(130))
+        catalog = (*rotating[:9], priority[0], *rotating[9:37], priority[1], priority[2], *rotating[37:])
         with TemporaryDirectory() as root:
             journal = LiveJournal(Path(root) / "live.sqlite3")
             options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"])
             monitor = LiveMonitor(None, None, journal, options, all_pairs=True)
-            with patch.object(monitor.market, "spot_symbols", new=AsyncMock(return_value=catalog)):
+            universe = AsyncMock(return_value=["ABSENT/USDT", "SOL/USDT", "BTC/USDT"])
+            with (
+                patch.object(monitor.market, "spot_symbols", new=AsyncMock(return_value=catalog)),
+                patch.object(monitor.market, "universe", new=universe),
+            ):
                 batches = [await monitor.scan_symbols() for _ in range(4)]
+            universe.assert_awaited_once()
             self.assertEqual(monitor.catalog_size, len(catalog))
-            self.assertEqual([batch[:2] for batch in batches], [priority] * 4)
-            self.assertTrue(all(len(batch) <= 32 and len(set(batch)) == len(batch) for batch in batches))
-            self.assertEqual(tuple(pair for batch in batches[:3] for pair in batch[2:]), rotating)
+            self.assertEqual([batch[:3] for batch in batches], [priority] * 4)
+            self.assertEqual([len(batch) for batch in batches], [64, 64, 11, 64])
+            self.assertTrue(all(len(set(batch)) == len(batch) for batch in batches))
+            self.assertEqual(tuple(pair for batch in batches[:3] for pair in batch[3:]), rotating)
             self.assertEqual(batches[0], batches[3])
 
     async def test_catalog_checks_available_reference_pairs_only(self):
@@ -215,10 +230,39 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
             options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"])
             monitor = LiveMonitor(None, None, journal, options, all_pairs=True)
             get_symbols = AsyncMock(side_effect=[("ETH/USDT",), ("OTHER/USDT", "ETH/USDT"), ()])
-            with patch.object(monitor.market, "spot_symbols", new=get_symbols):
+            with (
+                patch.object(monitor.market, "spot_symbols", new=get_symbols),
+                patch.object(monitor.market, "universe", new=AsyncMock(side_effect=MarketError("ticker unavailable"))),
+            ):
                 self.assertEqual(await monitor.scan_symbols(), ("ETH/USDT",))
                 self.assertEqual(await monitor.scan_symbols(), ("ETH/USDT", "OTHER/USDT"))
                 self.assertEqual(await monitor.scan_symbols(), ())
+
+    async def test_closed_candle_cache_reloads_at_boundary_and_retries_stale_and_failed_frames(self):
+        close = 1_800_000_000
+
+        def frame(opened):
+            return pd.DataFrame({"ts": [pd.Timestamp(opened, unit="s", tz="UTC")]})
+
+        stale = frame(close - 600)
+        current = frame(close - 300)
+        next_frame = frame(close)
+        fetch = AsyncMock(side_effect=[stale, MarketError("temporarily unavailable"), current, next_frame])
+        market = ScanMarket(SimpleNamespace(exchange="okx", quote=None, candles=fetch))
+        with patch("news_live.time.time", return_value=close + 1) as clock:
+            self.assertIs(await market.candles("BTC/USDT", "5m", 50), stale)
+            market.begin_scan()
+            with self.assertRaises(MarketError):
+                await market.candles("BTC/USDT", "5m", 50)
+            market.begin_scan()
+            self.assertIs(await market.candles("BTC/USDT", "5m", 50), current)
+            clock.return_value = close + 240
+            market.begin_scan()
+            self.assertIs(await market.candles("BTC/USDT", "5m", 50), current)
+            clock.return_value = close + 300
+            market.begin_scan()
+            self.assertIs(await market.candles("BTC/USDT", "5m", 50), next_frame)
+        self.assertEqual(fetch.await_count, 4)
 
     async def verify_flow(self, *, history_supported=True, revised=False, team_complete=True, telegram=False,
                           symbols=("BTC/USDT",), stale_symbol=None, manual_replies=False):
