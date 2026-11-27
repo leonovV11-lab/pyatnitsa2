@@ -1,3 +1,4 @@
+import asyncio
 import time
 import unittest
 from contextlib import closing
@@ -6,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pandas as pd
 
@@ -20,6 +21,7 @@ from news_live import (
     ScanMarket,
     classify_live_event,
     review_verdict,
+    run_monitor,
 )
 from official_news import NewsItem
 
@@ -202,6 +204,128 @@ def reaction(direction="up"):
 
 
 class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_continuous_scanner_runs_again_while_review_is_waiting(self):
+        review_started = asyncio.Event()
+        scan_continued = asyncio.Event()
+        stop_review = asyncio.Event()
+        options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"], team=True, once=False, all_pairs=False,
+                                  manual_replies=False, collect_market_evidence=False, daily_risk_cap=None,
+                                  interval=0.01)
+        monitor = LiveMonitor(None, None, None, options)
+        scan_count = 0
+
+        async def scan(*, background_reviews=False):
+            nonlocal scan_count
+            self.assertTrue(background_reviews)
+            scan_count += 1
+            if scan_count == 1:
+                monitor.schedule_reviews(["first"])
+            elif review_started.is_set():
+                scan_continued.set()
+
+        async def review(_candidates, *, history_snapshot):
+            review_started.set()
+            await stop_review.wait()
+
+        with (
+            patch("news_live.LiveMonitor", return_value=monitor),
+            patch.object(monitor, "scan_once", side_effect=scan),
+            patch.object(monitor, "review_ranked", side_effect=review),
+        ):
+            service = asyncio.create_task(run_monitor(options, None))
+            try:
+                await asyncio.wait_for(scan_continued.wait(), timeout=2)
+                self.assertGreaterEqual(scan_count, 2)
+            finally:
+                service.cancel()
+                await asyncio.gather(service, return_exceptions=True)
+
+    async def test_background_review_keeps_only_latest_waiting_batch(self):
+        started = asyncio.Event()
+        allow_first_to_finish = asyncio.Event()
+        latest_started = asyncio.Event()
+        options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"])
+        monitor = LiveMonitor(None, None, None, options)
+        reviewed = []
+
+        async def review(candidates, *, history_snapshot):
+            reviewed.append((candidates, history_snapshot))
+            if candidates == ["first"]:
+                started.set()
+                await allow_first_to_finish.wait()
+            else:
+                latest_started.set()
+
+        with patch.object(monitor, "review_ranked", side_effect=review):
+            worker = asyncio.create_task(monitor.review_loop())
+            try:
+                monitor.schedule_reviews(["first"])
+                await asyncio.wait_for(started.wait(), timeout=1)
+                monitor.schedule_reviews(["superseded"])
+                monitor.cached_history = [{"new": True}]
+                monitor.schedule_reviews(["latest"])
+                allow_first_to_finish.set()
+                await asyncio.wait_for(latest_started.wait(), timeout=1)
+                self.assertEqual(reviewed, [(["first"], []), (["latest"], [{"new": True}])])
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+
+    async def test_queued_expired_release_skips_quote_and_team(self):
+        options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"], team=True, max_reviews_per_scan=1)
+        monitor = LiveMonitor(None, None, None, options)
+        monitor.listed_news = {("event", "r1")}
+        event = {"id": "event", "revision": "r1", "published_at": time.time() - 7200}
+        row = {"event": event, "symbol": "BTC/USDT", "draft": {}, "stats": {}}
+        with (
+            patch.object(monitor, "watch") as watch,
+            patch.object(monitor, "current_plan") as plan,
+            patch.object(monitor, "review") as review,
+        ):
+            await monitor.review_ranked([row], history_snapshot=monitor.cached_history)
+            watch.assert_called_once_with(event, "BTC/USDT", "release_window_expired")
+            plan.assert_not_called()
+            review.assert_not_called()
+
+    async def test_release_expiring_during_precheck_skips_team(self):
+        now = time.time()
+        options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"], team=True, max_reviews_per_scan=1,
+                                  history_file=None)
+        journal = SimpleNamespace(has_review=Mock(return_value=False), claim_review=Mock())
+        monitor = LiveMonitor(None, None, journal, options)
+        monitor.listed_news = {("event", "r1")}
+        event = {"id": "event", "revision": "r1", "published_at": now - 5399}
+        row = {"event": event, "symbol": "BTC/USDT", "draft": {}, "stats": {}}
+        with (
+            patch("news_live.time.time", return_value=now) as clock,
+            patch.object(monitor, "watch") as watch,
+            patch.object(monitor, "review") as review,
+        ):
+            async def plan(*_):
+                clock.return_value = now + 2
+                return {}, None, ""
+
+            with patch.object(monitor, "current_plan", side_effect=plan):
+                await monitor.review_ranked([row], history_snapshot=monitor.cached_history)
+            watch.assert_called_once_with(event, "BTC/USDT", "release_window_expired")
+            journal.claim_review.assert_not_called()
+            review.assert_not_called()
+
+    async def test_catalog_error_does_not_preserve_obsolete_history(self):
+        with TemporaryDirectory() as root:
+            journal = LiveJournal(Path(root) / "live.sqlite3")
+            options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"], history_file=None)
+            monitor = LiveMonitor(None, None, journal, options, all_pairs=True)
+            monitor.cached_history = [{"old": True}]
+            with (
+                patch.object(monitor, "refresh_sources", new=AsyncMock(return_value=([], {}, set()))),
+                patch("news_live.fetch_discovery_news", new=AsyncMock(return_value=([], {}))),
+                patch.object(monitor, "scan_symbols", new=AsyncMock(side_effect=MarketError("unavailable"))),
+                patch("news_live.emit"),
+            ):
+                await monitor.scan_once(background_reviews=True)
+            self.assertEqual(monitor.cached_history, [])
+
     async def test_catalog_checks_reference_pairs_each_scan_and_rotates_every_other_pair(self):
         priority = ("BTC/USDT", "ETH/USDT", "SOL/USDT")
         rotating = tuple(f"TEST{i}/USDT" for i in range(130))
@@ -265,7 +389,8 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fetch.await_count, 4)
 
     async def verify_flow(self, *, history_supported=True, revised=False, team_complete=True, telegram=False,
-                          symbols=("BTC/USDT",), stale_symbol=None, manual_replies=False):
+                          symbols=("BTC/USDT",), stale_symbol=None, manual_replies=False, history_changed=False,
+                          source_lost_on_final_quote=False):
         now = time.time()
         initial = release(now)
         updated = release(now + 1800, "r2")
@@ -298,10 +423,14 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(evidence["mode"], "live")
             self.assertNotIn("qty", evidence["market"]["plan"])
             steps.append("agents")
+            if history_changed:
+                monitor.cached_history = [{"changed": True}]
             return rows
 
         async def refresh(_market, setup, _budget, _fee_rate):
             steps.append("quote")
+            if source_lost_on_final_quote and steps.count("quote") == 2:
+                monitor.listed_news.clear()
             if setup["symbol"] == stale_symbol:
                 return None, "quote_stale"
             return {**plan, "quote_observed_at": time.time()}, ""
@@ -330,7 +459,8 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
                 await monitor.scan_once()
                 if manual_replies:
                     await monitor.scan_once()
-            if telegram and history_supported and not revised and team_complete:
+            if (telegram and history_supported and not revised and team_complete
+                    and not history_changed and not source_lost_on_final_quote):
                 send.assert_awaited_once()
                 self.assertEqual(send.await_args.args[1], 1234)
             else:
@@ -363,6 +493,16 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_reviewed_signal_is_delivered_to_telegram(self):
         _, _, report = await self.verify_flow(telegram=True)
         self.assertEqual(report["telegram_deliveries"], {"sent": 1})
+
+    async def test_changed_history_during_review_blocks_delivery(self):
+        _, output, report = await self.verify_flow(telegram=True, history_changed=True)
+        self.assertEqual(output[-1]["reason"], "history_changed_during_review")
+        self.assertEqual(report["telegram_deliveries"], {})
+
+    async def test_release_lost_while_waiting_for_final_quote_blocks_delivery(self):
+        _, output, report = await self.verify_flow(telegram=True, source_lost_on_final_quote=True)
+        self.assertEqual(output[-1]["reason"], "release_changed_during_review")
+        self.assertEqual(report["telegram_deliveries"], {})
 
     async def test_one_signal_waits_for_manual_reply_after_both_pairs_are_ranked(self):
         steps, output, _ = await self.verify_flow(symbols=("BTC/USDT", "ETH/USDT"), telegram=True,

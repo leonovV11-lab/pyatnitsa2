@@ -473,6 +473,8 @@ class LiveMonitor:
         self.scan_market = ScanMarket(self.market)
         self.candidate_cache = {}
         self.cached_history = []
+        self.review_batches = asyncio.Queue(maxsize=1)
+        self.source_refresh_lock = asyncio.Lock()
         self.last_decisions = {}
         self.listed_news = set()
 
@@ -512,14 +514,15 @@ class LiveMonitor:
               "headline": event["title"], "url": event["url"], "symbol": symbol, "reason": reason, **details})
 
     async def refresh_sources(self):
-        items, health = await fetch_official_news(self.public_session)
-        for item in items:
-            self.journal.observe(item)
-        listed = {(item.id, item.revision) for item in items if health.get(item.source) == "ok"}
-        self.listed_news = listed
-        for change in self.journal.invalidate(health, time.time(), listed):
-            emit(change)
-        return items, health, listed
+        async with self.source_refresh_lock:
+            items, health = await fetch_official_news(self.public_session)
+            for item in items:
+                self.journal.observe(item)
+            listed = {(item.id, item.revision) for item in items if health.get(item.source) == "ok"}
+            self.listed_news = listed
+            for change in self.journal.invalidate(health, time.time(), listed):
+                emit(change)
+            return items, health, listed
 
     def portfolio(self):
         path = self.options.portfolio_file
@@ -529,6 +532,17 @@ class LiveMonitor:
             return read_portfolio(path, as_of=time.time()), ""
         except ValueError:
             return None, "portfolio_snapshot_unavailable"
+
+    def refresh_recorded_history(self):
+        try:
+            history = read_recorded_history(self.options.history_file)
+        except (OSError, ValueError):
+            history = []
+            emit({"type": "history_unavailable", "reason": "cannot_read_real_fill_export"})
+        if history != self.cached_history:
+            self.candidate_cache.clear()
+            self.cached_history = history
+        return self.cached_history
 
     async def current_plan(self, draft, symbol):
         options = self.options
@@ -581,8 +595,9 @@ class LiveMonitor:
         )
         return (None, None, reason) if reason else (plan, portfolio, "")
 
-    async def review(self, event, symbol, check, stats, review_id):
+    async def review(self, event, symbol, check, stats, review_id, *, history_snapshot):
         options = self.options
+        event_revision = event["id"], event["revision"]
         plan = check["plan"]
         book = {field: plan.get(field) for field in ("price", "bid", "ask_size", "bid_size", "quote_observed_at")}
         snapshot = {
@@ -599,13 +614,19 @@ class LiveMonitor:
         review_result = {"evidence": snapshot, "agent_results": results}
         reason = review_verdict(results)
         alert = None
+        if not reason and history_snapshot is not self.cached_history:
+            reason = "history_changed_during_review"
         if not reason:
             _, _, still_listed = await self.refresh_sources()
-            if (event["id"], event["revision"]) not in still_listed:
+            if event_revision not in still_listed:
                 reason = "release_changed_during_review"
             else:
                 plan, portfolio, reason = await self.current_plan(check, symbol)
-                if plan is not None:
+                if history_snapshot is not self.refresh_recorded_history():
+                    reason = "history_changed_during_review"
+                elif event_revision not in self.listed_news:
+                    reason = "release_changed_during_review"
+                elif plan is not None:
                     details = {"review_id": review_id, "pnl": stats, "completed_agents": len(results),
                                "reaction_pct": check["market"].get("reaction_pct"),
                                "btc_reaction_pct": check["market"].get("btc_reaction_pct")}
@@ -666,10 +687,27 @@ class LiveMonitor:
             await self.sampler.collect(event, family, evidence_symbols)
         return candidates
 
-    async def review_ranked(self, candidates):
+    def schedule_reviews(self, candidates):
+        # Keep only the latest batch while the single review worker is occupied.
+        if self.review_batches.full():
+            self.review_batches.get_nowait()
+            self.review_batches.task_done()
+        self.review_batches.put_nowait((candidates, self.cached_history))
+
+    async def review_loop(self):
+        while True:
+            candidates, history_snapshot = await self.review_batches.get()
+            try:
+                await self.review_ranked(candidates, history_snapshot=history_snapshot)
+            finally:
+                self.review_batches.task_done()
+
+    async def review_ranked(self, candidates, *, history_snapshot):
         options = self.options
         reviews = 0
         for candidate in candidates:
+            if history_snapshot is not self.cached_history:
+                return
             event, symbol, draft, stats = (
                 candidate[field] for field in ("event", "symbol", "draft", "stats")
             )
@@ -690,19 +728,32 @@ class LiveMonitor:
             if (event["id"], event["revision"]) not in self.listed_news:
                 self.watch(event, symbol, "official_release_unavailable")
                 continue
+            if time.time() >= event["published_at"] + REACTION_WINDOW:
+                self.watch(event, symbol, "release_window_expired")
+                continue
             review_id = key("live-review", event["id"], event["revision"], options.venue, symbol,
                             BASELINE, config.TRADE_REVIEW_MODEL)
             if self.journal.has_review(review_id):
                 continue
             plan, _, reason = await self.current_plan(draft, symbol)
+            if history_snapshot is not self.refresh_recorded_history():
+                return
             if plan is None:
                 self.watch(event, symbol, reason, pnl=stats)
                 continue
-            if self.journal.claim_review(review_id, event, time.time()):
-                await self.review(event, symbol, {**draft, "plan": plan}, stats, review_id)
+            if (event["id"], event["revision"]) not in self.listed_news:
+                self.watch(event, symbol, "official_release_unavailable")
+                continue
+            now = time.time()
+            if now >= event["published_at"] + REACTION_WINDOW:
+                self.watch(event, symbol, "release_window_expired")
+                continue
+            if self.journal.claim_review(review_id, event, now):
+                await self.review(event, symbol, {**draft, "plan": plan}, stats, review_id,
+                                  history_snapshot=history_snapshot)
                 reviews += 1
 
-    async def scan_once(self):
+    async def scan_once(self, *, background_reviews=False):
         (items, health, listed), (discovery, discovery_health) = await asyncio.gather(
             self.refresh_sources(), fetch_discovery_news(self.public_session),
         )
@@ -714,19 +765,14 @@ class LiveMonitor:
         self.last_decisions = {identity: state for identity, state in self.last_decisions.items()
                                if identity[0] in visible}
         options = self.options
+        history = self.refresh_recorded_history()
         try:
             symbols = await self.scan_symbols()
         except MarketError:
             emit({"type": "catalog_unavailable", "venue": options.venue})
+            if background_reviews:
+                self.schedule_reviews([])
             return
-        try:
-            history = read_recorded_history(options.history_file)
-        except (OSError, ValueError):
-            history = []
-            emit({"type": "history_unavailable", "reason": "cannot_read_real_fill_export"})
-        if self.all_pairs and history != self.cached_history:
-            self.candidate_cache.clear()
-            self.cached_history = history
         emit({"type": "scan", "source_health": health, "received": len(items), "recent": len(events),
               "discovery_health": discovery_health, "discovery_candidates": discovered,
               "history_rows": len(history), "sizing_configured": options.budget is not None,
@@ -762,7 +808,10 @@ class LiveMonitor:
                  "lower_stressed_net_r": row["stats"]["lower_stressed_net_r"]}
                 for row in candidates[:MAX_SYMBOLS]
             ]})
-            await self.review_ranked(candidates)
+        if background_reviews:
+            self.schedule_reviews(candidates)
+        elif candidates:
+            await self.review_ranked(candidates, history_snapshot=self.cached_history)
 
 
 async def run_monitor(options, journal, publisher=None):
@@ -780,6 +829,8 @@ async def run_monitor(options, journal, publisher=None):
             return
         async with asyncio.TaskGroup() as tasks:
             wake = asyncio.Event()
+            if options.team:
+                tasks.create_task(monitor.review_loop())
             if monitor.sampler is not None:
                 tasks.create_task(monitor.sampler.run())
             if publisher is not None:
@@ -790,7 +841,7 @@ async def run_monitor(options, journal, publisher=None):
                         edit_lock=publisher.edit_lock,
                     ))
             while True:
-                await monitor.scan_once()
+                await monitor.scan_once(background_reviews=options.team)
                 try:
                     await asyncio.wait_for(wake.wait(), timeout=options.interval)
                 except TimeoutError:
