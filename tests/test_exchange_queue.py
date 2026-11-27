@@ -54,7 +54,7 @@ class DynamicCatalogTests(unittest.IsolatedAsyncioTestCase):
             "BTC/USDT", "okx", 100_000.0, 100_100.0, 10.0, 10.0, now,
         )))
         native = {"qty": 0.01, "price": 0.03, "stop": 0.0299, "loss": 0.000005, "reward": 0.00001,
-                  "ratio": 2.0, "valid_until": now + 60}
+                  "tp1": 0.032, "tp2": 0.034, "entry_max": 0.031, "ratio": 2.0, "valid_until": now + 60}
         with (
             patch.object(monitor, "portfolio", return_value=(portfolio, "")),
             patch("news_live.refresh_plan", new=AsyncMock(return_value=(native, ""))) as refresh,
@@ -62,14 +62,32 @@ class DynamicCatalogTests(unittest.IsolatedAsyncioTestCase):
             plan, used_portfolio, reason = await monitor.current_plan({"setup": {"symbol": "ETH/BTC"}}, "ETH/BTC")
         self.assertEqual(reason, "")
         self.assertIs(used_portfolio, portfolio)
+        assert plan is not None
         self.assertEqual(plan["quote_asset"], "BTC")
         self.assertEqual(plan["price"], 0.03)
+        self.assertEqual(plan["entry_max"], 0.03)
         self.assertAlmostEqual(plan["loss"], 0.5005)
         self.assertAlmostEqual(plan["reward"], 1.0)
         self.assertAlmostEqual(plan["notional_usdt"], 30.03)
+        self.assertAlmostEqual(plan["stressed_reward_usdt"], 0.937)
+        self.assertAlmostEqual(plan["stressed_ratio"], 0.937 / plan["stressed_loss_usdt"])
         self.assertLessEqual(plan["valid_until"], now + 5)
         max_notional_btc = refresh.await_args.args[2] * MAX_POSITION_FRACTION
         self.assertAlmostEqual(max_notional_btc * 100_100.0, 62.5)
+
+    async def test_rejects_plan_when_cost_stress_erases_required_payoff(self):
+        options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"], budget=1000.0, allocation_slots=1,
+                                  fee_rate=0.001, risk_cap=10.0, portfolio_file=None)
+        journal = SimpleNamespace(check_capacity=Mock(return_value=""))
+        monitor = LiveMonitor(None, None, journal, options)
+        plan = {"qty": 1.0, "price": 100.0, "stop": 99.2, "tp1": 101.15, "tp2": 101.5,
+                "loss": 0.9992, "reward": 1.123675, "ratio": 1.123675 / 0.9992, "entry_max": 100.05}
+        with patch("news_live.refresh_plan", new=AsyncMock(return_value=(plan, ""))):
+            self.assertEqual(
+                await monitor.current_plan({"setup": {"symbol": "BTC/USDT"}}, "BTC/USDT"),
+                (None, None, "payoff_below_cost_stress"),
+            )
+        journal.check_capacity.assert_not_called()
 
 
 class ManualIssueTests(unittest.TestCase):

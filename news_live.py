@@ -87,7 +87,8 @@ WORLD_RULES = (
     ("natural_disasters", r"\b(?:earthquake|hurricane|tsunami|flooding|wildfire)\b"),
 )
 _AGENT_NAMES = {name for _, roles in ROLE_GROUPS for name, _ in roles}
-_PUBLIC_PLAN_FIELDS = ("strategy", "price", "stop", "tp1", "tp2", "ratio", "entry_min", "entry_max", "quote_observed_at")
+_PUBLIC_PLAN_FIELDS = ("strategy", "price", "stop", "tp1", "tp2", "ratio", "stressed_ratio",
+                       "entry_min", "entry_max", "quote_observed_at")
 
 
 def classify_live_event(source, title):
@@ -562,6 +563,17 @@ class LiveMonitor:
             plan["valid_until"] = min(plan.get("valid_until", math.inf), rate.valid_until)
             if plan["ratio"] < MIN_NET_PAYOFF:
                 return None, None, "quote_conversion_reduces_net_payoff"
+        average_target = plan["tp1"] / 2 + plan["tp2"] / 2
+        extra_target_cost = EXTRA_COST_PER_SIDE * plan["qty"] * (plan["price"] + average_target) * rate.sell_rate
+        stressed_reward = plan["reward"] - extra_target_cost
+        stressed_risk = plan["stressed_loss_usdt"]
+        stressed_ratio = stressed_reward / stressed_risk if 0 < stressed_risk < math.inf else 0.0
+        if not MIN_NET_PAYOFF <= stressed_ratio < math.inf:
+            return None, None, "payoff_below_cost_stress"
+        plan["stressed_reward_usdt"] = stressed_reward
+        plan["stressed_ratio"] = stressed_ratio
+        # The risk and cash checks use this ask. A higher entry would invalidate the sizing.
+        plan["entry_max"] = plan["price"]
         reason = self.journal.check_capacity(
             symbol, plan, cap=options.risk_cap, budget=options.budget, as_of=time.time(), portfolio=portfolio,
             daily_risk_cap=self.daily_risk_cap,

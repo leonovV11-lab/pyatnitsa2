@@ -113,6 +113,14 @@ class LiveTelegramTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(expected, text)
         self.assertNotIn("\u202e", text)
 
+    async def test_signal_displays_stressed_reward_and_ratio_when_available(self):
+        alert = signal()
+        alert["plan"]["stressed_reward_usdt"] = 0.15
+        alert["plan"]["stressed_ratio"] = 1.15
+        self.assertEqual((await send_signal(self.bot, CHAT_ID, alert)).status, "sent")
+        text = self.bot.send_message.await_args.kwargs["text"]
+        self.assertIn("При обеих целях с повышенными издержками · 0.15 USDT · 1.15 R", text)
+
     async def test_stale_signal_and_bad_fields_never_touch_transport(self):
         stale = signal()
         stale["expires_at"] = NOW

@@ -350,6 +350,8 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
         signal = next(item for item in output if item["type"] == "live_signal")
         self.assertEqual(signal["evidence"]["completed_agents"], 50)
         self.assertGreater(signal["plan"]["stressed_loss_usdt"], signal["plan"]["loss"])
+        self.assertEqual(signal["plan"]["entry_max"], signal["plan"]["price"])
+        self.assertLess(signal["plan"]["stressed_ratio"], signal["plan"]["ratio"])
         self.assertEqual(report["finished_reviews"], 1)
         self.assertEqual(report["signals"], {"active": 1})
 

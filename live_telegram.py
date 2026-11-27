@@ -245,6 +245,13 @@ def _render(signal: dict, reason: str | None = None) -> tuple[str, float]:
         f"Риск по плану: {_decimal_text(loss, 6)} USDT · При росте издержек: {_decimal_text(stress, 6)} USDT",
         f"Расчёт при обеих целях: {_decimal_text(reward, 6)} USDT · {_decimal_text(ratio, 4)} R",
     ]
+    if "stressed_ratio" in plan or "stressed_reward_usdt" in plan:
+        stressed_ratio = _positive(plan.get("stressed_ratio"))
+        stressed_reward = _positive(plan.get("stressed_reward_usdt"))
+        lines.append(
+            f"При обеих целях с повышенными издержками · {_decimal_text(stressed_reward, 6)} USDT"
+            f" · {_decimal_text(stressed_ratio, 4)} R"
+        )
     if evidence := _evidence_lines(signal.get("evidence")):
         lines += ["", *evidence]
     if reason is None:
