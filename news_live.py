@@ -11,6 +11,7 @@ from collections import Counter
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import islice
 from pathlib import Path
 
 import aiohttp
@@ -702,56 +703,96 @@ class LiveMonitor:
             finally:
                 self.review_batches.task_done()
 
-    async def review_ranked(self, candidates, *, history_snapshot):
-        options = self.options
-        reviews = 0
+    def review_blocker(self, event):
+        if (event["id"], event["revision"]) not in self.listed_news:
+            return "official_release_unavailable"
+        if time.time() >= event["published_at"] + REACTION_WINDOW:
+            return "release_window_expired"
+        return ""
+
+    def available_reviews(self, candidates):
         for candidate in candidates:
-            if history_snapshot is not self.cached_history:
-                return
-            event, symbol, draft, stats = (
-                candidate[field] for field in ("event", "symbol", "draft", "stats")
-            )
-            if not options.team:
-                self.watch(event, symbol, "agent_team_disabled", pnl=stats)
+            event, symbol = candidate["event"], candidate["symbol"]
+            if reason := self.review_blocker(event):
+                self.watch(event, symbol, reason)
                 continue
-            if reviews >= options.max_reviews_per_scan:
-                break
-            if self.manual_replies and (publisher := self.publisher) is not None:
-                portfolio, reason = self.portfolio()
-                if not reason:
-                    reason = self.journal.slots.capacity(
-                        publisher.route, portfolio.open_symbols if portfolio else frozenset(),
-                    )
-                if reason:
-                    emit({"type": "manual_queue", "status": reason, "candidates_available": len(candidates)})
-                    return
-            if (event["id"], event["revision"]) not in self.listed_news:
-                self.watch(event, symbol, "official_release_unavailable")
-                continue
-            if time.time() >= event["published_at"] + REACTION_WINDOW:
-                self.watch(event, symbol, "release_window_expired")
-                continue
-            review_id = key("live-review", event["id"], event["revision"], options.venue, symbol,
+            review_id = key("live-review", event["id"], event["revision"], self.options.venue, symbol,
                             BASELINE, config.TRADE_REVIEW_MODEL)
-            if self.journal.has_review(review_id):
-                continue
-            plan, _, reason = await self.current_plan(draft, symbol)
-            if history_snapshot is not self.refresh_recorded_history():
+            if not self.journal.has_review(review_id):
+                yield candidate, review_id
+
+    def manual_review_available(self, candidate_count):
+        if not self.manual_replies or self.publisher is None:
+            return True
+        portfolio, reason = self.portfolio()
+        if not reason:
+            reason = self.journal.slots.capacity(
+                self.publisher.route, portfolio.open_symbols if portfolio else frozenset(),
+            )
+        if reason:
+            emit({"type": "manual_queue", "status": reason, "candidates_available": candidate_count})
+        return not reason
+
+    async def price_review(self, candidate, review_id):
+        event, symbol, stats = candidate["event"], candidate["symbol"], candidate["stats"]
+        plan, _, reason = await self.current_plan(candidate["draft"], symbol)
+        if blocker := self.review_blocker(event):
+            self.watch(event, symbol, blocker)
+            return None
+        if plan is None:
+            self.watch(event, symbol, reason, pnl=stats)
+            return None
+        # Historical R is normalized by initial risk. Use the same basis for the current plan.
+        profit = stats["lower_stressed_net_r"] * plan["loss"]
+        if not 0 < profit < math.inf:
+            self.watch(event, symbol, "profit_estimate_unavailable")
+            return None
+        return {"candidate": candidate, "review_id": review_id, "plan": plan, "profit": profit}
+
+    async def review_ranked(self, candidates, *, history_snapshot):
+        if not candidates:
+            return
+        options = self.options
+        if not options.team:
+            for candidate in candidates:
+                self.watch(candidate["event"], candidate["symbol"], "agent_team_disabled", pnl=candidate["stats"])
+            return
+        eligible = self.available_reviews(candidates)
+        reviews = 0
+        while reviews < options.max_reviews_per_scan:
+            if history_snapshot is not self.cached_history or not self.manual_review_available(len(candidates)):
                 return
-            if plan is None:
-                self.watch(event, symbol, reason, pnl=stats)
-                continue
-            if (event["id"], event["revision"]) not in self.listed_news:
-                self.watch(event, symbol, "official_release_unavailable")
-                continue
-            now = time.time()
-            if now >= event["published_at"] + REACTION_WINDOW:
-                self.watch(event, symbol, "release_window_expired")
-                continue
-            if self.journal.claim_review(review_id, event, now):
-                await self.review(event, symbol, {**draft, "plan": plan}, stats, review_id,
-                                  history_snapshot=history_snapshot)
-                reviews += 1
+            batch = list(islice(eligible, MAX_SYMBOLS))
+            if not batch:
+                return
+            estimates = [row for row in await asyncio.gather(
+                *(self.price_review(candidate, review_id) for candidate, review_id in batch),
+            ) if row is not None]
+            refreshed = set()
+            while estimates and reviews < options.max_reviews_per_scan:
+                if (history_snapshot is not self.refresh_recorded_history()
+                        or not self.manual_review_available(len(candidates))):
+                    return
+                estimates.sort(key=lambda row: (-row["profit"], ranking_key(row["candidate"])))
+                row = estimates.pop(0)
+                candidate, review_id, plan = row["candidate"], row["review_id"], row["plan"]
+                event, symbol = candidate["event"], candidate["symbol"]
+                if reason := self.review_blocker(event):
+                    self.watch(event, symbol, reason)
+                    continue
+                now = time.time()
+                deadline = min(plan.get("valid_until", math.inf),
+                               plan["quote_observed_at"] + DEFAULT_QUOTE_MAX_AGE)
+                if now >= deadline:
+                    if review_id not in refreshed:
+                        refreshed.add(review_id)
+                        if updated := await self.price_review(candidate, review_id):
+                            estimates.append(updated)
+                    continue
+                if self.journal.claim_review(review_id, event, now):
+                    await self.review(event, symbol, {**candidate["draft"], "plan": plan}, candidate["stats"],
+                                      review_id, history_snapshot=history_snapshot)
+                    reviews += 1
 
     async def scan_once(self, *, background_reviews=False):
         (items, health, listed), (discovery, discovery_health) = await asyncio.gather(

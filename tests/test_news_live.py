@@ -390,7 +390,8 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def verify_flow(self, *, history_supported=True, revised=False, team_complete=True, telegram=False,
                           symbols=("BTC/USDT",), stale_symbol=None, manual_replies=False, history_changed=False,
-                          source_lost_on_final_quote=False):
+                          source_lost_on_final_quote=False, scale_by_symbol=None, expire_once_symbol=None,
+                          refreshed_scale=None):
         now = time.time()
         initial = release(now)
         updated = release(now + 1800, "r2")
@@ -405,6 +406,7 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
             "loss": 1.2, "qty": 0.1, "reward": 1.68,
         }
         steps = []
+        planned_symbols = []
 
         async def sources(*_args):
             steps.append("source")
@@ -429,11 +431,22 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
 
         async def refresh(_market, setup, _budget, _fee_rate):
             steps.append("quote")
+            symbol = setup["symbol"]
+            planned_symbols.append(symbol)
             if source_lost_on_final_quote and steps.count("quote") == 2:
                 monitor.listed_news.clear()
-            if setup["symbol"] == stale_symbol:
+            if symbol == stale_symbol:
                 return None, "quote_stale"
-            return {**plan, "quote_observed_at": time.time()}, ""
+            stamp = time.time()
+            scale = (scale_by_symbol or {}).get(symbol, 1.0)
+            expiry = stamp + 5
+            if symbol == expire_once_symbol:
+                if planned_symbols.count(symbol) == 1:
+                    expiry = stamp - 1
+                elif refreshed_scale is not None:
+                    scale = refreshed_scale
+            return {**plan, **{field: plan[field] * scale for field in ("qty", "loss", "reward")},
+                    "quote_observed_at": stamp, "valid_until": expiry}, ""
 
         with TemporaryDirectory() as root:
             db = LiveJournal(Path(root) / "live.sqlite3")
@@ -521,12 +534,60 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
         symbols = tuple(f"ASSET{index}/USDT" for index in range(16))
         steps, output, _ = await self.verify_flow(symbols=symbols, stale_symbol=symbols[-1])
         self.assertEqual(steps[:33], ["source", *(["chart", "math"] * 16)])
-        self.assertEqual(steps[33:], ["quote", "quote", "agents", "source", "quote"])
+        self.assertEqual(steps[33:], ["quote"] * 16 + ["agents", "source", "quote"])
         ranking = next(item for item in output if item["type"] == "candidate_ranking")
         self.assertEqual(ranking["ranked"], 16)
         self.assertEqual(ranking["top"][0]["symbol"], symbols[-1])
         alert = next(item for item in output if item["type"] == "live_signal")
         self.assertEqual(alert["symbol"], symbols[-2])
+
+    async def test_prefers_larger_stressed_profit_at_current_position_size(self):
+        symbols = "BTC/USDT", "ETH/USDT"
+        _, output, _ = await self.verify_flow(symbols=symbols,
+                                              scale_by_symbol={symbols[0]: 1.25, symbols[1]: 0.5})
+        historical_rank = next(item for item in output if item["type"] == "candidate_ranking")
+        alert = next(item for item in output if item["type"] == "live_signal")
+        self.assertEqual(historical_rank["top"][0]["symbol"], symbols[1])
+        self.assertEqual(alert["symbol"], symbols[0])
+        self.assertAlmostEqual(alert["plan"]["loss"], 1.5)
+
+    async def test_refreshes_winning_plan_if_quote_expires_during_comparison(self):
+        symbols = "BTC/USDT", "ETH/USDT"
+        steps, output, _ = await self.verify_flow(symbols=symbols, expire_once_symbol=symbols[1])
+        self.assertEqual(steps.count("quote"), 4)
+        self.assertEqual(next(item for item in output if item["type"] == "live_signal")["symbol"], symbols[1])
+
+    async def test_reconsiders_priority_when_refreshed_size_falls(self):
+        symbols = "BTC/USDT", "ETH/USDT"
+        _, output, _ = await self.verify_flow(symbols=symbols, expire_once_symbol=symbols[1],
+                                              refreshed_scale=0.5)
+        self.assertEqual(next(item for item in output if item["type"] == "live_signal")["symbol"], symbols[0])
+
+    async def test_tries_next_batch_when_first_sixteen_have_no_viable_plan(self):
+        options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"], team=True, max_reviews_per_scan=1,
+                                  history_file=None)
+        journal = SimpleNamespace(has_review=Mock(return_value=False), claim_review=Mock(return_value=True))
+        monitor = LiveMonitor(None, None, journal, options, all_pairs=True)
+        event = {"id": "event", "revision": "r1", "published_at": time.time() - 600}
+        monitor.listed_news = {("event", "r1")}
+        symbols = [f"ASSET{index}/USDT" for index in range(17)]
+        candidates = [
+            {"event": event, "symbol": symbol, "draft": {},
+             "stats": {"lower_stressed_net_r": 0.15, "recent_mean_stressed_net_r": 0.18, "day_count": 20}}
+            for symbol in symbols
+        ]
+        plan = {"loss": 0.5, "quote_observed_at": time.time()}
+        drafts = [(None, None, "no_book")] * 16 + [(plan, None, "")]
+        with (
+            patch.object(monitor, "current_plan", new=AsyncMock(side_effect=drafts)) as price,
+            patch.object(monitor, "watch"),
+            patch.object(monitor, "review", new=AsyncMock()) as review,
+        ):
+            await monitor.review_ranked(candidates, history_snapshot=monitor.cached_history)
+            self.assertEqual(price.await_count, 17)
+            review.assert_awaited_once()
+            assert review.await_args is not None
+            self.assertEqual(review.await_args.args[1], symbols[-1])
 
     async def test_release_correction_after_agents_suppresses_signal(self):
         steps, output, report = await self.verify_flow(revised=True, telegram=True)
