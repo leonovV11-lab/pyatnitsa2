@@ -51,6 +51,18 @@ def signal():
     }
 
 
+def technical_setup():
+    alert = signal()
+    alert["type"] = "technical_setup"
+    alert["evidence"].pop("completed_agents")
+    plan = alert["plan"]
+    for field in ("qty", "loss", "reward", "ratio", "stressed_loss_usdt"):
+        plan.pop(field)
+    plan.update(entry_max=plan["price"], stressed_ratio=1.15, fee_rate=0.001, extra_cost_per_side=0.001,
+                quote_observed_at=NOW - 1, valid_until=NOW + 5)
+    return alert
+
+
 class LiveTelegramTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.bot = AsyncMock(spec=Bot)
@@ -120,6 +132,35 @@ class LiveTelegramTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await send_signal(self.bot, CHAT_ID, alert)).status, "sent")
         text = self.bot.send_message.await_args.kwargs["text"]
         self.assertIn("При обеих целях с повышенными издержками · 0.15 USDT · 1.15 R", text)
+
+    async def test_technical_setup_shows_native_levels_and_no_trade_controls(self):
+        alert = technical_setup()
+        alert["symbol"] = "ETH/BTC"
+        alert["plan"]["quote_asset"] = "BTC"
+        alert["reply_required"] = True
+        self.assertEqual((await send_signal(self.bot, CHAT_ID, alert)).status, "sent")
+        sent = self.bot.send_message.await_args.kwargs
+        self.assertIsNone(sent["reply_markup"])
+        for expected in ("Технический сигнал", "12500–12550.5 BTC", "12450.25 BTC",
+                         "12650.75 BTC", "12800 BTC", "1.15 R", "0.10%", "https://example.org/release"):
+            self.assertIn(expected, sent["text"])
+        self.assertNotIn("Вошёл", sent["text"])
+        self.assertNotIn("Объём:", sent["text"])
+        edited = await edit_signal(self.bot, CHAT_ID, 35, alert, "alert_expired", response_state="waiting")
+        self.assertEqual(edited.status, "sent")
+        kwargs = self.bot.edit_message_text.await_args.kwargs
+        self.assertIsNone(kwargs["reply_markup"])
+        self.assertIn("Технический сигнал", kwargs["text"])
+        self.assertIn("ИСТЁК", kwargs["text"])
+
+    async def test_technical_setup_rejects_above_snapshot_entry_or_invalid_fee(self):
+        bad_entry = technical_setup()
+        bad_entry["plan"]["entry_max"] += 1
+        bad_fee = technical_setup()
+        bad_fee["plan"]["fee_rate"] = True
+        self.assertEqual((await send_signal(self.bot, CHAT_ID, bad_entry)).reason, "signal_invalid")
+        self.assertEqual((await send_signal(self.bot, CHAT_ID, bad_fee)).reason, "signal_invalid")
+        self.bot.send_message.assert_not_awaited()
 
     async def test_stale_signal_and_bad_fields_never_touch_transport(self):
         stale = signal()

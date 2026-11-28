@@ -27,6 +27,7 @@ from live_market_check import (
     observe_reaction,
     prepare_candidate,
     refresh_plan,
+    refresh_technical_setup,
 )
 from live_portfolio import MAX_PORTFOLIO_AGE_SECONDS, read_portfolio
 from live_readiness import readiness_report
@@ -45,7 +46,12 @@ from news_journal import (
     key,
 )
 from official_news import NewsSource, fetch_official_news
-from strategies import BASELINE, MAX_POSITION_FRACTION, MIN_NET_PAYOFF
+from strategies import (
+    BASELINE,
+    EXTRA_COST_PER_SIDE,
+    MAX_POSITION_FRACTION,
+    MIN_NET_PAYOFF,
+)
 
 SIGNAL_TTL = 5
 RISK_RESERVATION_SECONDS = 300
@@ -58,7 +64,8 @@ CATALOG_VOLUME_RETRY = 30
 CHART_MINUTES_SECONDS = FIVE_MINUTES
 SCAN_CANDLE_INTERVALS = {"5m": FIVE_MINUTES, "15m": FIFTEEN_MINUTES}
 MAX_REVIEWS_PER_SCAN = 4
-EXTRA_COST_PER_SIDE = 0.001
+TECHNICAL_SETUP_TTL = 60
+MAX_TECHNICAL_SETUPS_PER_SCAN = 4
 DISCOVERY_SOURCES = (
     NewsSource("bbc_world", "BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml",
                "www.bbc.co.uk", "/news/"),
@@ -245,6 +252,43 @@ class LiveJournal(HeadlineJournal):
         with closing(self.connect()) as db:
             return db.execute("SELECT 1 FROM news_reviews WHERE review_id=?", (review_id,)).fetchone() is not None
 
+    def has_setup(self, event_id, venue, symbol):
+        with closing(self.connect()) as db:
+            return db.execute(
+                "SELECT 1 FROM live_setups WHERE id=?", (key("setup", event_id, venue, symbol),),
+            ).fetchone() is not None
+
+    def issue_setup(self, event, venue, symbol, plan, *, as_of, telegram_route, details=None):
+        quote_time = plan["quote_observed_at"]
+        if not telegram_route or not 0 <= as_of - quote_time <= DEFAULT_QUOTE_MAX_AGE:
+            return None
+        expiry = min(quote_time + TECHNICAL_SETUP_TTL, plan["valid_until"],
+                     event["published_at"] + REACTION_WINDOW)
+        if expiry <= as_of:
+            return None
+        setup_id = key("setup", event["id"], venue, symbol)
+        payload = {
+            "type": "technical_setup", "status": "active", "id": setup_id, "event_id": event["id"],
+            "source": event["source"], "revision": event["revision"], "headline": event["title"],
+            "url": event["url"], "venue": venue, "symbol": symbol, "side": "buy",
+            "known_at": event["known_at"], "issued_at": as_of, "expires_at": expiry,
+            "plan": plan, "evidence": details or {},
+        }
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            if self.current_revision(db, event["id"], as_of) != event["revision"]:
+                return None
+            result = db.execute("""
+                INSERT OR IGNORE INTO live_setups
+                    (id,event_id,revision,source,venue,symbol,issued_at,expires_at,status,payload)
+                VALUES (?,?,?,?,?,?,?,?,'active',?)
+            """, (setup_id, event["id"], event["revision"], event["source"], venue, symbol,
+                  as_of, expiry, json.dumps(payload, ensure_ascii=False, allow_nan=False)))
+            if not result.rowcount:
+                return None
+            self.telegram.enqueue(db, setup_id, telegram_route, as_of)
+            return payload
+
     def issue(self, event, venue, symbol, plan, *, cap, as_of, details=None, review_result=None,
               telegram_route=None, budget=None, portfolio=None, reply_required=False, daily_risk_cap=None):
         risk = plan.get("stressed_loss_usdt", plan["loss"])
@@ -303,20 +347,21 @@ class LiveJournal(HeadlineJournal):
         with closing(self.connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
             changes = []
-            for row in db.execute("SELECT * FROM live_signals WHERE status='active'").fetchall():
-                status, reason = "cancelled", ""
-                if row["expires_at"] <= as_of:
-                    status, reason = "expired", "alert_expired"
-                elif health is not None and health.get(row["source"]) != "ok":
-                    reason = "source_unavailable"
-                elif self.current_revision(db, row["event_id"], as_of) != row["revision"]:
-                    reason = "source_revision_changed"
-                elif listed is not None and (row["event_id"], row["revision"]) not in listed:
-                    reason = "source_no_longer_lists_release"
-                if reason:
-                    db.execute("UPDATE live_signals SET status=?, reason=? WHERE id=?", (status, reason, row["id"]))
-                    changes.append({"type": "signal_update", "id": row["id"], "status": status, "reason": reason,
-                                    "venue": row["venue"], "symbol": row["symbol"], "observed_at": as_of})
+            for table, kind in (("live_signals", "signal_update"), ("live_setups", "technical_setup_update")):
+                for row in db.execute(f"SELECT * FROM {table} WHERE status='active'").fetchall():
+                    status, reason = "cancelled", ""
+                    if row["expires_at"] <= as_of:
+                        status, reason = "expired", "alert_expired"
+                    elif health is not None and health.get(row["source"]) != "ok":
+                        reason = "source_unavailable"
+                    elif self.current_revision(db, row["event_id"], as_of) != row["revision"]:
+                        reason = "source_revision_changed"
+                    elif listed is not None and (row["event_id"], row["revision"]) not in listed:
+                        reason = "source_no_longer_lists_release"
+                    if reason:
+                        db.execute(f"UPDATE {table} SET status=?, reason=? WHERE id=?", (status, reason, row["id"]))
+                        changes.append({"type": kind, "id": row["id"], "status": status, "reason": reason,
+                                        "venue": row["venue"], "symbol": row["symbol"], "observed_at": as_of})
             return changes
 
     def report(self):
@@ -325,6 +370,9 @@ class LiveJournal(HeadlineJournal):
         with closing(self.connect()) as db, db:
             counts = {row["status"]: row["total"] for row in db.execute(
                 "SELECT status, COUNT(*) AS total FROM live_signals GROUP BY status"
+            )}
+            setup_counts = {row["status"]: row["total"] for row in db.execute(
+                "SELECT status, COUNT(*) AS total FROM live_setups GROUP BY status"
             )}
             active = [json.loads(row["payload"]) for row in db.execute(
                 "SELECT payload FROM live_signals WHERE status='active' AND expires_at>? ORDER BY issued_at",
@@ -354,7 +402,7 @@ class LiveJournal(HeadlineJournal):
                 "reason": detail["reason"],
                 "agent_decisions": Counter(row["decision"] for row in detail["agent_results"]),
             }
-        return {"type": "report", **dict(summary), "signals": counts, "active": active,
+        return {"type": "report", **dict(summary), "signals": counts, "technical_setups": setup_counts, "active": active,
                 "latest_review": last_review, "recent_reactions": latest_reactions,
                 "recent_headlines": self.current_news(now)[:10], "discovery_candidates": discoveries,
                 "telegram_deliveries": self.telegram.counts(), "manual_slots": self.slots.report(),
@@ -454,19 +502,21 @@ class ScanMarket:
 
 class LiveMonitor:
     def __init__(self, public_session, private_session, journal, options, publisher=None, *,
-                 all_pairs=False, manual_replies=False, collect_market_evidence=False, daily_risk_cap=None):
+                 all_pairs=False, manual_replies=False, collect_market_evidence=False, daily_risk_cap=None,
+                 technical_fee_rate=None):
         self.public_session = public_session
         self.private_session = private_session
         self.journal = journal
         self.options = options
         self.publisher = publisher
-        if manual_replies and publisher is None:
-            raise ValueError("Режиму ручных ответов нужен отправитель Telegram.")
+        if publisher is None and (manual_replies or technical_fee_rate is not None):
+            raise ValueError("Для выбранного режима нужен отправитель Telegram.")
         self.market = Market(public_session, options.venue, all_spot=all_pairs)
         self.sampler = MarketSampler(self.market, journal.market_evidence) if collect_market_evidence else None
         self.all_pairs = all_pairs
         self.manual_replies = manual_replies
         self.daily_risk_cap = daily_risk_cap
+        self.technical_fee_rate = technical_fee_rate
         self.market_cursor = 0
         self.catalog_size = len(options.symbols)
         self.liquid_pairs = ()
@@ -647,7 +697,7 @@ class LiveMonitor:
             self.journal.finish_review(review_id, {**review_result, "reason": reason, "signal_id": None})
             self.watch(event, symbol, reason, pnl=stats)
 
-    async def scan_event(self, market, event, history, symbols):
+    async def scan_event(self, market, event, history, symbols, *, technical_setups=None):
         options = self.options
         family, eligible = classify_live_event(event["source"], event["title"])
         observations = await asyncio.gather(*(
@@ -666,7 +716,7 @@ class LiveMonitor:
                 reason = "topic_unclassified" if family == "uncatalogued" else "market_link_unvalidated"
                 self.watch(event, symbol, reason, family=family)
                 continue
-            if options.budget is None and self.sampler is None:
+            if options.budget is None and self.sampler is None and technical_setups is None:
                 self.watch(event, symbol, "sizing_parameters_required", family=family)
                 continue
             draft, reason = await prepare_candidate(market, symbol, event["known_at"])
@@ -675,8 +725,11 @@ class LiveMonitor:
                 continue
             if self.sampler is not None:
                 evidence_symbols.append(symbol)
+            if technical_setups is not None:
+                technical_setups.append((event, symbol, draft))
             if options.budget is None:
-                self.watch(event, symbol, "sizing_parameters_required", family=family)
+                if technical_setups is None:
+                    self.watch(event, symbol, "sizing_parameters_required", family=family)
                 continue
             stats = assess_recorded_history(history, family=family, venue=options.venue, symbol=symbol,
                                             strategy=BASELINE, as_of=time.time(), before=event["known_at"])
@@ -687,6 +740,35 @@ class LiveMonitor:
         if evidence_symbols and self.sampler is not None:
             await self.sampler.collect(event, family, evidence_symbols)
         return candidates
+
+    async def publish_technical_setups(self, candidates):
+        publisher, fee_rate = self.publisher, self.technical_fee_rate
+        if not candidates or publisher is None or fee_rate is None:
+            return
+        candidates.sort(key=lambda row: (-row[2]["setup"].get("score", 0), row[1], row[0]["id"]))
+        checked = issued = 0
+        for event, symbol, draft in candidates:
+            if checked >= MAX_SYMBOLS or issued >= MAX_TECHNICAL_SETUPS_PER_SCAN:
+                break
+            if self.review_blocker(event) or self.journal.has_setup(event["id"], self.options.venue, symbol):
+                continue
+            checked += 1
+            plan, reason = await refresh_technical_setup(self.market, draft["setup"], fee_rate)
+            if plan is None:
+                self.watch(event, symbol, reason)
+                continue
+            if self.review_blocker(event):
+                continue
+            market = draft["market"]
+            alert = self.journal.issue_setup(
+                event, self.options.venue, symbol, plan, as_of=time.time(), telegram_route=publisher.route,
+                details={"reaction_pct": market.get("reaction_pct"), "btc_reaction_pct": market.get("btc_reaction_pct")},
+            )
+            if alert is not None:
+                issued += 1
+                emit(alert)
+        if issued:
+            await publisher.flush()
 
     def schedule_reviews(self, candidates):
         # Keep only the latest batch while the single review worker is occupied.
@@ -819,16 +901,21 @@ class LiveMonitor:
               "history_rows": len(history), "sizing_configured": options.budget is not None,
               "team_enabled": options.team, "symbols": len(symbols), "catalog_size": self.catalog_size,
               "collecting_market_evidence": self.sampler is not None,
+              "technical_signals_enabled": self.technical_fee_rate is not None,
               "daily_risk_configured": self.daily_risk_cap is not None})
         if self.scan_market.market is not self.market:
             self.scan_market = ScanMarket(self.market)
         self.scan_market.begin_scan()
         candidates = []
+        technical_setups = [] if self.technical_fee_rate is not None else None
         for event in events:
             if (event["id"], event["revision"]) not in listed:
                 self.watch(event, None, "official_release_unavailable")
                 continue
-            candidates.extend(await self.scan_event(self.scan_market, event, history, symbols))
+            candidates.extend(await self.scan_event(
+                self.scan_market, event, history, symbols, technical_setups=technical_setups,
+            ))
+        await self.publish_technical_setups(technical_setups)
         if self.all_pairs:
             chart_close = int(time.time() // CHART_MINUTES_SECONDS) * CHART_MINUTES_SECONDS
             current_symbols = set(symbols)
@@ -857,10 +944,11 @@ class LiveMonitor:
 
 async def run_monitor(options, journal, publisher=None):
     async with aiohttp.ClientSession(trust_env=True) as public, aiohttp.ClientSession() as private:
+        technical_fee = options.setup_fee_rate if getattr(options, "technical_signals", False) else None
         monitor = LiveMonitor(public, private, journal, options, publisher=publisher,
                               all_pairs=options.all_pairs, manual_replies=options.manual_replies,
                               collect_market_evidence=options.collect_market_evidence,
-                              daily_risk_cap=options.daily_risk_cap)
+                              daily_risk_cap=options.daily_risk_cap, technical_fee_rate=technical_fee)
         if options.once:
             await monitor.scan_once()
             if monitor.sampler is not None:
@@ -949,6 +1037,10 @@ def main():
                         help="Ждать ответа в Telegram и вести до 16 открытых позиций")
     parser.add_argument("--collect-market-evidence", action="store_true",
                         help="Собирать публичные котировки кандидатов для последующей оценки")
+    parser.add_argument("--technical-signals", action="store_true",
+                        help="Отправлять технические карточки с уровнями и расчётными издержками")
+    parser.add_argument("--setup-fee-rate", type=float, default=0.001,
+                        help="Оценка комиссии за сторону для технической карточки, доля")
     parser.add_argument("--concurrency", type=int, choices=range(1, 51), default=10, metavar="N")
     parser.add_argument("--max-reviews-per-scan", type=int, choices=range(1, MAX_REVIEWS_PER_SCAN + 1), default=1,
                         help="Сколько кандидатов можно передать команде за цикл")
@@ -964,6 +1056,10 @@ def main():
         except ValueError:
             parser.error("Для Telegram задайте числовой BOT_OWNER_ID личного чата.")
     if not (options.report or options.telegram_check):
+        if options.technical_signals and (not options.telegram or options.team or options.manual_replies):
+            parser.error("Техническим карточкам нужен --telegram и отдельный запуск без проверки командой.")
+        if options.technical_signals and not 0 <= options.setup_fee_rate < 0.05:
+            parser.error("Оценка комиссии за сторону должна быть долей от 0 до 0,05.")
         if options.manual_replies and (not options.telegram or options.once):
             parser.error("Для ответов владельца нужен постоянный запуск с --telegram.")
         if (len(options.symbols) > MAX_SYMBOLS or len(set(options.symbols)) != len(options.symbols)

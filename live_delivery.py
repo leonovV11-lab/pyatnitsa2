@@ -26,6 +26,18 @@ class TelegramOutbox:
                 );
                 CREATE INDEX IF NOT EXISTS telegram_deliveries_queue
                     ON telegram_deliveries(route, state, next_attempt_at);
+                CREATE TABLE IF NOT EXISTS live_setups (
+                    id TEXT PRIMARY KEY, event_id TEXT NOT NULL, revision TEXT NOT NULL,
+                    source TEXT NOT NULL, venue TEXT NOT NULL, symbol TEXT NOT NULL,
+                    issued_at REAL NOT NULL, expires_at REAL NOT NULL, status TEXT NOT NULL,
+                    payload TEXT NOT NULL, reason TEXT,
+                    UNIQUE(event_id, venue, symbol)
+                );
+                CREATE INDEX IF NOT EXISTS live_setups_active ON live_setups(status, expires_at);
+                CREATE VIEW IF NOT EXISTS telegram_signal_records AS
+                    SELECT id, status, expires_at, payload, issued_at, reason FROM live_signals
+                    UNION ALL
+                    SELECT id, status, expires_at, payload, issued_at, reason FROM live_setups;
             """)
 
     @staticmethod
@@ -42,13 +54,14 @@ class TelegramOutbox:
             """, (route, now - ATTEMPT_TIMEOUT))
             db.execute("""
                 UPDATE telegram_deliveries SET state='skipped', reason='signal_expired_or_cancelled'
-                WHERE route=? AND state='pending' AND signal_id IN (
-                    SELECT id FROM live_signals WHERE status!='active' OR expires_at<=?
+                WHERE route=? AND state='pending' AND EXISTS (
+                    SELECT 1 FROM telegram_signal_records s WHERE s.id=telegram_deliveries.signal_id
+                    AND (s.status!='active' OR s.expires_at<=?)
                 )
             """, (route, now))
             row = db.execute("""
                 SELECT d.signal_id, s.payload FROM telegram_deliveries d
-                JOIN live_signals s ON s.id=d.signal_id
+                JOIN telegram_signal_records s ON s.id=d.signal_id
                 WHERE d.route=? AND d.state='pending' AND d.next_attempt_at<=?
                 ORDER BY s.issued_at LIMIT 1
             """, (route, now)).fetchone()
@@ -65,7 +78,7 @@ class TelegramOutbox:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("""
                 SELECT d.attempts, s.status, s.expires_at FROM telegram_deliveries d
-                JOIN live_signals s ON s.id=d.signal_id WHERE d.signal_id=? AND d.state='sending'
+                JOIN telegram_signal_records s ON s.id=d.signal_id WHERE d.signal_id=? AND d.state='sending'
             """, (signal_id,)).fetchone()
             if row is None:
                 return "unconfirmed"
@@ -96,7 +109,7 @@ class TelegramOutbox:
             row = db.execute("""
                 SELECT d.signal_id, d.message_id, s.payload,
                     CASE WHEN s.status='cancelled' THEN s.reason ELSE 'alert_expired' END AS reason
-                FROM telegram_deliveries d JOIN live_signals s ON s.id=d.signal_id
+                FROM telegram_deliveries d JOIN telegram_signal_records s ON s.id=d.signal_id
                 WHERE d.route=? AND d.state='sent' AND d.notice_state='waiting'
                     AND (s.status!='active' OR s.expires_at<=?)
                 ORDER BY s.expires_at LIMIT 1
@@ -140,7 +153,7 @@ class TelegramPublisher:
         if update is not None:
             signal, message_id, reason = update
             async with self.edit_lock:
-                if self.slots is not None and signal.get("reply_required"):
+                if self.slots is not None and signal.get("type") != "technical_setup" and signal.get("reply_required"):
                     state = self.slots.state(signal["id"], route=self.route)
                     result = await edit_signal(self.bot, self.chat_id, message_id, signal, reason, response_state=state)
                 else:

@@ -118,6 +118,12 @@ def _positive(value: object) -> float:
     return value
 
 
+def _cost_rate(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < 1:
+        raise ValueError("Invalid cost rate")
+    return value
+
+
 def _decimal_text(value: float, significant_digits: int | None = None) -> str:
     digits = str(value) if significant_digits is None else format(value, f".{significant_digits}g")
     return format(Decimal(digits), "f")
@@ -201,6 +207,7 @@ def _evidence_lines(evidence: object) -> list[str]:
 
 
 def _render(signal: dict, reason: str | None = None) -> tuple[str, float]:
+    technical = signal.get("type") == "technical_setup"
     venue = _label(signal.get("venue"), r"[a-zA-Z0-9_-]{1,32}")
     symbol = _label(signal.get("symbol"), r"[A-Z0-9]{1,24}/[A-Z0-9]{1,24}")
     signal_id = _label(signal.get("id"), r"[A-Za-z0-9_-]{1,64}")
@@ -213,17 +220,15 @@ def _render(signal: dict, reason: str | None = None) -> tuple[str, float]:
     source_url = _url(signal.get("url"))
     expiry = _positive(signal.get("expires_at"))
     local_expiry = datetime.fromtimestamp(expiry, tz=MOSCOW_TIME).strftime("%d.%m.%Y %H:%M:%S")
-    entry, stop, tp1, tp2, qty, loss, reward, ratio = (
-        _positive(plan.get(key)) for key in ("price", "stop", "tp1", "tp2", "qty", "loss", "reward", "ratio")
-    )
+    entry, stop, tp1, tp2 = (_positive(plan.get(key)) for key in ("price", "stop", "tp1", "tp2"))
     if not stop < entry < tp1 <= tp2:
         raise ValueError("Invalid price order")
-    stress = _positive(plan.get("stressed_loss_usdt", loss))
-    if stress < loss:
-        raise ValueError("Invalid stressed risk")
     market_label = f"{symbol} · {venue.upper()}"
+    if technical:
+        market_label = f"Технический сигнал · {market_label}"
     if reason is None:
-        lines = [f"Пятница 2 · Покупка на споте · {market_label}"]
+        title = market_label if technical else f"Покупка на споте · {market_label}"
+        lines = [f"Пятница 2 · {title}"]
     else:
         status = UPDATE_TEXT.get(reason, "ОТМЕНЁН. Сигнал больше не действует.")
         lines = [
@@ -232,26 +237,47 @@ def _render(signal: dict, reason: str | None = None) -> tuple[str, float]:
             "Историческая котировка и параметры на момент публикации.",
         ]
     lines += ["", f"Вход по снимку рынка: {_decimal_text(entry)} {quote_asset}"]
-    if "entry_min" in plan or "entry_max" in plan:
+    if technical or "entry_min" in plan or "entry_max" in plan:
         entry_min = _positive(plan.get("entry_min"))
         entry_max = _positive(plan.get("entry_max"))
-        if not entry_min <= entry <= entry_max <= tp1:
+        if not entry_min <= entry <= entry_max <= tp1 or (technical and entry_max != entry):
             raise ValueError("Invalid entry range")
         lines.append(f"Диапазон входа: {_decimal_text(entry_min)}–{_decimal_text(entry_max)} {quote_asset}")
     lines += [
         f"Стоп: {_decimal_text(stop)} {quote_asset}",
         f"Цель 1: {_decimal_text(tp1)} {quote_asset} · Цель 2: {_decimal_text(tp2)} {quote_asset}",
-        f"Объём: {_decimal_text(qty)} {asset}",
-        f"Риск по плану: {_decimal_text(loss, 6)} USDT · При росте издержек: {_decimal_text(stress, 6)} USDT",
-        f"Расчёт при обеих целях: {_decimal_text(reward, 6)} USDT · {_decimal_text(ratio, 4)} R",
     ]
-    if "stressed_ratio" in plan or "stressed_reward_usdt" in plan:
+    if technical:
         stressed_ratio = _positive(plan.get("stressed_ratio"))
-        stressed_reward = _positive(plan.get("stressed_reward_usdt"))
-        lines.append(
-            f"При обеих целях с повышенными издержками · {_decimal_text(stressed_reward, 6)} USDT"
-            f" · {_decimal_text(stressed_ratio, 4)} R"
-        )
+        fee_rate = _cost_rate(plan.get("fee_rate"))
+        extra_cost = _cost_rate(plan.get("extra_cost_per_side"))
+        if fee_rate + extra_cost >= 1:
+            raise ValueError("Invalid combined cost rate")
+        quote_stamp = datetime.fromtimestamp(_positive(plan.get("quote_observed_at")), tz=MOSCOW_TIME)
+        lines += [
+            f"Снимок стакана в {quote_stamp:%H:%M:%S} МСК.",
+            f"В расчёте комиссия {fee_rate:.2%} и запас на издержки {extra_cost:.2%} на сторону.",
+            f"При обеих целях с повышенными издержками · {_decimal_text(stressed_ratio, 4)} R",
+            "Стоп и цели описывают расчётный сценарий.",
+            "Объём позиции и фактическая доходность требуют данных о портфеле и исполнениях.",
+        ]
+    else:
+        qty, loss, reward, ratio = (_positive(plan.get(key)) for key in ("qty", "loss", "reward", "ratio"))
+        stress = _positive(plan.get("stressed_loss_usdt", loss))
+        if stress < loss:
+            raise ValueError("Invalid stressed risk")
+        lines += [
+            f"Объём: {_decimal_text(qty)} {asset}",
+            f"Риск по плану: {_decimal_text(loss, 6)} USDT · При росте издержек: {_decimal_text(stress, 6)} USDT",
+            f"Расчёт при обеих целях: {_decimal_text(reward, 6)} USDT · {_decimal_text(ratio, 4)} R",
+        ]
+        if "stressed_ratio" in plan or "stressed_reward_usdt" in plan:
+            stressed_ratio = _positive(plan.get("stressed_ratio"))
+            stressed_reward = _positive(plan.get("stressed_reward_usdt"))
+            lines.append(
+                f"При обеих целях с повышенными издержками · {_decimal_text(stressed_reward, 6)} USDT"
+                f" · {_decimal_text(stressed_ratio, 4)} R"
+            )
     if evidence := _evidence_lines(signal.get("evidence")):
         lines += ["", *evidence]
     if reason is None:
@@ -261,7 +287,7 @@ def _render(signal: dict, reason: str | None = None) -> tuple[str, float]:
         ]
     else:
         lines += ["", f"Срок действия сигнала: до {local_expiry} МСК."]
-    if signal.get("reply_required") is True:
+    if not technical and signal.get("reply_required") is True:
         lines += ["", "«Вошёл» подтверждает уже совершённый вручную вход. Кнопки не продлевают срок сигнала."]
     lines += ["", headline, source_url, "", f"Пятница 2 · ID {signal_id}"]
     text = "\n".join(lines)
@@ -289,7 +315,8 @@ async def send_signal(bot: Bot, chat_id: int, signal: dict) -> DeliveryResult:
         return DeliveryResult("rejected", reason="chat_id_invalid")
     try:
         text, expiry = _render(signal)
-        markup = reply_markup(signal["id"], "waiting") if signal.get("reply_required") is True else None
+        markup = (reply_markup(signal["id"], "waiting")
+                  if signal.get("type") != "technical_setup" and signal.get("reply_required") is True else None)
     except (AttributeError, OverflowError, OSError, TypeError, ValueError):
         return DeliveryResult("rejected", reason="signal_invalid")
     if expiry <= time.time():
@@ -317,11 +344,11 @@ async def edit_signal(
         return DeliveryResult("rejected", reason="message_id_invalid")
     try:
         text, _ = _render(signal, reason)
-        markup: _ReplyMarkup = (
-            {"reply_markup": reply_markup(signal["id"], response_state)}
-            if signal.get("reply_required") is True
-            else {}
-        )
+        markup: _ReplyMarkup = {}
+        if signal.get("type") == "technical_setup":
+            markup["reply_markup"] = None
+        elif signal.get("reply_required") is True:
+            markup["reply_markup"] = reply_markup(signal["id"], response_state)
     except (AttributeError, OverflowError, OSError, TypeError, ValueError):
         return DeliveryResult("rejected", reason="signal_invalid")
     try:

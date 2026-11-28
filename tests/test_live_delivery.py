@@ -1,5 +1,7 @@
+import json
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -20,7 +22,44 @@ def issue(journal, now, *, route="owner"):
     return journal.issue(event, "okx", "BTC/USDT", {"loss": 2.0}, cap=10, as_of=now, telegram_route=route)
 
 
+def queue_setup(journal, now, *, expires_at):
+    payload = {"type": "technical_setup", "id": "setup-alert"}
+    with closing(journal.connect()) as db, db:
+        db.execute("""
+            INSERT INTO live_setups (id,event_id,revision,source,venue,symbol,issued_at,expires_at,status,payload)
+            VALUES (?, 'release', 'revision', 'fed', 'okx', 'BTC/USDT', ?, ?, 'active', ?)
+        """, (payload["id"], now, expires_at, json.dumps(payload)))
+        journal.telegram.enqueue(db, payload["id"], "owner", now)
+    return payload
+
+
 class DeliveryJournalTests(unittest.TestCase):
+    def test_technical_setup_uses_same_durable_outbox_without_reserving_trade(self):
+        now = time.time()
+        with TemporaryDirectory() as root:
+            path = Path(root) / "news.sqlite3"
+            writer = LiveJournal(path)
+            setup = queue_setup(writer, now, expires_at=now + 5)
+            reopened = LiveJournal(path)
+            self.assertIsNone(reopened.telegram.claim_send("different-owner", now))
+            self.assertEqual(writer.telegram.claim_send("owner", now), setup)
+            self.assertIsNone(reopened.telegram.claim_send("owner", now))
+            writer.telegram.finish_send(setup["id"], DeliveryResult("sent", message_id=21), now + 1)
+
+            trade = issue(reopened, now + 1)
+            self.assertIsNotNone(trade)
+            self.assertEqual(reopened.telegram.claim_send("owner", now + 1), trade)
+            self.assertEqual(reopened.telegram.claim_update("owner", now + 5), (setup, 21, "alert_expired"))
+            self.assertIsNone(writer.telegram.claim_update("owner", now + 5))
+
+    def test_expired_technical_setup_is_skipped_before_first_delivery(self):
+        now = time.time()
+        with TemporaryDirectory() as root:
+            journal = LiveJournal(Path(root) / "news.sqlite3")
+            queue_setup(journal, now, expires_at=now + 5)
+            self.assertIsNone(journal.telegram.claim_send("owner", now + 5))
+            self.assertEqual(journal.telegram.counts(), {"skipped": 1})
+
     def test_only_one_process_can_claim_an_alert_for_its_recipient(self):
         now = time.time()
         with TemporaryDirectory() as root:

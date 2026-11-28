@@ -11,6 +11,7 @@ from live_market_check import (
     observe_reaction,
     prepare_candidate,
     refresh_plan,
+    refresh_technical_setup,
 )
 from market import MarketError, Quote
 
@@ -200,3 +201,53 @@ class LiveMarketTests(unittest.IsolatedAsyncioTestCase):
         result, reason = await self.inspect()
         self.assertIsNone(result)
         self.assertIn("котировк", reason)
+
+    def technical_fixture(self):
+        self.market.book = Quote(SYMBOL, self.market.exchange, 99.95, 100, 0.01, 0.02, NOW)
+        return {"symbol": SYMBOL, "strategy": "trend_v1", "score": 80, "reference": 100,
+                "atr": 1, "stop": 99, "tp1": 101.7, "tp2": 102.3,
+                "snapshot_5m_close": NOW - 60, "event_known_at": NOW - 500}
+
+    async def test_technical_levels_use_stressed_per_unit_ratio_without_sizing(self):
+        levels, reason = await refresh_technical_setup(self.market, self.technical_fixture(), FEE)
+        self.assertEqual(reason, "")
+        assert levels is not None
+        self.assertEqual(set(levels), {"price", "stop", "tp1", "tp2", "entry_min", "entry_max", "stressed_ratio",
+                                       "fee_rate", "extra_cost_per_side", "quote_observed_at", "valid_until",
+                                       "quote_asset"})
+        self.assertEqual(levels["price"], 100)
+        self.assertEqual(levels["entry_min"], 99.5)
+        self.assertEqual(levels["entry_max"], 100)
+        self.assertEqual(levels["fee_rate"], FEE)
+        self.assertEqual(levels["extra_cost_per_side"], 0.001)
+        self.assertAlmostEqual(levels["stressed_ratio"], (102 * 0.998 - 100 * 1.002) / (100 * 1.002 - 99 * 0.998))
+        self.assertEqual(levels["quote_asset"], "USDT")
+        self.assertEqual(levels["quote_observed_at"], NOW)
+        self.assertEqual(levels["valid_until"], NOW + 240)
+        self.assertEqual(self.market.quote_calls, 1)
+        json.dumps(levels, allow_nan=False)
+
+    async def test_technical_setup_rejects_base_edge_that_vanishes_under_stress(self):
+        setup = {**self.technical_fixture(), "tp1": 101.2, "tp2": 101.8}
+        self.market.book = replace(self.market.book, bid_size=20, ask_size=20)
+        unstressed, _ = await refresh_plan(self.market, setup, BUDGET, FEE)
+        self.assertIsNotNone(unstressed)
+        defensive, reason = await refresh_technical_setup(self.market, setup, FEE)
+        self.assertIsNone(defensive)
+        self.assertTrue(reason)
+
+    async def test_technical_setup_rejects_stale_book_and_candle_rollover(self):
+        setup = self.technical_fixture()
+        self.market.book = replace(self.market.book, observed_at=NOW - 6)
+        result, reason = await refresh_technical_setup(self.market, setup, FEE)
+        self.assertIsNone(result)
+        self.assertIn("котировк", reason)
+
+        async def book_at_boundary(*_):
+            self.clock.return_value = NOW + 240
+            return replace(self.market.book, observed_at=NOW + 240)
+
+        with patch.object(self.market, "quote", side_effect=book_at_boundary):
+            result, reason = await refresh_technical_setup(self.market, setup, FEE)
+        self.assertIsNone(result)
+        self.assertIn("свеч", reason)

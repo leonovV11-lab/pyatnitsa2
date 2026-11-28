@@ -6,8 +6,16 @@ import time
 
 from pandas import DataFrame
 
-from market import DEFAULT_QUOTE_MAX_AGE, MarketError
-from strategies import BASELINE, build_plan, candidate_setups, is_bullish
+from market import DEFAULT_QUOTE_MAX_AGE, MarketError, Quote
+from strategies import (
+    BASELINE,
+    EXTRA_COST_PER_SIDE,
+    MIN_NET_PAYOFF,
+    build_levels,
+    build_plan,
+    candidate_setups,
+    is_bullish,
+)
 
 FIVE_MINUTES = 5 * 60
 FIFTEEN_MINUTES = 15 * 60
@@ -46,12 +54,7 @@ def _bars(frame):
     ]
 
 
-async def refresh_plan(market, setup, budget, fee_rate) -> tuple[dict | None, str]:
-    """Rebuild the plan for the reviewed setup against a fresh order book."""
-    if not math.isfinite(budget) or budget <= 0:
-        return None, "Бюджет должен быть положительным и конечным"
-    if not math.isfinite(fee_rate) or not 0 <= fee_rate < 1:
-        return None, "Комиссия должна быть долей от 0 до 1"
+async def _refresh_quote(market, setup) -> tuple[Quote | None, str]:
     if reason := _setup_expiry_reason(setup, time.time()):
         return None, reason
 
@@ -61,6 +64,20 @@ async def refresh_plan(market, setup, budget, fee_rate) -> tuple[dict | None, st
         return None, "Нет свежей котировки"
 
     if reason := _setup_expiry_reason(setup, time.time()):
+        return None, reason
+    if quote is None:
+        return None, "Нет свежей котировки"
+    return quote, ""
+
+
+async def refresh_plan(market, setup, budget, fee_rate) -> tuple[dict | None, str]:
+    """Rebuild the plan for the reviewed setup against a fresh order book."""
+    if not math.isfinite(budget) or budget <= 0:
+        return None, "Бюджет должен быть положительным и конечным"
+    if not math.isfinite(fee_rate) or not 0 <= fee_rate < 1:
+        return None, "Комиссия должна быть долей от 0 до 1"
+    quote, reason = await _refresh_quote(market, setup)
+    if quote is None:
         return None, reason
     plan, reason = build_plan(setup, quote, budget, fee_rate)
     if plan is None:
@@ -72,6 +89,34 @@ async def refresh_plan(market, setup, budget, fee_rate) -> tuple[dict | None, st
         "bid_size": quote.bid_size, "ask_size": quote.ask_size,
         "valid_until": min(
             quote.observed_at + DEFAULT_QUOTE_MAX_AGE,
+            setup["snapshot_5m_close"] + FIVE_MINUTES,
+            setup["event_known_at"] + MAX_EVENT_AGE,
+        ),
+    }, ""
+
+
+async def refresh_technical_setup(market, setup, fee_rate) -> tuple[dict | None, str]:
+    """Price technical levels with stressed costs, independent of any position size."""
+    stressed_fee_rate = fee_rate + EXTRA_COST_PER_SIDE
+    if not math.isfinite(stressed_fee_rate) or not 0 <= fee_rate < 1 - EXTRA_COST_PER_SIDE:
+        return None, "Комиссия с запасом должна быть долей от 0 до 1"
+    quote, reason = await _refresh_quote(market, setup)
+    if quote is None:
+        return None, reason
+    levels, reason = build_levels(setup, quote, stressed_fee_rate)
+    if levels is None:
+        return None, reason
+    ratio = levels["ratio"]
+    if not MIN_NET_PAYOFF <= ratio < math.inf:
+        return None, "Расчёт после повышенных издержек не покрывает риск"
+    return {
+        **{field: levels[field] for field in ("price", "stop", "tp1", "tp2", "entry_min", "quote_observed_at")},
+        "entry_max": levels["price"],
+        "stressed_ratio": ratio,
+        "fee_rate": fee_rate,
+        "extra_cost_per_side": EXTRA_COST_PER_SIDE,
+        "quote_asset": setup["symbol"].split("/", 1)[1],
+        "valid_until": min(
             setup["snapshot_5m_close"] + FIVE_MINUTES,
             setup["event_known_at"] + MAX_EVENT_AGE,
         ),

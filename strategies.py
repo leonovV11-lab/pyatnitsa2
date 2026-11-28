@@ -10,6 +10,7 @@ RISK_PER_TRADE = 0.015
 MAX_POSITION_FRACTION = 0.20
 MIN_NET_PAYOFF = 1.0
 MAX_SPREAD = 0.003
+EXTRA_COST_PER_SIDE = 0.001
 
 
 def is_bullish(closes):
@@ -73,10 +74,8 @@ def candidate_setups(symbol, five, fifteen, btc_bullish):
     ]
 
 
-def build_plan(candidate, quote, budget, fee_rate):
-    """Return a fresh plan, or a reason why the current quote cannot support it."""
-    if not math.isfinite(budget) or budget <= 0:
-        return None, "Бумажный бюджет не настроен"
+def build_levels(candidate, quote, fee_rate):
+    """Check the current price and calculate payoff per unit of the instrument."""
     if quote is None or not quote.is_fresh():
         return None, "Нет свежей котировки"
     ask, bid = quote.ask, quote.bid
@@ -98,14 +97,29 @@ def build_plan(candidate, quote, budget, fee_rate):
         return None, "Цена вне диапазона входа"
     per_unit_loss = ask * (1 + fee_rate) - stop * (1 - fee_rate)
     per_unit_reward = target * (1 - fee_rate) - ask * (1 + fee_rate)
+    return {
+        "symbol": candidate["symbol"], "score": candidate["score"], "strategy": candidate["strategy"],
+        "price": ask, "bid": bid, "stop": stop, "tp1": tp1, "tp2": tp2,
+        "per_unit_loss": per_unit_loss, "per_unit_reward": per_unit_reward,
+        "ratio": per_unit_reward / per_unit_loss, "spread_pct": spread,
+        "entry_min": lower, "entry_max": upper, "quote_observed_at": quote.observed_at,
+    }, ""
+
+
+def build_plan(candidate, quote, budget, fee_rate):
+    """Return a fresh plan, or a reason why the current quote cannot support it."""
+    if not math.isfinite(budget) or budget <= 0:
+        return None, "Бумажный бюджет не настроен"
+    levels, reason = build_levels(candidate, quote, fee_rate)
+    if levels is None:
+        return None, reason
+    per_unit_loss = levels.pop("per_unit_loss")
+    per_unit_reward = levels.pop("per_unit_reward")
     quantity = min(budget * RISK_PER_TRADE / per_unit_loss,
-                   budget * MAX_POSITION_FRACTION / (ask * (1 + fee_rate)))
+                   budget * MAX_POSITION_FRACTION / (levels["price"] * (1 + fee_rate)))
     if quantity > quote.ask_size or quantity > quote.bid_size:
         return None, "Недостаточный объём на лучших ценах"
     return {
-        "symbol": candidate["symbol"], "score": candidate["score"], "strategy": candidate["strategy"],
-        "price": ask, "bid": bid, "qty": quantity, "stop": stop, "tp1": tp1, "tp2": tp2,
-        "loss": quantity * per_unit_loss, "reward": quantity * per_unit_reward,
-        "ratio": per_unit_reward / per_unit_loss, "spread_pct": spread,
-        "entry_min": lower, "entry_max": upper, "quote_observed_at": quote.observed_at,
+        **levels,
+        "qty": quantity, "loss": quantity * per_unit_loss, "reward": quantity * per_unit_reward,
     }, ""

@@ -34,7 +34,38 @@ def release(now, revision="r1", source="fed"):
     )
 
 
+def technical_plan(now):
+    return {"price": 100.0, "stop": 98.0, "tp1": 103.0, "tp2": 105.0, "entry_min": 99.0,
+            "entry_max": 100.0, "stressed_ratio": 1.5, "fee_rate": 0.001,
+            "extra_cost_per_side": 0.001, "quote_asset": "USDT", "quote_observed_at": now,
+            "valid_until": now + 180}
+
+
 class LiveSignalTests(unittest.TestCase):
+    def test_technical_setup_is_durable_and_does_not_occupy_a_trade(self):
+        now = time.time()
+        with TemporaryDirectory() as root:
+            path = Path(root) / "live.sqlite3"
+            journal = LiveJournal(path)
+            event = journal.observe(release(now))
+            self.assertIsNone(journal.issue_setup(event, "okx", "BTC/USDT", technical_plan(now - 6),
+                                                  as_of=now, telegram_route="owner"))
+            setup = journal.issue_setup(event, "okx", "BTC/USDT", technical_plan(now),
+                                        as_of=now, telegram_route="owner")
+            self.assertIsNotNone(setup)
+            assert setup is not None
+            self.assertEqual(setup["type"], "technical_setup")
+            self.assertNotIn("qty", setup["plan"])
+            journal = LiveJournal(path)
+            self.assertIsNone(journal.issue_setup(event, "okx", "BTC/USDT", technical_plan(now),
+                                                  as_of=now, telegram_route="owner"))
+            self.assertEqual(journal.telegram.claim_send("owner", now), setup)
+            trade = journal.issue(event, "okx", "BTC/USDT", {"loss": 1.0}, cap=2.0, as_of=now)
+            self.assertIsNotNone(trade)
+            self.assertEqual(journal.report()["technical_setups"], {"active": 1})
+            changes = journal.invalidate({"fed": "ok"}, now + 1, listed=set())
+            self.assertEqual({row["type"] for row in changes}, {"signal_update", "technical_setup_update"})
+
     def test_gate_distinguishes_direct_events_from_cross_market_research(self):
         self.assertEqual(classify_live_event("fed", "Federal Reserve issues FOMC statement"),
                          ("us_monetary_policy", True))
@@ -204,6 +235,40 @@ def reaction(direction="up"):
 
 
 class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_technical_signal_reaches_telegram_without_portfolio_history_or_agent(self):
+        now = time.time()
+        with TemporaryDirectory() as root:
+            journal = LiveJournal(Path(root) / "live.sqlite3")
+            options = SimpleNamespace(venue="okx", symbols=["BTC/USDT"], budget=None,
+                                      team=False, history_file=None)
+            publisher = TelegramPublisher(object(), 1234, "owner", journal.telegram)
+            monitor = LiveMonitor(None, None, journal, options, publisher=publisher, technical_fee_rate=0.001)
+            with (
+                patch("news_live.fetch_official_news", new=AsyncMock(return_value=([release(now)], {"fed": "ok"}))),
+                patch("news_live.fetch_discovery_news", new=AsyncMock(return_value=([], {}))),
+                patch("news_live.observe_reaction", new=AsyncMock(return_value=(reaction(), ""))),
+                patch("news_live.prepare_candidate",
+                      new=AsyncMock(return_value=({"setup": {"score": 85}, "market": reaction()}, ""))),
+                patch("news_live.refresh_technical_setup",
+                      new=AsyncMock(return_value=(technical_plan(now), "")), create=True) as levels,
+                patch("news_live.analyze_team", new=AsyncMock()) as team,
+                patch("live_delivery.send_signal",
+                      new=AsyncMock(return_value=DeliveryResult("sent", message_id=42))) as send,
+                patch("live_delivery.emit"),
+                patch("news_live.emit"),
+            ):
+                await monitor.scan_once()
+                await monitor.scan_once()
+            send.assert_awaited_once()
+            assert send.await_args is not None
+            self.assertEqual(send.await_args.args[2]["type"], "technical_setup")
+            levels.assert_awaited_once()
+            team.assert_not_awaited()
+            report = journal.report()
+            self.assertEqual(report["signals"], {})
+            self.assertEqual(report["technical_setups"], {"active": 1})
+            self.assertEqual(report["telegram_deliveries"], {"sent": 1})
+
     async def test_continuous_scanner_runs_again_while_review_is_waiting(self):
         review_started = asyncio.Event()
         scan_continued = asyncio.Event()
@@ -482,7 +547,7 @@ class LiveFlowTests(unittest.IsolatedAsyncioTestCase):
                 tables = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 self.assertEqual(tables, {
                     "official_headlines", "news_reviews", "live_signals", "market_reactions", "discovery_headlines",
-                    "telegram_deliveries", "live_manual_slots",
+                    "telegram_deliveries", "live_manual_slots", "live_setups",
                     "market_quote_samples", "market_quote_checks",
                 })
             return steps, [call.args[0] for call in output.call_args_list], db.report()
